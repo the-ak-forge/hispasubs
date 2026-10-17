@@ -1,0 +1,15 @@
+{
+  "name": "hispasubs-addon",
+  "version": "3.0.0",
+  "description": "Stremio Addon for lexical subtitle classification",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.10",
+    "axios": "^1.6.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2"
+  }
+}
