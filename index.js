@@ -39,7 +39,7 @@ const getConfigureHTML = (host, existingConfig = {}) => `
     <div class="container">
         <div>${LOGO_SVG}</div>
         <h1>HispaSubs</h1>
-        <p>Motor de descompresión Node.js. Soporta OS-V3 y SubDL nativo.</p>
+        <p>Motor de descompresión Node.js activo. SubDL procesado en memoria.</p>
         <div class="form-group">
             <label>SubDL API Key (Opcional - Expande catálogo)</label>
             <input type="text" id="subdlKey" placeholder="ej: abc123def456..." value="${existingConfig.subdlKey || ''}">
@@ -69,9 +69,9 @@ const getConfigureHTML = (host, existingConfig = {}) => `
 
 const getManifest = (config) => ({
   id: "org.hispasubs.addon",
-  version: "3.5.0",
+  version: "4.0.0",
   name: "HispaSubs",
-  description: `Motor Node.js con Extractor ZIP. OS V3 | SubDL: ${config.subdlKey ? '✅' : '❌'}`,
+  description: `Motor Node.js + Extractor ZIP. OS V3 | SubDL: ${config.subdlKey ? '✅' : '❌'}`,
   logo: ADDON_LOGO,
   resources: ["subtitles"],
   types: ["movie", "series"],
@@ -92,10 +92,10 @@ const parseConfig = (configStr) => {
 // --- SCRAPERS ---
 const getOpenSubtitlesV3 = async (type, fullId) => {
   try {
-    const { data } = await axios.get(`https://opensubtitles-v3.strem.io/subtitles/${type}/${fullId}.json`, { timeout: 3500 });
+    const { data } = await axios.get(`https://opensubtitles-v3.strem.io/subtitles/${type}/${fullId}.json`, { timeout: 2500 });
     return (data.subtitles || [])
       .filter(sub => (sub.lang || "").toLowerCase().includes("spa") || sub.lang === "es")
-      .map(sub => ({ id: sub.id, url: sub.url, lang: "spa", source: "OS" }));
+      .map(sub => ({ id: sub.id, url: sub.url, lang: "spa", source: "OS-V3" }));
   } catch (e) { return []; }
 };
 
@@ -104,35 +104,34 @@ const getSubDL = async (imdbId, season, episode, apiKey) => {
   try {
     let url = `https://api.subdl.com/api/v1/subtitles?api_key=${apiKey}&imdb_id=${imdbId}&languages=ES`;
     if (season && episode) url += `&season_number=${season}&episode_number=${episode}`;
-    const { data } = await axios.get(url, { timeout: 3500 });
+    const { data } = await axios.get(url, { timeout: 2500 });
     if (!data.subtitles) return [];
     
     return data.subtitles.map(sub => {
-      let dlUrl = sub.url.startsWith("http") ? sub.url : `https://dl.subdl.com${sub.url}`;
+      let dlUrl = sub.url;
+      if (dlUrl.startsWith('//')) dlUrl = 'https:' + dlUrl;
+      else if (!dlUrl.startsWith('http')) dlUrl = 'https://dl.subdl.com' + dlUrl;
       return { id: `sdl_${sub.file_id || Math.random()}`, url: dlUrl, lang: "spa", source: "SubDL" };
     });
   } catch (e) { return []; }
 };
 
-// --- EL ANALIZADOR NODE.JS (Maneja texto puro y Zips en RAM) ---
+// --- EL ANALIZADOR NODE.JS ---
 const classifySubtitle = async (sub, host) => {
+  let isZip = sub.url.toLowerCase().includes(".zip");
+  // Aseguramos que todo archivo zip apunte siempre al proxy, incluso si el análisis falla.
+  let finalUrl = isZip ? `https://${host}/proxy?zipUrl=${encodeURIComponent(sub.url)}` : sub.url;
+
   try {
     let text = "";
-    let isZip = sub.url.includes(".zip");
-
     if (isZip) {
-      // Descargamos el ZIP como buffer binario
-      const response = await axios.get(sub.url, { responseType: 'arraybuffer', timeout: 2500 });
+      const response = await axios.get(sub.url, { responseType: 'arraybuffer', timeout: 2000 });
       const zip = new AdmZip(response.data);
       const zipEntries = zip.getEntries();
-      // Buscamos el primer archivo .srt dentro del zip
       const srtEntry = zipEntries.find(entry => entry.entryName.toLowerCase().endsWith('.srt'));
-      if (srtEntry) {
-        text = zip.readAsText(srtEntry, 'utf8');
-      }
+      if (srtEntry) text = zip.readAsText(srtEntry, 'utf8');
     } else {
-      // Texto puro (OpenSubtitles)
-      const response = await axios.get(sub.url, { timeout: 2000 });
+      const response = await axios.get(sub.url, { timeout: 1500 });
       text = response.data;
     }
 
@@ -143,19 +142,13 @@ const classifySubtitle = async (sub, host) => {
     if (esMatches > latMatches + 2) flag = "🇪🇸 Castellano";
     else if (latMatches > esMatches + 2) flag = "🇲🇽 Latino";
 
-    // MAGIA DE SUBDL: Si es un ZIP, cambiamos la URL para que Stremio le pida el subtítulo a nuestro servidor Proxy
-    let finalUrl = sub.url;
-    if (isZip) {
-      finalUrl = `https://${host}/proxy?zipUrl=${encodeURIComponent(sub.url)}`;
-    }
-
     return { id: sub.id, url: finalUrl, lang: `${flag} (${sub.source})` };
   } catch (error) {
-    return { id: sub.id, url: sub.url, lang: `🇪🇸/🇲🇽 Genérico (${sub.source})` };
+    return { id: sub.id, url: finalUrl, lang: `🇪🇸/🇲🇽 Genérico (${sub.source})` };
   }
 };
 
-// --- EL PROXY EXTRACTOR PARA STREMIO ---
+// --- EL PROXY EXTRACTOR DE ZIP PARA STREMIO ---
 app.get('/proxy', async (req, res) => {
   const zipUrl = req.query.zipUrl;
   if (!zipUrl) return res.status(400).send("No zipUrl provided");
@@ -167,36 +160,36 @@ app.get('/proxy', async (req, res) => {
     
     if (srtEntry) {
       const srtContent = zip.readAsText(srtEntry, 'utf8');
-      // Engañamos a Stremio enviándole las cabeceras de un archivo SRT legítimo
       res.setHeader('Content-Type', 'application/x-subrip; charset=utf-8');
       res.send(srtContent);
     } else {
       res.status(404).send("No SRT inside ZIP");
     }
   } catch (err) {
-    res.status(500).send("Error proxying SubDL");
+    res.status(500).send("Error proxying Zip file");
   }
 });
 
-// --- RUTAS DE STREMIO ---
-app.get('/', (req, res) => res.send(getConfigureHTML(req.headers.host)));
-app.get('/:config?/configure', (req, res) => {
-  const config = parseConfig(req.params.config);
-  res.send(getConfigureHTML(req.headers.host, config));
+// --- RUTAS DE STREMIO (CORREGIDAS Y EXPLÍCITAS) ---
+app.get('/', (req, res) => res.send(getConfigureHTML(req.get('host'))));
+app.get('/configure', (req, res) => res.send(getConfigureHTML(req.get('host'))));
+app.get('/:config/configure', (req, res) => {
+  res.send(getConfigureHTML(req.get('host'), parseConfig(req.params.config)));
 });
 
-app.get('/:config?/manifest.json', (req, res) => {
+app.get('/manifest.json', (req, res) => res.json(getManifest({})));
+app.get('/:config/manifest.json', (req, res) => {
   res.json(getManifest(parseConfig(req.params.config)));
 });
 
-app.get('/:config?/subtitles/:type/:id', async (req, res) => {
+const handleSubtitles = async (req, res, config) => {
   try {
-    const config = parseConfig(req.params.config);
+    const type = req.params.type;
     const fullId = req.params.id.replace('.json', '');
     const [imdbId, season, episode] = fullId.split(':');
 
     const [osSubs, sdlSubs] = await Promise.allSettled([
-      getOpenSubtitlesV3(req.params.type, fullId),
+      getOpenSubtitlesV3(type, fullId),
       getSubDL(imdbId, season, episode, config.subdlKey)
     ]);
 
@@ -204,20 +197,30 @@ app.get('/:config?/subtitles/:type/:id', async (req, res) => {
     if (osSubs.status === 'fulfilled') rawSubs.push(...osSubs.value);
     if (sdlSubs.status === 'fulfilled') rawSubs.push(...sdlSubs.value);
 
-    // Node.js es potente, analizamos hasta 10
-    const subsToAnalyze = rawSubs.slice(0, 10);
-    const unanalyzedSubs = rawSubs.slice(10).map(s => {
+    if (rawSubs.length === 0) {
+      return res.json({ subtitles: [{ id: "diag_1", url: "https://pastebin.com/raw/empty", lang: "⚠️ 0 Resultados" }] });
+    }
+
+    // Limitamos a 4 para garantizar que Vercel responda a Stremio en menos de 3 segundos
+    const subsToAnalyze = rawSubs.slice(0, 4);
+    const unanalyzedSubs = rawSubs.slice(4).map(s => {
       let finalUrl = s.url;
-      if (s.url.includes(".zip")) finalUrl = `https://${req.headers.host}/proxy?zipUrl=${encodeURIComponent(s.url)}`;
+      if (s.url.toLowerCase().includes(".zip")) {
+        finalUrl = `https://${req.get('host')}/proxy?zipUrl=${encodeURIComponent(s.url)}`;
+      }
       return { id: s.id, url: finalUrl, lang: `🇪🇸/🇲🇽 Genérico (${s.source})` };
     });
 
-    const analyzedSubs = await Promise.all(subsToAnalyze.map(sub => classifySubtitle(sub, req.headers.host)));
+    const analyzedSubs = await Promise.all(subsToAnalyze.map(sub => classifySubtitle(sub, req.get('host'))));
     res.json({ subtitles: [...analyzedSubs, ...unanalyzedSubs] });
 
   } catch (err) {
     res.json({ subtitles: [] });
   }
-});
+};
+
+// Rutas explícitas para evitar el bug del parámetro opcional :config
+app.get('/subtitles/:type/:id', (req, res) => handleSubtitles(req, res, {}));
+app.get('/:config/subtitles/:type/:id', (req, res) => handleSubtitles(req, res, parseConfig(req.params.config)));
 
 module.exports = app;
