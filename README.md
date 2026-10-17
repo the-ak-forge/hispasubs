@@ -68,7 +68,7 @@ El proyecto sigue un diseño modular con dos capas principales:
 - Capa Edge (Cloudflare Workers)
   - Gestiona rutas, resolución de manifiestos, consultas paralelas y evaluación léxica ultrarrápida.
 
-- Capa Proxy / Extractor
+- Capa Proxy
   - Descarga y extrae paquetes `.zip` de SubDL en memoria RAM usando `adm-zip`.
   - Entrega al reproductor subtítulos `.srt` limpios y listos para uso.
 
