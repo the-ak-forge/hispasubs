@@ -33,7 +33,7 @@ El complemento inspecciona el contenido textual de los subtítulos en tiempo rea
 El proyecto utiliza un diseño modular dividido en dos capas:
 
 * **Capa Edge (Cloudflare Workers):** Gestión de rutas, resolución de manifiesto, consultas paralelas a proveedores y evaluación léxica ultrarrápida.
-* **Capa Proxy / Extractor (Node.js con Express):** Servidor auxiliar encargado de descargar y extraer los paquetes `.zip` de SubDL en memoria RAM (`adm-zip`), entregando al reproductor cabeceras puras de subtítulos `.srt`.
+* **Capa Proxy / Extractor:** Servidor auxiliar encargado de descargar y extraer los paquetes `.zip` de SubDL en memoria RAM (`adm-zip`), entregando al reproductor cabeceras puras de subtítulos `.srt`.
 * **Protocolo:** Stremio Addon Protocol v3.
 
 ---
