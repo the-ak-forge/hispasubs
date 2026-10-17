@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.0.1
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.0.2
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -73,6 +73,19 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   if (req.method === "OPTIONS") return res.status(204).end();
 
+  // Raíz amigable: el dominio no es una web, es un endpoint. Al abrirlo a
+  // mano (o en health checks de Vercel) se explica a sí mismo en vez de
+  // devolver el 400 "Falta zipUrl". /proxy sin zipUrl sí sigue en 400.
+  const pathname = (req.url || "/").split("?")[0];
+  if (pathname === "/" || pathname === "/index.html") {
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    return res.status(200).json({
+      service: "HispaSubs Proxy",
+      status: "ok",
+      usage: "/proxy?zipUrl=<url-https-de-un-zip-de-SubDL-u-OpenSubtitles>",
+    });
+  }
+
   try {
     const rawUrl = (req.query && req.query.zipUrl) || "";
     if (!rawUrl) return res.status(400).json({ error: "Falta zipUrl" });
@@ -99,7 +112,7 @@ export default async function handler(req, res) {
       upstream = await fetch(target, {
         signal: controller.signal,
         redirect: "manual", // NO seguir redirecciones a otros hosts
-        headers: { "User-Agent": "HispaSubs/1.0.1" },
+        headers: { "User-Agent": "HispaSubs/1.0.2" },
       });
     } finally {
       clearTimeout(timer);
@@ -119,7 +132,7 @@ export default async function handler(req, res) {
       try {
         upstream = await fetch(new URL(loc, target), {
           signal: controller2.signal,
-          headers: { "User-Agent": "HispaSubs/1.0.1" },
+          headers: { "User-Agent": "HispaSubs/1.0.2" },
         });
       } finally {
         clearTimeout(timer2);
