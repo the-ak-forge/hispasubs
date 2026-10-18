@@ -151,3 +151,6 @@ vite.config.ts.timestamp-*
 # Añadido por el proyecto (Worker / macOS)
 .DS_Store
 .wrangler/
+
+# Notas internas de mantenimiento (datos operativos, no públicos)
+NOTAS-INTERNAS.md
