@@ -107,6 +107,18 @@ Si responde `"status": false`, regenera la clave en [tu panel de SubDL](https://
 ### La app móvil (Android/iOS) no muestra ningún resultado
 La app móvil agrupa los subtítulos por **código de idioma**, así que `lang` debe ser un código ISO válido (`spa`) y la etiqueta visible va en `label`; ese es el formato que devuelve el complemento desde la v1.3.0 (sin configuración). Si aun así no ves ninguna entrada, reinstala el complemento desde la [página de configuración](https://hispasubs.ak-forge.workers.dev) (el formato ya no depende de la URL de instalación) y reinicia la app. Nota: en Android TV hay un bug conocido de Stremio (versiones 1.11.x) en el que los subtítulos de addons aparecen pero no se muestran al elegirlos, por el servidor local (`127.0.0.1:11470`); se arregla reiniciando la app o desde Stremio.
 
+### En el móvil todas las filas ponen «HispaSubs» (no se ve la bandera)
+No es configurable desde el complemento: es una limitación del cliente móvil. La app de Android habla con el núcleo (Rust) por protobuf y el puente `stremio-core-kotlin` no reenvía el campo `label`; en su lugar rellena `name` con el **nombre del complemento**:
+
+```proto
+message Subtitle { required string id = 1; required string lang = 2; required string url = 3; optional string name = 4; }
+```
+```rust
+types::Subtitle { id, lang, url, name: addon_name.cloned() }   // name = nombre del addon
+```
+
+Por eso cada fila móvil se titula con el nombre del addon y no con `label`. Los subtítulos siguen siendo correctos y funcionales: el idioma se agrupa por `spa` y la variante se comprueba al reproducir. En escritorio (stremio-web) sí se muestra `label`, así que ahí las banderas y variantes se ven con normalidad.
+
 ### La selección automática de subtítulos en español no funciona
 Estaba relacionado con lo anterior: la selección automática compara `lang` con códigos ISO (`languages.find()`), y con texto libre (`🇲🇽 Latino (OS-V3)`) nunca coincidía. Desde la v1.3.0 `lang` es `spa`, así que el escritorio ya autoselecciona los subtítulos en español y muestra la variante (`label`) sin perderla.
 
