@@ -1,0 +1,350 @@
+// ============================================================================
+// test_proxy.js — tests del proxy de Vercel (api/proxy.js)
+//
+// Sin red: dns.lookup y el fetch global se sustituyen por stubs, así que la
+// suite es determinista y corre igual en local que en CI.
+//   node test_proxy.js
+// ============================================================================
+
+import AdmZip from "adm-zip";
+import dns from "node:dns/promises";
+import handler, { ALLOWED_HOSTS, MAX_BYTES, isPublicIP } from "./api/proxy.js";
+
+let pass = 0;
+let fail = 0;
+
+const section = (title) => console.log(`\n== ${title}`);
+const check = (name, cond, extra = "") => {
+  if (cond) {
+    pass += 1;
+    console.log(`  ✔ ${name}`);
+  } else {
+    fail += 1;
+    console.error(`  ✘ ${name}${extra ? ` -> ${extra}` : ""}`);
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Stubs: DNS y fetch (el handler importa "node:dns/promises" como default,
+// que es el objeto mutable del módulo builtin: se puede sustituir su lookup)
+// ---------------------------------------------------------------------------
+const dnsTable = new Map();
+dns.lookup = async (hostname) => {
+  const addrs = dnsTable.get(hostname);
+  if (!addrs) {
+    throw Object.assign(new Error(`ENOTFOUND ${hostname}`), { code: "ENOTFOUND" });
+  }
+  return addrs.map((a) => ({ address: a, family: a.includes(":") ? 6 : 4 }));
+};
+
+dnsTable.set("dl.subdl.com", ["104.20.1.1"]);
+
+let fetchLog = [];
+let fetchImpl = () => {
+  throw new Error("fetchImpl no preparado para esta prueba");
+};
+globalThis.fetch = async (url, init) => {
+  fetchLog.push({ url: String(url), init });
+  return fetchImpl(url, init);
+};
+
+// ---------------------------------------------------------------------------
+// Mocks de req/res estilo Vercel
+// ---------------------------------------------------------------------------
+const mkRes = () => ({
+  headers: {},
+  statusCode: 200,
+  body: undefined,
+  setHeader(k, v) { this.headers[String(k).toLowerCase()] = v; },
+  status(c) { this.statusCode = c; return this; },
+  json(o) { this.body = JSON.stringify(o); return this; },
+  send(d) { this.body = d; return this; },
+  end() { return this; },
+});
+
+const call = async (url, { ip = "203.0.113.7", headers = {} } = {}) => {
+  const req = {
+    url,
+    method: "GET",
+    headers: {
+      "user-agent": "test",
+      ...(ip ? { "x-real-ip": ip } : {}),
+      ...headers,
+    },
+    query: Object.fromEntries(new URL(url, "http://local").searchParams),
+  };
+  const res = mkRes();
+  await handler(req, res);
+  return res;
+};
+
+const bodyJson = (res) => {
+  try { return JSON.parse(String(res.body)); } catch { return null; }
+};
+
+const buildZip = (files) => {
+  const zip = new AdmZip();
+  for (const [name, content] of files) zip.addFile(name, Buffer.from(content));
+  return zip.toBuffer();
+};
+
+const okZip = buildZip([["pista.srt", "1\n00:00:01,000 --> 00:00:02,000\nhola\n"], ["nota.txt", "x"]]);
+
+// ===========================================================================
+// 1. isPublicIP (SSRF: la lista blanca es el control principal, esto es la
+//    defensa en profundidad para IPs literales y para hosts que resuelvan
+//    a rangos privados)
+// ===========================================================================
+section("1. isPublicIP: rangos privados bloqueados");
+for (const ip of ["127.0.0.1", "10.0.0.1", "172.16.5.5", "192.168.1.1", "169.254.169.254", "0.0.0.0", "100.64.0.1", "192.0.0.1", "198.18.0.1", "224.0.0.1", "240.0.0.1", "255.255.255.255"]) {
+  check(`IPv4 ${ip} es privada`, isPublicIP(ip) === false);
+}
+check("IPv4 8.8.8.8 es pública", isPublicIP("8.8.8.8") === true);
+check("IPv4 172.32.5.5 es pública (fuera de 172.16/12)", isPublicIP("172.32.5.5") === true);
+check("IPv4 100.128.0.1 es pública (fuera de CGNAT 100.64/10)", isPublicIP("100.128.0.1") === true);
+for (const ip of ["::1", "::", "fe80::1", "fc00::1", "fd12::1", "ff02::1", "::ffff:127.0.0.1", "::10.0.0.1"]) {
+  check(`IPv6 ${ip} es privada`, isPublicIP(ip) === false);
+}
+check("IPv6 2001:4860:4860::8888 es pública", isPublicIP("2001:4860:4860::8888") === true);
+check("IPv6 ::ffff:8.8.8.8 (mapped) es pública", isPublicIP("::ffff:8.8.8.8") === true);
+
+// ===========================================================================
+// 2. Rutas y errores de usuario
+// ===========================================================================
+section("2. Rutas: raíz amigable y errores de usuario");
+{
+  const res = await call("/");
+  check("GET / devuelve 200 autoexplicativo", res.statusCode === 200 && bodyJson(res)?.service === "HispaSubs Proxy");
+  check("GET / expone el uso", String(bodyJson(res)?.usage || "").includes("/proxy?zipUrl="));
+}
+{
+  // Con los rewrites de vercel.json, la función puede ver su propio path.
+  const res = await call("/api/proxy");
+  check("GET /api/proxy sin zipUrl responde como la raíz", res.statusCode === 200 && bodyJson(res)?.service === "HispaSubs Proxy");
+}
+{
+  const res = await call("/proxy");
+  check("GET /proxy sin zipUrl -> 400", res.statusCode === 400 && bodyJson(res)?.error === "Falta zipUrl");
+}
+{
+  const res = await call("/zzz");
+  check("GET /zzz sin zipUrl -> 400", res.statusCode === 400 && bodyJson(res)?.error === "Falta zipUrl");
+}
+{
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("esto-no-es-una-url"));
+  check("zipUrl ilegible -> 400", res.statusCode === 400 && bodyJson(res)?.error === "URL inválida");
+}
+{
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("http://dl.subdl.com/x.zip"));
+  check("http:// -> 400 (solo https)", res.statusCode === 400 && bodyJson(res)?.error === "Solo se permite https");
+}
+{
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://subdl.com/x.zip"));
+  check("host fuera de allowlist -> 403", res.statusCode === 403 && bodyJson(res)?.error === "Host no permitido");
+}
+
+// ===========================================================================
+// 3. Allowlist, puertos y SSRF
+// ===========================================================================
+section("3. Allowlist, puertos y red privada");
+fetchImpl = () => new Response(null, { status: 500 });
+{
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com:8443/x.zip"));
+  check("puerto 8443 rechazado (antes conectaba igual)", res.statusCode === 403 && bodyJson(res)?.error === "Puerto no permitido", JSON.stringify(bodyJson(res)));
+}
+{
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com:4443/x.zip"));
+  check("puerto 4443 rechazado", res.statusCode === 403 && bodyJson(res)?.error === "Puerto no permitido");
+}
+{
+  fetchLog = [];
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com:443/x.zip"));
+  check("puerto 443 explícito permitido (llega a fetch)", res.statusCode === 502 && fetchLog.length === 1, JSON.stringify(bodyJson(res)));
+}
+{
+  // Un host permitido que resuelva a una IP privada: SSRF vía DNS (host
+  // interno registrado en la allowlist por error).
+  dnsTable.set("dl.subdl.com", ["10.0.0.5"]);
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/x.zip"));
+  dnsTable.set("dl.subdl.com", ["104.20.1.1"]);
+  check("host allowlist que resuelve a IP privada -> 403", res.statusCode === 403 && /privada/.test(String(bodyJson(res)?.error)), JSON.stringify(bodyJson(res)));
+}
+{
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://127.0.0.1/x.zip"));
+  check("IP literal loopback -> 403", res.statusCode === 403);
+}
+
+// ===========================================================================
+// 4. Redirecciones: cada salto se valida (regresión del bypass de 1.0.2)
+// ===========================================================================
+section("4. Redirecciones validadas salto a salto");
+{
+  fetchLog = [];
+  let calls = 0;
+  fetchImpl = () => {
+    calls += 1;
+    if (calls === 1) return new Response(null, { status: 302, headers: { location: "https://dl.subdl.com/bueno.zip" } });
+    return new Response(null, { status: 302, headers: { location: "https://evil.com/malo.zip" } });
+  };
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/original.zip"));
+  check("salto a host no permitido -> 403", res.statusCode === 403 && bodyJson(res)?.error === "Redirección a host no permitido", JSON.stringify(bodyJson(res)));
+  check("no se sigue la redirección hostila", calls === 2, `fetch llamado ${calls} veces`);
+  check("todos los fetch usan redirect:manual", fetchLog.length === 2 && fetchLog.every((c) => c.init?.redirect === "manual"));
+}
+{
+  fetchImpl = () => new Response(null, { status: 302, headers: { location: "https://dl.subdl.com:8443/x.zip" } });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/x.zip"));
+  check("salto a puerto no permitido -> 403", res.statusCode === 403 && bodyJson(res)?.error === "Redirección a puerto no permitido", JSON.stringify(bodyJson(res)));
+}
+{
+  fetchImpl = () => new Response(null, { status: 302, headers: { location: "http://dl.subdl.com/x.zip" } });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/x.zip"));
+  check("salto a http:// -> 403 (mensaje de redirección)", res.statusCode === 403 && bodyJson(res)?.error === "Redirección a esquema no permitido", JSON.stringify(bodyJson(res)));
+}
+{
+  let calls = 0;
+  fetchImpl = () => {
+    calls += 1;
+    if (calls === 1) return new Response(null, { status: 302, headers: { location: "https://dl.subdl.com/b.zip" } });
+    return new Response(okZip, { status: 200 });
+  };
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/a.zip"));
+  check("cadena válida de 1 salto -> 200", res.statusCode === 200 && Buffer.isBuffer(res.body));
+}
+{
+  fetchImpl = () => new Response(null, { status: 302, headers: { location: "https://dl.subdl.com/b.zip" } });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/a.zip"));
+  check("redirecciones infinitas -> 403 tras el tope", res.statusCode === 403 && bodyJson(res)?.error === "Demasiadas redirecciones", JSON.stringify(bodyJson(res)));
+}
+
+// ===========================================================================
+// 5. Extracción del zip
+// ===========================================================================
+section("5. Extracción del zip");
+{
+  fetchImpl = () => new Response(okZip, { status: 200 });
+  fetchLog = [];
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check("zip con .srt -> 200", res.statusCode === 200);
+  check("devuelve el contenido del .srt", String(res.body).includes("hola"));
+  check("content-type text/plain", res.headers["content-type"] === "text/plain; charset=utf-8");
+  check("content-disposition con el nombre", String(res.headers["content-disposition"]).includes('filename="pista.srt"'));
+  check("cache-control 86400", res.headers["cache-control"] === "public, max-age=86400");
+}
+{
+  const zip = buildZip([["a.vtt", "WEBVTT\n"], ["b.srt", "1\n00:00:01,000 --> 00:00:02,000\nx\n"], ["c_small.srt", "peque\n"], ["d_big.srt", "g".repeat(5000)]]);
+  fetchImpl = () => new Response(zip, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check("prefiere .srt sobre .vtt y el más grande", res.statusCode === 200 && String(res.body).startsWith("g"));
+}
+{
+  const zip = buildZip([["pistä ño.srt", "contenido\n"]]);
+  fetchImpl = () => new Response(zip, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  const cd = String(res.headers["content-disposition"] || "");
+  check("nombre no-ASCII: cabecera 100% ASCII (sin CR/LF)", /^[\x20-\x7e]+$/.test(cd) && cd.includes("filename*=UTF-8''"), cd);
+  check("nombre no-ASCII: fallback ASCII legible", cd.includes('filename="pist_ _o.srt"'), cd);
+}
+{
+  const zip = buildZip([['pista con "comillas".srt', "contenido\n"]]);
+  fetchImpl = () => new Response(zip, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  const cd = String(res.headers["content-disposition"] || "");
+  check("comillas en el nombre sanitizadas", /^[\x20-\x7e]+$/.test(cd) && !cd.includes('comillas"'), cd);
+}
+{
+  const zip = buildZip([["leeme.txt", "no soy un subtitulo"], ["nota.md", "tampoco"]]);
+  fetchImpl = () => new Response(zip, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check("zip sin subtítulos -> 404", res.statusCode === 404);
+}
+{
+  // Stremio no descomprime .rar: el proxy tampoco debe devolverlos.
+  const zip = buildZip([["pelicula.rar", "Rar!\x1a"], ["pista.srt", "1\n00:00:01,000 --> 00:00:02,000\nx\n"]]);
+  fetchImpl = () => new Response(zip, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check(".rar ignorado: se sirve el .srt", res.statusCode === 200 && String(res.body).includes("00:00:01"));
+}
+{
+  const zip = buildZip([["solo.rar", "Rar!\x1a"]]);
+  fetchImpl = () => new Response(zip, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check("zip solo con .rar -> 404", res.statusCode === 404);
+}
+{
+  // Declarado > MAX_BYTES: se descarta ANTES de descomprimirlo.
+  const zip = buildZip([["gigante.srt", "a".repeat(MAX_BYTES + 1024)]]);
+  fetchImpl = () => new Response(zip, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check("entrada declarada > MAX_BYTES -> 404 (no se descomprime)", res.statusCode === 404);
+}
+{
+  fetchImpl = () => new Response(Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x62, 0x61, 0x73, 0x75]), { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check("zip corrupto -> 415", res.statusCode === 415);
+}
+{
+  fetchImpl = () => new Response(Buffer.from("<html><body>404</body></html>"), { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check("respuesta que no es zip -> 415", res.statusCode === 415);
+}
+{
+  fetchImpl = () => new Response(Buffer.alloc(MAX_BYTES + 1), { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check(`respuesta > ${MAX_BYTES / 1024 / 1024} MB -> 413`, res.statusCode === 413);
+}
+{
+  fetchImpl = () => new Response("boom", { status: 500 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check("origen con error -> 502", res.statusCode === 502 && bodyJson(res)?.error === "Origen respondió 500");
+}
+
+// ===========================================================================
+// 6. Rate limit por IP
+// ===========================================================================
+section("6. Rate limit por IP");
+process.env.RATE_LIMIT_PER_MIN = "3";
+{
+  fetchImpl = () => new Response("boom", { status: 500 });
+  const url = "/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip");
+  const codes = [];
+  for (let i = 0; i < 4; i++) codes.push((await call(url, { ip: "198.51.100.77" })).statusCode);
+  check("3 peticiones pasan y la 4ª da 429", JSON.stringify(codes) === JSON.stringify([502, 502, 502, 429]), JSON.stringify(codes));
+  const res = await call(url, { ip: "198.51.100.77" });
+  check("429 incluye Retry-After", res.statusCode === 429 && Number(res.headers["retry-after"]) >= 1, JSON.stringify(res.headers));
+  // La raíz (health check) no consume cuota.
+  for (let i = 0; i < 3; i++) await call("/", { ip: "198.51.100.88" });
+  const res2 = await call(url, { ip: "198.51.100.88" });
+  check("GET / no cuenta para el límite", res2.statusCode === 502, JSON.stringify(bodyJson(res2)));
+  // x-forwarded-for (sin x-real-ip): se usa el primer salto.
+  const fwd = { ip: null, headers: { "x-forwarded-for": "198.51.100.99, 10.0.0.1" } };
+  const codes2 = [];
+  for (let i = 0; i < 4; i++) codes2.push((await call(url, fwd)).statusCode);
+  check("usa el primer salto de x-forwarded-for", JSON.stringify(codes2) === JSON.stringify([502, 502, 502, 429]), JSON.stringify(codes2));
+  // Desactivado con 0.
+  process.env.RATE_LIMIT_PER_MIN = "0";
+  let ok = true;
+  for (let i = 0; i < 6; i++) {
+    if ((await call(url, { ip: "198.51.100.100" })).statusCode === 429) ok = false;
+  }
+  check("RATE_LIMIT_PER_MIN=0 desactiva el límite", ok);
+  delete process.env.RATE_LIMIT_PER_MIN;
+}
+
+// ===========================================================================
+// 7. Sincronía con la allowlist del worker
+// ===========================================================================
+section("7. allowlist del proxy vs del worker");
+{
+  const { readFile } = await import("node:fs/promises");
+  const workerSrc = await readFile(new URL("./worker.js", import.meta.url), "utf8");
+  const missing = ALLOWED_HOSTS.filter((h) => !workerSrc.includes(`"${h}"`));
+  check("worker.js conoce todos los hosts del proxy", missing.length === 0, `faltan: ${missing.join(", ")}`);
+  check("sin comodines en la allowlist", !ALLOWED_HOSTS.includes("*") && ALLOWED_HOSTS.length >= 5);
+}
+
+// ===========================================================================
+// Resumen
+// ===========================================================================
+console.log(`\n${pass} ok, ${fail} fallos`);
+process.exit(fail > 0 ? 1 : 0);

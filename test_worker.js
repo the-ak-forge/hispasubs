@@ -204,5 +204,86 @@ try {
   globalThis.fetch = origFetch;
 }
 
+// 10) v1.3.1 (auditoría de código): entradas no servibles, contenido que no
+// es subtítulo, caché explícita, rate limit y manifest sin firma obsoleta.
+const origFetch2 = globalThis.fetch;
+try {
+  globalThis.fetch = (input, init) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      // Lista rica solo para el ID de la prueba de clasificación; el resto
+      // (vacíos y rate limit) reciben respuesta vacía.
+      const subtitles = u.includes("tt9999999") ? [
+        { id: "r1", url: "https://subs5.strem.io/pelicula.rar", lang: "spa" },
+        { id: "z1", url: "https://ejemplo.com/hosts/sub.zip", lang: "spa" },
+        { id: "h1", url: "https://subs5.strem.io/html.srt", lang: "spa" },
+        { id: "g1", url: "https://subs5.strem.io/gibberish.srt", lang: "spa" },
+        { id: "ok", url: "https://subs5.strem.io/ok.srt", lang: "spa" },
+        { id: "eses", url: "https://subs5.strem.io/eses.srt", lang: "es-ES" },
+      ] : [];
+      return Promise.resolve(new Response(JSON.stringify({ subtitles }),
+        { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("html.srt")) {
+      return Promise.resolve(textResp("<!DOCTYPE html><html><body>404 Not Found</body></html>"));
+    }
+    if (u.includes("gibberish.srt")) return Promise.resolve(textResp("zzzz qqqq xxxx jj kk ll vv nn mm"));
+    if (u.includes("eses.srt") || u.includes("ok.srt")) return Promise.resolve(textResp(TXT_CAST));
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+
+  res = await get("/subtitles/movie/tt9999999.json");
+  const j10 = await res.json();
+  const e10 = j10.subtitles || [];
+
+  check("v1.3.1: .rar descartado (Stremio no descomprime, el proxy solo hace zip)",
+    !e10.some((e) => e.url.includes(".rar")), JSON.stringify(e10.map((e) => e.url)).slice(0, 200));
+  check("v1.3.1: .zip fuera de la allowlist del proxy descartado",
+    !e10.some((e) => e.url.includes("ejemplo.com")), JSON.stringify(e10.map((e) => e.url)).slice(0, 200));
+  const htmlEntry = e10.find((e) => e.url.includes("html.srt"));
+  check("v1.3.1: HTML de error -> 'sin clasificar' (antes caía en Neutro)",
+    htmlEntry?.label === "📄 Español (sin clasificar · OS-V3)", JSON.stringify(htmlEntry).slice(0, 160));
+  const gibEntry = e10.find((e) => e.url.includes("gibberish.srt"));
+  check("v1.3.1: 0 matches léxicos -> 'sin clasificar' (antes caía en Neutro)",
+    gibEntry?.label === "📄 Español (sin clasificar · OS-V3)", JSON.stringify(gibEntry).slice(0, 160));
+  check("v1.3.1: filtro de idioma acepta variantes (es-ES)",
+    e10.some((e) => e.url.includes("eses.srt")), JSON.stringify(e10.map((e) => e.url)).slice(0, 200));
+  check("v1.3.1: Cache-Control explícito de 2h en la lista",
+    res.headers.get("cache-control") === "public, max-age=7200", res.headers.get("cache-control"));
+
+  // 10b) Caché negativa: la lista vacía lleva TTL corto (60 s).
+  res = await get("/subtitles/movie/tt8888888.json"); // ambas fuentes -> []
+  check("v1.3.1: lista vacía con Cache-Control 60s (caché negativa)",
+    res.headers.get("cache-control") === "public, max-age=60", res.headers.get("cache-control"));
+
+  // 10c) Manifest: sin la firma inválida (estaba generada para v1.2.0).
+  res = await get("/manifest.json");
+  const m10 = await res.json();
+  check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
+    !("stremioAddonsConfig" in m10));
+  check("v1.3.1: manifest version 1.3.1", m10.version === "1.3.1", m10.version);
+
+  // 10d) Rate limit por IP (solo peticiones sin caché). Cada petición usa un
+  // ID distinto para que siempre sea cache-miss y el conteo sea determinista.
+  const rlReq = (ip, n) => worker.fetch(
+    new Request(`${base}/subtitles/movie/tt777777${n}.json`, { headers: { "cf-connecting-ip": ip } }),
+    { RATE_LIMIT: "3" }, {});
+  const rlCodes = [];
+  for (let i = 0; i < 4; i++) rlCodes.push((await rlReq("203.0.113.99", i)).status);
+  check("v1.3.1: 3 peticiones sin caché y la 4ª -> 429",
+    JSON.stringify(rlCodes) === JSON.stringify([200, 200, 200, 429]), JSON.stringify(rlCodes));
+  const rlRes = await rlReq("203.0.113.99", 9);
+  check("v1.3.1: el 429 lleva Retry-After",
+    rlRes.status === 429 && Number(rlRes.headers.get("retry-after")) >= 1,
+    String(rlRes.headers.get("retry-after")));
+  const noIp = await worker.fetch(
+    new Request(`${base}/subtitles/movie/tt7777778.json`), { RATE_LIMIT: "3" }, {});
+  check("v1.3.1: sin cf-connecting-ip no se limita (tests/entornos sin CF)",
+    noIp.status === 200, String(noIp.status));
+} finally {
+  globalThis.fetch = origFetch2;
+}
+
 console.log(`\n${pass} ok, ${fail} fallos`);
 if (fail) Deno.exit(1);
