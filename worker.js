@@ -1,7 +1,19 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.3.0
+// HispaSubs — Cloudflare Worker v1.3.1
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
 //
+// v1.3.1 (auditoría 18/10/2026):
+//  - Firma del manifest eliminada: estaba generada para el manifest de
+//    v1.2.0 y dejó de validar al subir la versión (ver cambio 21).
+//  - Solo se enrutan al proxy de Vercel los .zip cuyo host está en su
+//    allowlist; los .rar y demás formatos que nadie puede abrir se
+//    descartan en vez de publicar una URL rota.
+//  - El análisis valida el contenido: HTML, binario, vacío o 0 matches ya
+//    no se etiquetan "🌎 Neutro", sino "📄 sin clasificar".
+//  - Descarga del análisis acotada a 1 MB (un arrayBuffer() completo podía
+//    tirar el isolate).
+//  - Cache-Control explícito (2 h listas / 60 s negativas) y rate limit por
+//    IP configurable (RATE_LIMIT, 0 = desactivado).
 // v1.3.0: formato canónico del protocolo: `lang` ISO 639-2 ("spa") + `label`
 //         con la etiqueta visible. La app móvil agrupa por código de idioma
 //         (con `lang` de texto libre no listaba NINGUNA entrada); el
@@ -54,7 +66,37 @@ const hashStr = (s) => {
 };
 
 const isHttpUrl = (u) => typeof u === "string" && /^https?:\/\//i.test(u);
-const isCompressed = (u) => /\.(zip|rar)(\?|$)/i.test(u);
+
+// Solo .zip: el proxy de Vercel extrae zips con adm-zip. Un .rar no lo abre
+// Stremio (no descomprime) ni nosotros -> esas entradas se filtran en la
+// fusión de fuentes en vez de servir una URL que devolvería 415.
+const isCompressed = (u) => /\.zip(\?|$)/i.test(u);
+
+// Formatos comprimidos que NADIE de la cadena puede abrir: se descartan.
+const isUnserveable = (u) => /\.(rar|7z|gz|bz2|xz|tar)(\?|$)/i.test(u);
+
+// Hosts que el proxy de Vercel acepta. GEMELO de ALLOWED_HOSTS en
+// api/proxy.js: si cambia uno, cambia el otro (si no, el .zip de esa fuente
+// se enruta a un proxy que responde 403 y la entrada queda irreproducible).
+const PROXY_ALLOWED_HOSTS = [
+  "dl.subdl.com",
+  "www.opensubtitles.org",
+  "dl.opensubtitles.org",
+  "files.opensubtitles.org",
+  "dl6.opensubtitles.org",
+];
+
+// Un .zip solo se enruta al proxy si este lo puede descargar (https + host
+// en allowlist). Si no, se trata como no servible.
+const isProxyable = (u) => {
+  if (!isCompressed(u)) return false;
+  try {
+    const url = new URL(u);
+    return url.protocol === "https:" && PROXY_ALLOWED_HOSTS.includes(url.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+};
 
 // Formato de cada entrada (campos del protocolo de Stremio):
 //  - `lang`: SIEMPRE el código ISO 639-2 "spa". El cliente móvil (núcleo
@@ -92,6 +134,13 @@ const fetchJSON = async (url, ms = 2500) => {
 // Descarga un .srt y lo decodifica con fallback: muchos SRTs antiguos son
 // Windows-1252; en UTF-8 los acentos se rompen y el diccionario deja de
 // matchear, sesgando todo hacia "Neutro".
+//
+// La lectura va ACOTADA a 1 MB: con arrayBuffer() completo, un fichero
+// enorme (o una respuesta que no es un subtítulo) podía cargar cientos de MB
+// en el isolate (128 MB) y tumbar la petición. Para muestrear el léxico,
+// 1 MB es un techo más que holgado.
+const MAX_ANALYZE_BYTES = 1024 * 1024;
+
 const fetchSubtitleText = async (url, ms = 2000) => {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
@@ -101,7 +150,9 @@ const fetchSubtitleText = async (url, ms = 2000) => {
       signal: controller.signal,
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const buf = await res.arrayBuffer();
+    const declared = Number(res.headers.get("content-length") || 0);
+    if (declared > MAX_ANALYZE_BYTES) throw new Error("subtítulo demasiado grande");
+    const buf = await readCapped(res, MAX_ANALYZE_BYTES);
     let text = new TextDecoder("utf-8").decode(buf);
     if (text.includes("\uFFFD")) {
       try { text = new TextDecoder("windows-1252").decode(buf); } catch { /* codec no disponible: nos quedamos con UTF-8 */ }
@@ -111,6 +162,34 @@ const fetchSubtitleText = async (url, ms = 2000) => {
     clearTimeout(timer); // también cubre el body: abort() corta el stream
   }
 };
+
+// Lee como mucho `max` bytes y cancela el stream. En entornos sin streaming
+// (o si el body ya viene materializado) caemos a arrayBuffer() y cortamos.
+async function readCapped(res, max) {
+  if (!res.body || typeof res.body.getReader !== "function") {
+    const ab = await res.arrayBuffer();
+    return ab.byteLength > max ? ab.slice(0, max) : ab;
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done || total >= max) break;
+    const room = max - total;
+    const take = value.length > room ? value.subarray(0, room) : value;
+    chunks.push(take);
+    total += take.length;
+  }
+  try { await reader.cancel(); } catch { /* stream ya cerrado */ }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.length;
+  }
+  return out;
+}
 
 // Cache API tolerante: en algunos entornos caches.default no está disponible.
 const cacheMatch = async (request) => {
@@ -122,13 +201,49 @@ const cachePut = (ctx, request, response) => {
   } catch { /* caches.default no disponible en este entorno: seguimos sin cache */ }
 };
 
-const jsonResponse = (obj) =>
+// Cache-Control explícito. La Cache API de Cloudflare aplica por defecto un
+// Edge TTL de 120 min a un 200 sin cabecera, es decir: el TTL vivía oculto en
+// el default de la plataforma. Ahora está declarado:
+//   7200 s: lista normal de subtítulos.
+//    60 s: resultados vacíos o error (caché NEGATIVA: si un proveedor cae, no
+//          se pagan 2,5 s de timeouts en cada petición de ese título).
+const jsonResponse = (obj, cacheSeconds) =>
   new Response(JSON.stringify(obj), {
     headers: {
       "Access-Control-Allow-Origin": "*",
       "Content-Type": "application/json",
+      ...(cacheSeconds ? { "Cache-Control": `public, max-age=${cacheSeconds}` } : {}),
     },
   });
+
+// ---------------------------------------------------------------------------
+// Rate limit por IP (best-effort, en memoria del isolate)
+//
+// Ventana fija de 60 s. Solo cuenta peticiones SIN caché: las cacheadas no
+// cuestan nada arriba y así un tope razonable no castiga a usuarios reales
+// (que repiten la misma petición al abrir el reproductor). Es un atenuador,
+// no una defensa de plataforma: para eso hay reglas de rate limiting en el
+// panel de Cloudflare. Desactivable con RATE_LIMIT=0 (wrangler.toml / vars).
+// ---------------------------------------------------------------------------
+const rateHits = new Map();
+const rateLimit = (ip, limit) => {
+  const now = Date.now();
+  if (rateHits.size > 5000) {
+    for (const [k, v] of rateHits) if (v.reset <= now) rateHits.delete(k);
+  }
+  let entry = rateHits.get(ip);
+  if (!entry || entry.reset <= now) {
+    entry = { count: 0, reset: now + 60_000 };
+    rateHits.set(ip, entry);
+  }
+  entry.count += 1;
+  if (entry.count > limit) {
+    // Un solo log por IP y ventana: un ataque no debe ahogar los logs.
+    if (entry.count === limit + 1) console.warn(`[rate-limit] ${ip} superó ${limit}/min`);
+    return Math.max(1, Math.ceil((entry.reset - now) / 1000));
+  }
+  return null;
+};
 
 // ---------------------------------------------------------------------------
 // Config (base64url embebido en la URL)
@@ -186,10 +301,9 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.3.0",
+  version: "1.3.1",
   name: "HispaSubs",
-  // Descripción ESTÁTICA: si varía con la config, la firma de abajo deja de
-  // coincidir con el manifest registrado en stremio-addons.net.
+  // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
     "Filtro inteligente de dialectos en español (🇲🇽 Latino / 🇪🇸 Castellano / 🌎 Neutro). OpenSubtitles V3 nativo + soporte SubDL.",
   logo: `https://${host}/logo.svg`,
@@ -198,13 +312,12 @@ const getManifest = (host) => ({
   catalogs: [],
   idPrefixes: ["tt"],
   behaviorHints: { configurable: true },
-  // La firma solo es válida para un manifest byte a byte idéntico al
-  // registrado. Regenera este bloque con stremio-addons.net o elimínalo.
-  stremioAddonsConfig: {
-    issuer: "https://stremio-addons.net",
-    signature:
-      "eyJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2In0..I_TfY_MkwEz6JZ4Dz_iheA.lQvOABYkxbWdyl0gtUIAkRNqV44rLUY_kIlflyxXSxHKgii-IbQGkMmA19NxUlqLI9vJGbUq9mrKo8fYbfcJ8aRrOdIoSKqq0ACZhEh67nAXPrH_F2dAAcIXBsF-frME.sp-1lBwTFqkf4CPaQgMEbw",
-  },
+  // SIN firma stremioAddonsConfig: la que había estaba generada para el
+  // manifest de v1.2.0 (commit f8eff37) y al subir la versión dejó de validar
+  // (la firma cubre el manifest byte a byte, incluido `version` y `logo`, que
+  // depende del host). Una firma inválida es peor que ninguna. Para firmar de
+  // nuevo: publica este manifest en stremio-addons.net y pega aquí el bloque
+  // que te devuelva.
 });
 
 // ---------------------------------------------------------------------------
@@ -222,8 +335,11 @@ const getOpenSubtitlesV3 = async (type, fullId) => {
       // Guard por entrada: una sub sin URL ya no invalida toda la fuente.
       .filter((sub) => sub && isHttpUrl(sub.url))
       .filter((sub) => {
-        const l = (sub.lang || "").toLowerCase();
-        return l.includes("spa") || l === "es";
+        // ISO 639-2 ("spa") y variantes usuales ("es", "es-ES", "es-419",
+        // "esp", "span"): el resto de idiomas se descarta. Antes solo
+        // aceptaba includes("spa") o "es" exacto.
+        const l = (sub.lang || "").toLowerCase().trim();
+        return /^(?:spa|esp|span|es)(?:[-_][a-z0-9]{2,8})?$/.test(l);
       })
       .map((sub) => ({
         id: sub.id || `os_${hashStr(sub.url)}`,
@@ -306,6 +422,14 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
 // Motor de análisis léxico
 // ---------------------------------------------------------------------------
 
+// 📄 = "no analizado" (nunca una variante): distinto de 🇪🇸/🇲🇽/🌎.
+const unclassified = (sub, finalUrl) => ({
+  id: sub.id,
+  url: finalUrl,
+  lang: LANG_ISO_ES,
+  label: `📄 Español (sin clasificar · ${sub.source})`,
+});
+
 const classifySubtitle = async (sub) => {
   // Guard ANTES de cualquier acceso a sub.url (evita el crash en cascada
   // de Promise.all del 1.0.0).
@@ -320,9 +444,27 @@ const classifySubtitle = async (sub) => {
   try {
     // El proxy tarda más (descarga + descomprime): timeout amplio para zips.
     const text = await fetchSubtitleText(finalUrl, isZip ? 6000 : 2000);
+
+    // Validación del CONTENIDO antes de etiquetar. "🌎 Neutro" significaba
+    // "vocabulario equilibrado", pero con HTML de error, binario (un zip sin
+    // descomprimir), vacío o 0 matches lo que había era CERO datos, y de cero
+    // datos no se puede afirmar que nada: eso es 📄 "sin clasificar".
+    const sample = text.trim();
+    const isHtml = /^\s*<(!doctype|html|head|meta|title|body|div|p|span|table)\b/i.test(sample);
+    const looksLikeZip = sample.charCodeAt(0) === 0x50 && sample.charCodeAt(1) === 0x4b;
+    if (!sample || looksLikeZip || isHtml) {
+      console.error("[classify]", sub.source, "contenido que no es texto de subtítulo");
+      return unclassified(sub, finalUrl);
+    }
+
     const esMatches = (text.match(DICT_ES) || []).length;
     const latMatches = (text.match(DICT_LAT) || []).length;
     const total = esMatches + latMatches;
+    if (total === 0) {
+      // Ni una sola palabra del léxico: probablemente no sea un subtítulo en
+      // español ni siquiera (idioma erróneo, fichero de créditos...).
+      return unclassified(sub, finalUrl);
+    }
 
     // Margen proporcional: con 3 apariciones de "coche" ya no decides un
     // subtítulo entero; hace falta cierta ventaja relativa.
@@ -335,8 +477,7 @@ const classifySubtitle = async (sub) => {
     return { id: sub.id, url: finalUrl, lang: LANG_ISO_ES, label: `${flag} (${sub.source})` };
   } catch (error) {
     console.error("[classify]", sub.source, error.message);
-    // 📄 = "no analizado" (nunca una variante): distinto de 🇪🇸/🇲🇽/🌎.
-    return { id: sub.id, url: finalUrl, lang: LANG_ISO_ES, label: `📄 Español (sin clasificar · ${sub.source})` };
+    return unclassified(sub, finalUrl);
   }
 };
 
@@ -345,7 +486,7 @@ const classifySubtitle = async (sub) => {
 // ---------------------------------------------------------------------------
 
 export default {
-  async fetch(request, _env, ctx) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const pathParts = url.pathname.split("/").filter(Boolean);
 
@@ -426,6 +567,27 @@ export default {
         const cached = await cacheMatch(request);
         if (cached) return cached;
 
+        // Límite por IP, solo en peticiones sin caché (las cacheadas no cuestan
+        // nada arriba). RATE_LIMIT: peticiones/minuto e IP, 0 = desactivado.
+        // Sin cabecera cf-connecting-ip (tests, entornos sin Cloudflare) no se
+        // limita, para no bloquear a todos bajo la misma clave vacía.
+        const ip = request.headers.get("cf-connecting-ip");
+        const limit = Number(env.RATE_LIMIT ?? 120);
+        if (ip && Number.isFinite(limit) && limit > 0) {
+          const retryAfter = rateLimit(ip, limit);
+          if (retryAfter) {
+            return new Response(JSON.stringify({ error: "rate limit" }), {
+              status: 429,
+              headers: {
+                "Access-Control-Allow-Origin": "*",
+                "Content-Type": "application/json",
+                "Cache-Control": "no-store",
+                "Retry-After": String(retryAfter),
+              },
+            });
+          }
+        }
+
         const [osSubs, sdlSubs] = await Promise.allSettled([
           getOpenSubtitlesV3(type, fullId),
           getSubDL(imdbId, season, episode, config.subdlKey, type),
@@ -444,10 +606,27 @@ export default {
           ...(sdlSubs.status === "fulfilled" ? sdlSubs.value : []),
         ];
 
+        // Descarte de entradas que no se pueden SERVIR: formatos que nadie
+        // descomprime (.rar y cía) y .zip cuyo host no está en la allowlist
+        // del proxy de Vercel (esa URL acabaría en 403/415: mejor no ofrecerla
+        // que ofrecer una entrada que falla al reproducir).
+        const serveable = [];
+        let dropped = 0;
+        for (const sub of rawSubs) {
+          if (isUnserveable(sub.url) || (isCompressed(sub.url) && !isProxyable(sub.url))) {
+            dropped += 1;
+            continue;
+          }
+          serveable.push(sub);
+        }
+        if (dropped) {
+          console.log(`[subtitles] ${dropped} entradas descartadas (formato o host no servible)`);
+        }
+
         // Deduplicación por URL (OS y SubDL devuelven los mismos títulos).
         const seenUrls = new Set();
         const deduped = [];
-        for (const sub of rawSubs) {
+        for (const sub of serveable) {
           const key = sub.url.split("#")[0];
           if (seenUrls.has(key)) continue;
           seenUrls.add(key);
@@ -455,9 +634,13 @@ export default {
         }
 
         // Sin resultados: se devuelve lista vacía real (adiós al "diag_1" de pastebin).
+        // Con caché negativa de 60 s: un proveedor caído no se paga en cada
+        // petición del mismo título.
         if (deduped.length === 0) {
           console.log(`[subtitles] 0 resultados para ${type}/${fullId}`);
-          return jsonResponse({ subtitles: [] });
+          const empty = jsonResponse({ subtitles: [] }, 60);
+          cachePut(ctx, request, empty);
+          return empty;
         }
 
         // Análisis equilibrado: hasta 3 por fuente. En 1.0.0 las subs de
@@ -479,14 +662,17 @@ export default {
         );
 
         const subtitles = analyzed.filter(Boolean);
-        const response = jsonResponse({ subtitles });
+        const response = jsonResponse({ subtitles }, 7200);
         cachePut(ctx, request, response);
         return response;
       } catch (err) {
         // Los errores de una request no deben romper la respuesta de Stremio,
-        // pero al menos ahora quedan registrados.
+        // pero al menos ahora quedan registrados. Caché negativa corta (60 s)
+        // para no repetir el fallo en cada petición del mismo título.
         console.error("[subtitles] error inesperado:", err.message);
-        return jsonResponse({ subtitles: [] });
+        const failed = jsonResponse({ subtitles: [] }, 60);
+        cachePut(ctx, request, failed);
+        return failed;
       }
     }
 
@@ -538,3 +724,31 @@ export default {
 //     visible ("🇲🇽 Latino (OS-V3)"), que el escritorio (stremio-web) muestra
 //     tal cual. Retrocompatible: las URLs de config de 1.2.0 (langMode/
 //     isoLang) se ignoran y sirven este mismo formato.
+//
+// v1.3.1 (auditoría de código y de los despliegues en vivo, 18/10/2026):
+// 21. [FIRMA] El bloque stremioAddonsConfig estaba generado con el manifest
+//     de v1.2.0 (commit f8eff37): desde la v1.3.0 dejaba de validar (la
+//     firma cubre el manifest byte a byte, incluido `version` y el `logo`,
+//     que además depende del host). Eliminado: una firma inválida es peor
+//     que ninguna. Para volver a firmar: publica el manifest actual en
+//     stremio-addons.net y pega aquí el bloque que devuelva.
+// 22. [PROXY] Entradas que no se pueden SERVIR descartadas al fusionar
+//     fuentes: .rar y cía (Stremio no descomprime y el proxy solo hace zip)
+//     y .zip cuyo host no está en la allowlist del proxy (terminaría en
+//     403/415). Antes se publicaban igual, como entradas irreproducibles.
+// 23. [CLASIFICACIÓN] Contenido que no es texto de subtítulo (HTML de error,
+//     binario, vacío) o con 0 matches léxicos ya no cae en "🌎 Neutro" por
+//     defecto: se etiqueta "📄 sin clasificar". "Neutro" solo se afirma con
+//     datos reales.
+// 24. [MEMORIA] Análisis acotado a 1 MB (antes arrayBuffer() completo: un
+//     fichero enorme cargaba cientos de MB en un isolate de 128 MB).
+// 25. [CACHÉ] Cache-Control explícito en las respuestas JSON: 2 h para las
+//     listas y 60 s para vacías/error (caché negativa: un proveedor caído ya
+//     no cuesta 2,5 s de timeouts por cada petición del mismo título). Antes
+//     el TTL era el Edge TTL por defecto de la plataforma (120 min).
+// 26. [ABUSO] Rate limit por IP en memoria del isolate: 120 peticiones sin
+//     caché por minuto e IP por defecto, configurable con RATE_LIMIT (0 =
+//     off), con 429 + Retry-After. Atenuador, no defensa: la regla seria va
+//     en el panel de Cloudflare.
+// 27. [IDIOMA] Filtro de OpenSubtitles V3 ampliado a variantes del código
+//     (es-ES, es-419, esp, span): antes solo "spa" o "es" exacto.

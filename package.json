@@ -1,13 +1,15 @@
 {
   "name": "hispasubs-addon",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "description": "Proxy ZIP extractor for HispaSubs",
-  "main": "index.js",
+  "main": "api/proxy.js",
   "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "test": "npm run test:worker && npm run test:proxy",
+    "test:worker": "deno run --allow-net test_worker.js",
+    "test:proxy": "node test_proxy.js"
   },
   "dependencies": {
-    "adm-zip": "^0.5.10"
+    "adm-zip": "^0.6.1"
   }
 }

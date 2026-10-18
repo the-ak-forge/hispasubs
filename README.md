@@ -1,5 +1,7 @@
 # HispaSubs 🇲🇽 🇪🇸
 
+[![CI](https://github.com/the-ak-forge/hispasubs/actions/workflows/ci.yml/badge.svg)](https://github.com/the-ak-forge/hispasubs/actions/workflows/ci.yml)
+
 > Clasificador inteligente de subtítulos en español para Stremio
 
 HispaSubs te ayuda a identificar rápidamente si un subtítulo está orientado a España, Latinoamérica o si es neutral. Evita el problema clásico de activar un archivo marcado como “Español” y descubrir, a mitad de la reproducción, que está escrito con un vocabulario regional muy distinto al que esperabas.
@@ -13,8 +15,8 @@ El complemento analiza el texto de los subtítulos, detecta expresiones, pronomb
 - Clasificación léxica inteligente
   - 🇲🇽 Latino: detecta vocabulario, pronombres y expresiones comunes de América Latina (`ustedes`, `celular`, `carro`, `manejar`, `enojar`, etc.).
   - 🇪🇸 Castellano: detecta conjugaciones y giros propios de España (`vosotros`, `ordenador`, `coche`, `conducir`, `enfadar`, etc.).
-  - 🌎 Neutro: identifica subtítulos con vocabulario equilibrado o sin localismos marcados.
-  - 📄 Español (sin clasificar): subtítulos en español que no llegaron a analizarse (ver [Solución de problemas](#-solución-de-problemas)).
+  - 🌎 Neutro: identifica subtítulos con vocabulario equilibrado o sin localismos marcados (solo se emite cuando el análisis encontró datos reales; un archivo sin ningún match léxico recibe 📄, no 🌎).
+  - 📄 Español (sin clasificar): subtítulos que no llegaron a analizarse o cuyo contenido no resultó ser texto de subtítulo (HTML de error, binario, vacío o sin coincidencias léxicas; ver [Solución de problemas](#-solución-de-problemas)).
 
 - Sin configuración obligatoria
   - Incluye soporte predeterminado para OpenSubtitles V3.
@@ -25,11 +27,11 @@ El complemento analiza el texto de los subtítulos, detecta expresiones, pronomb
 
 - Integración opcional con SubDL
   - Añade tu [clave API gratuita de SubDL](https://subdl.com/panel/api) para ampliar el catálogo de subtítulos.
-  - Los archivos comprimidos (`.zip`) de SubDL se descomprimen **y se clasifican automáticamente**: reciben la misma etiqueta de región que los subtítulos sueltos.
+  - Los archivos comprimidos (`.zip`) de SubDL **en hosts permitidos** se descomprimen **y se clasifican automáticamente**: reciben la misma etiqueta de región que los subtítulos sueltos. Las entradas que no se pueden servir (`.rar` y `.zip` de hosts fuera de la lista permitida) se descartan en lugar de ofrecer una pista que fallaría al reproducir.
 
 - Privacidad y rendimiento
   - Ejecuta la lógica en Edge con baja latencia.
-  - No almacena datos ni credenciales del usuario: tu clave de SubDL vive en tu configuración de Stremio, no en servidores propios.
+  - No almacena datos ni credenciales del usuario: tu clave de SubDL vive en tu configuración de Stremio, no en servidores propios. *Nota de transparencia:* esa clave viaja codificada en la URL de instalación (formato base64url del propio protocolo de configuración de Stremio) y se usa como cabecera `Api-Key` en las llamadas a la API de SubDL; no se registra en ningún servidor propio, pero cualquiera que intercepte la petición a `api.subdl.com` podría leerla (igual que con cualquier addon que use esta API).
 
 ---
 
@@ -60,8 +62,8 @@ HispaSubs inspecciona el contenido textual de cada subtítulo e identifica patro
 | --- | --- |
 | 🇪🇸 Castellano | Analizado. Vocabulario y giros de España. |
 | 🇲🇽 Latino | Analizado. Vocabulario latinoamericano. |
-| 🌎 Neutro | Analizado. Sin inclinación regional marcada. |
-| 📄 Español (sin clasificar) | En español, pero sin analizar: se analizan hasta 3 subtítulos por fuente por título, o el análisis falló (p. ej. rate limit del proveedor). |
+| 🌎 Neutro | Analizado. Sin inclinación regional marcada (solo si hubo coincidencias léxicas reales). |
+| 📄 Español (sin clasificar) | En español, pero sin analizar: se analizan hasta 3 subtítulos por fuente por título, el análisis falló (p. ej. rate limit del proveedor) o el contenido no era texto de subtítulo (HTML de error, binario, vacío o sin ninguna palabra del léxico). |
 
 Esto permite distinguir entre versiones del español con matices regionales sin depender de metadatos ambiguos o genéricos.
 
@@ -69,13 +71,15 @@ Esto permite distinguir entre versiones del español con matices regionales sin 
 
 ## 🏗️ Arquitectura técnica
 
-- **Worker en Cloudflare (Edge)**
+- **Worker en Cloudflare (Edge)** — `worker.js` (+ `wrangler.toml`)
   - Gestiona rutas, resolución de manifiestos, consultas en paralelo a las fuentes y la evaluación léxica.
-  - Cachea respuestas de listas para no repetir análisis.
+  - Cachea respuestas de listas (2 h; resultados vacíos 60 s como caché negativa) y aplica un rate limit por IP configurable (`RATE_LIMIT`, por defecto 120 peticiones sin caché/minuto; `0` lo desactiva).
 
-- **Proxy en Vercel (Node.js + `adm-zip`)**
-  - Descarga los `.zip` de SubDL y extrae el `.srt` en memoria RAM, sin tocar disco.
+- **Proxy en Vercel (Node.js + `adm-zip`)** — `api/proxy.js` (+ `vercel.json`)
+  - Descarga los `.zip` de SubDL y extrae el `.srt` en memoria RAM, sin tocar disco. Máximo 4 MB (límite de respuesta de Vercel).
+  - Solo acepta `https`, únicamente los hosts de la allowlist (`dl.subdl.com` y los CDN de OpenSubtitles), solo puerto 443, y valida cada salto de redirección contra IPs privadas (SSRF).
   - Sirve el subtítulo ya limpio al reproductor **y** canaliza el archivo al Worker para su clasificación.
+  - Limita las peticiones por IP (`RATE_LIMIT_PER_MIN`, por defecto 120/min; `0` lo desactiva).
 
 - **Fuentes de subtítulos**
   - [OpenSubtitles V3](https://www.opensubtitles.org) (addon de la comunidad de Stremio, siempre activa).
@@ -88,10 +92,20 @@ Esto permite distinguir entre versiones del español con matices regionales sin 
 
 ## 🚀 Despliegue y rollback
 
-El repositorio reúne los dos componentes en la raíz:
+El repositorio reúne los dos componentes:
 
-- **Worker (Cloudflare)**: `worker.js`. Se despliega con `npx wrangler deploy worker.js --name hispasubs`.
-- **Proxy (Vercel)**: `index.js` + `vercel.json`. Vercel lo despliega automáticamente al hacer `push` a `main`, con el *Root Directory* en la raíz del repo.
+- **Worker (Cloudflare)**: `worker.js` + `wrangler.toml`. Se despliega con `npx wrangler deploy` (lee `wrangler.toml`: nombre, fichero de entrada y `compatibility_date`).
+- **Proxy (Vercel)**: `api/proxy.js` + `vercel.json`. Vercel lo despliega automáticamente al hacer `push` a `main`, con el *Root Directory* en la raíz del repo. `vercel.json` enruta todo (`/`, `/proxy?...`) a la función y fija un `maxDuration` de 60 s.
+
+### Tests
+
+```bash
+npm test            # requiere Deno (tests del worker) y Node (tests del proxy)
+```
+
+- `test_worker.js` (Deno): suite del Worker; incluye una llamada real a OpenSubtitles opcional (best effort).
+- `test_proxy.js` (Node): suite del proxy, con `dns.lookup` y `fetch` simulados, así que no necesita red.
+- CI en GitHub Actions (`.github/workflows/ci.yml`): instala con `npm ci`, ejecuta ambas suites y falla si `npm audit` detecta vulnerabilidades *high*/*critical*.
 
 ### Volver a una versión anterior del Worker
 
@@ -100,7 +114,7 @@ Cada versión publicada está en el historial de git, así que no hacen falta co
 ```bash
 git log --oneline -- worker.js              # localizar la versión
 git show <commit>:worker.js > worker.js     # restaurarla
-npx wrangler deploy worker.js --name hispasubs
+npx wrangler deploy
 ```
 
 La copia histórica de la v1.1.0 quedó en el commit inicial del repo (se localiza con `git log --diff-filter=A --oneline -- worker.v1.1.0.js`; su cabecera interna dice «v1.0.1» aunque su `manifest` publicaba `1.1.0`).
@@ -111,6 +125,30 @@ Cada plataforma guarda sus propios despliegues y permite volver atrás desde su 
 
 - **Cloudflare** → Workers → `hispasubs` → *Versions* → *Rollback*.
 - **Vercel** → proyecto del Proxy → *Deployments* → promover un despliegue anterior.
+
+### Firma del manifest (stremio-addons.net)
+
+La v1.3.0 publicaba un bloque `stremioAddonsConfig` con una firma generada para el manifest de la **v1.2.0**: desde que cambió la versión dejó de validar, porque la firma cubre el manifest byte a byte (incluido `version` y el `logo`, que además depende del host). En la v1.3.1 se **eliminó** (una firma inválida es peor que ninguna; el addon se instala igual sin ella).
+
+Si en el futuro quieres firmarlo de nuevo, publica el manifest actual desde [stremio-addons.net](https://stremio-addons.net) y pega el bloque `stremioAddonsConfig` que te devuelva en `getManifest()` (`worker.js`). Acuérdate de regenerarlo cada vez que cambies `version`, `logo` o `description`.
+
+---
+
+## 🛡️ Protección contra abuso
+
+Ambos componentes limitan las peticiones por IP desde el código (memoria de la instancia: es un atenuador, no una defensa de plataforma):
+
+| Componente | Variable | Por defecto | Efecto |
+| --- | --- | --- | --- |
+| Worker | `RATE_LIMIT` (en `wrangler.toml` / *[Vars]*) | 120 | Peticiones sin caché por minuto e IP → `429` + `Retry-After` |
+| Proxy | `RATE_LIMIT_PER_MIN` (variable de entorno en Vercel) | 120 | Peticiones con `zipUrl` por minuto e IP → `429` + `Retry-After` |
+
+Pon `0` en cualquiera de las dos para desactivarlo. Solo se limita lo que cuesta recursos arriba: las respuestas cacheadas y la raíz del proxy no consumen cuota.
+
+Dos avisos prácticos:
+
+- **CGNAT**: mucha gente comparte IP pública (típico en fibra móvil de operadora). El umbral es holgado, pero si algún usuario reporta `429`, sube el valor en vez de desactivarlo por completo.
+- **Regla recomendada en el panel de Cloudflare**: Workers → `hispasubs` → *Settings* → *Rate Limiting*, con un umbral más agresivo (p. ej. 300 req/min por IP) y acción *Block*. Así el límite real no depende de la memoria del isolate.
 
 ---
 
@@ -125,7 +163,7 @@ Cada plataforma guarda sus propios despliegues y permite volver atrás desde su 
 ## 🛠️ Solución de problemas
 
 ### Veo subtítulos con la etiqueta 📄 “Español (sin clasificar)”
-El análisis consume recursos, así que por título se analizan hasta **3 subtítulos por fuente** (OpenSubtitles y SubDL); el resto se muestra sin analizar para mantener la respuesta rápida — en la práctica, los primeros de la lista suelen estar clasificados. También aparece 📄 si la descarga del archivo para analizarlo falló (p. ej. límite de peticiones del proveedor). Una clave de SubDL amplía el catálogo disponible.
+El análisis consume recursos, así que por título se analizan hasta **3 subtítulos por fuente** (OpenSubtitles y SubDL); el resto se muestra sin analizar para mantener la respuesta rápida — en la práctica, los primeros de la lista suelen estar clasificados. También aparece 📄 si la descarga del archivo para analizarlo falló (p. ej. límite de peticiones del proveedor), o si el contenido descargado no resultó ser texto de subtítulo (una página HTML de error, un binario, un archivo vacío o uno sin ninguna palabra del léxico): en esos casos no se afirma “🌎 Neutro” porque no hay datos reales que lo respalden. Una clave de SubDL amplía el catálogo disponible.
 
 ### No veo subtítulos de SubDL
 Comprueba que tu clave es válida probándola directamente:
@@ -151,7 +189,10 @@ Por eso cada fila móvil se titula con el nombre del addon y no con `label`. Los
 Estaba relacionado con lo anterior: la selección automática compara `lang` con códigos ISO (`languages.find()`), y con texto libre (`🇲🇽 Latino (OS-V3)`) nunca coincidía. Desde la v1.3.0 `lang` es `spa`, así que el escritorio ya autoselecciona los subtítulos en español y muestra la variante (`label`) sin perderla.
 
 ### La lista de subtítulos tarda un poco en aparecer
-Si hay `.zip` de SubDL, se descargan, descomprimen y analizan la primera vez (~1-2 s). Stremio cachea la respuesta; en peticiones siguientes aparece al instante.
+Si hay `.zip` de SubDL, se descargan, descomprimen y analizan la primera vez (~1-2 s; el peor caso con varios zips ronda los 8 s, que es el tiempo máximo que el proxy espera por archivo). Stremio cachea la respuesta (y el complemento la cachea 2 h); en peticiones siguientes aparece al instante.
+
+### Recibo errores 429 («Demasiadas peticiones»)
+El complemento limita las peticiones sin caché por IP (120/min por defecto) para evitar abusos. Es muy difícil de tocar en uso normal, pero si compartes IP pública con mucha gente (CGNAT de operadora), el propietario del addon puede subir el límite (`RATE_LIMIT` en Cloudflare y `RATE_LIMIT_PER_MIN` en Vercel) sin necesidad de desactivarlo.
 
 ---
 

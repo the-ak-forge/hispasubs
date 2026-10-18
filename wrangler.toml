@@ -1,0 +1,15 @@
+# Configuración del Worker (Cloudflare).
+# Antes se desplegaba con argumentos sueltos: `npx wrangler deploy worker.js
+# --name hispasubs`; ahora basta `npx wrangler deploy` (lee este fichero).
+name = "hispasubs"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# workers_dev es true por defecto: sigue publicando en hispasubs.ak-forge.workers.dev
+
+# Variables opcionales (descomentar para cambiar los valores por defecto):
+#
+# [vars]
+# RATE_LIMIT = "120"   # peticiones SIN caché por minuto e IP. 0 = desactivado.
+#                      # Si algún usuario reporta 429s (típico tras CGNAT de
+#                      # operadora, donde muchos comparten IP), súbelo.
