@@ -86,6 +86,34 @@ Esto permite distinguir entre versiones del español con matices regionales sin 
 
 ---
 
+## 🚀 Despliegue y rollback
+
+El repositorio reúne los dos componentes en la raíz:
+
+- **Worker (Cloudflare)**: `worker.js`. Se despliega con `npx wrangler deploy worker.js --name hispasubs`.
+- **Proxy (Vercel)**: `index.js` + `vercel.json`. Vercel lo despliega automáticamente al hacer `push` a `main`, con el *Root Directory* en la raíz del repo.
+
+### Volver a una versión anterior del Worker
+
+Cada versión publicada está en el historial de git, así que no hacen falta copias extra de ficheros:
+
+```bash
+git log --oneline -- worker.js              # localizar la versión
+git show <commit>:worker.js > worker.js     # restaurarla
+npx wrangler deploy worker.js --name hispasubs
+```
+
+La copia histórica de la v1.1.0 quedó en el commit inicial del repo (se localiza con `git log --diff-filter=A --oneline -- worker.v1.1.0.js`; su cabecera interna dice «v1.0.1» aunque su `manifest` publicaba `1.1.0`).
+
+### Rollback en producción (sin git)
+
+Cada plataforma guarda sus propios despliegues y permite volver atrás desde su panel:
+
+- **Cloudflare** → Workers → `hispasubs` → *Versions* → *Rollback*.
+- **Vercel** → proyecto del Proxy → *Deployments* → promover un despliegue anterior.
+
+---
+
 ## 📦 Casos de uso
 
 - Ver contenido latino con subtítulos que reflejen vocabulario y expresiones propias del idioma de América Latina.
