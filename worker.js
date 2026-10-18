@@ -7,6 +7,9 @@
 //    logo concentra >50 % de las ejecuciones (Stremio lo re-pide en cada
 //    apertura; ~37k req/día) y ahora el borde responde sin ejecutar el
 //    worker. Cabecera x-cache: HIT/MISS para diagnosticar.
+//    (Posteriores a este cambio: los ficheros viven ahora en public/ como
+//    Workers Static Assets y el borde los sirve sin invocar al Worker ->
+//    ni cuota ni logs; la ruta de este archivo queda como fallback.)
 //  - /favicon.ico deja de devolver 404 (los navegadores lo piden siempre
 //    que la página no declara <link rel="icon">).
 //  - Log de SubDL más claro ante HTTP 403 (clave rechazada o cuota agotada).
@@ -507,11 +510,13 @@ export default {
 
     // Logo y favicon propios (antes el logo apuntaba a otro workers.dev: si
     // ese worker muere, el logo se rompía; además el logo del manifest debe
-    // ser HTTPS propio). Son recursos estáticos y concentran >50 % del
-    // tráfico (Stremio re-pide el logo en cada apertura de la app), así que
-    // se sirven desde la Cache API del borde: el primer hit los cachea y el
-    // resto responde sin ejecutar lógica. Si la caché no estuviera
-    // disponible en el entorno, se sirven igual que siempre.
+    // ser HTTPS propio).
+    //
+    // Fallback: desde la v1.3.2 estos ficheros viven en public/ y los sirve
+    // el edge de Cloudflare como Workers Static Assets (sin invocar al
+    // Worker: requests gratis/ilimitados y sin logs). Este bloque solo se
+    // ejecutaría si el asset desapareciera del despliegue; mantiene el
+    // comportamiento idéntico (Cache API del borde + x-cache).
     if (pathParts[0] === "logo.svg" || pathParts[0] === "favicon.ico") {
       const cached = await cacheMatch(request);
       if (cached) {
