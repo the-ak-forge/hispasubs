@@ -4,6 +4,11 @@
 name = "hispasubs"
 main = "worker.js"
 compatibility_date = "2026-10-01"
+# Sin Preview URLs: es un addon en producción, y las variantes
+# *.hispasubs.ak-forge.workers.dev solo añaden confusión (y wrangler las
+# habilita por defecto si no se declara esta opción).
+workers_dev = true
+preview_urls = false
 
 # workers_dev es true por defecto: sigue publicando en hispasubs.ak-forge.workers.dev
 
