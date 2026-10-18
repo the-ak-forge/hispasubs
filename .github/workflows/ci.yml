@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # npm ci instala exactamente lo que dice package-lock.json (adm-zip 0.6.1+)
+      - run: npm ci
+
+      # Tests del Worker (Deno) y del proxy (Node, con dns/fetch mockeados)
+      - run: npm test
+
+      # Falla el build si aparece una vulnerabilidad high/critical nueva.
+      # Para revisar sin romper: `npm audit` a secas.
+      - run: npm audit --audit-level=high
