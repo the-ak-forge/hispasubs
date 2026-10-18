@@ -101,10 +101,70 @@ if (res.status === 200) encSubs = await res.json();
 check("serie codificada devuelve array de subs", Array.isArray(encSubs.subtitles), JSON.stringify(encSubs).slice(0, 120));
 console.log(`  (serie tt0121955 s12e5 vía %3A → ${encSubs.subtitles.length} subs)`);
 
-// 7) Logo
+// 7) Logo y favicon (v1.3.2: recursos estáticos servidos desde la Cache API)
 res = await get("/logo.svg");
 check("logo.svg content-type correcto",
   (res.headers.get("content-type") || "").includes("image/svg+xml"));
+check("logo.svg cacheable (max-age 86400)",
+  (res.headers.get("cache-control") || "").includes("max-age=86400"));
+const logoBody = await res.text();
+res = await get("/favicon.ico");
+check("favicon.ico responde 200 con el SVG (antes devolvía 404)",
+  res.status === 200 && (res.headers.get("content-type") || "").includes("image/svg+xml"));
+check("favicon.ico es el mismo recurso estático que el logo",
+  (await res.text()) === logoBody);
+res = await get("/logo.svg");
+check("logo.svg sin caché disponible marca MISS y sirve el recurso",
+  res.headers.get("x-cache") === "MISS" && res.status === 200);
+
+// 7b) HIT de caché y tolerancia a caché rota (mock de caches.default)
+const mockGlobal = (k, v) => {
+  const desc = Object.getOwnPropertyDescriptor(globalThis, k);
+  Object.defineProperty(globalThis, k, { value: v, configurable: true, writable: true });
+  return desc;
+};
+const restoreGlobal = (k, desc) => {
+  if (desc) Object.defineProperty(globalThis, k, desc);
+  else delete globalThis[k];
+};
+{
+  const cachedBody = "<svg>cached</svg>";
+  const prev = mockGlobal("caches", {
+    default: {
+      match: async () => new Response(cachedBody, { headers: { "cache-control": "public, max-age=86400" } }),
+      put: async () => {},
+    },
+  });
+  try {
+    const waits = [];
+    res = await worker.fetch(new Request(`${base}/logo.svg`), {}, { waitUntil: (p) => waits.push(p) });
+    const body = await res.text();
+    check("logo.svg sirve la entrada de caché (HIT) sin regenerar",
+      res.status === 200 && body === cachedBody && res.headers.get("x-cache") === "HIT");
+    await Promise.all(waits);
+  } catch (e) {
+    check("logo.svg sirve la entrada de caché (HIT) sin regenerar", false, e.message);
+  } finally {
+    restoreGlobal("caches", prev);
+  }
+}
+{
+  const prev = mockGlobal("caches", {
+    default: {
+      match: async () => { throw new Error("caché rota"); },
+      put: async () => { throw new Error("caché rota"); },
+    },
+  });
+  try {
+    res = await get("/logo.svg");
+    check("logo.svg responde aunque la caché falle (tolerancia)",
+      res.status === 200 && res.headers.get("x-cache") === "MISS");
+  } catch (e) {
+    check("logo.svg responde aunque la caché falle (tolerancia)", false, e.message);
+  } finally {
+    restoreGlobal("caches", prev);
+  }
+}
 
 // 8) End-to-end con red (best effort: si no hay red, el worker responde [])
 res = await get("/subtitles/movie/tt0111161.json");
@@ -262,7 +322,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("v1.3.1: manifest version 1.3.1", m10.version === "1.3.1", m10.version);
+  check("manifest version 1.3.2", m10.version === "1.3.2", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Cada petición usa un
   // ID distinto para que siempre sea cache-miss y el conteo sea determinista.
