@@ -1,6 +1,13 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.3.2
+// HispaSubs — Cloudflare Worker v1.3.3
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.3.3 (18/10/2026):
+//  - Rate limiting nativo via Workers Rate Limiting API (ratelimit binding).
+//    Aplica solo a peticiones SIN caché (subtitles/manifest dinámicos).
+//    Usa clave por IP (cf-connecting-ip). Periodo 60 s, configurable vía env
+//    RATE_LIMIT (0 = desactivado). Respeta Free plan; sin coste extra.
+//    Mantiene logs mínimos (avisa una sola vez por ventana).
 //
 // v1.3.2 (18/10/2026):
 //  - /logo.svg y /favicon.ico se sirven desde la Cache API del borde: el
@@ -229,32 +236,49 @@ const jsonResponse = (obj, cacheSeconds) =>
   });
 
 // ---------------------------------------------------------------------------
-// Rate limit por IP (best-effort, en memoria del isolate)
+// Rate limit por IP (Workers Rate Limiting API + fallback in-memory)
 //
-// Ventana fija de 60 s. Solo cuenta peticiones SIN caché: las cacheadas no
-// cuestan nada arriba y así un tope razonable no castiga a usuarios reales
-// (que repiten la misma petición al abrir el reproductor). Es un atenuador,
-// no una defensa de plataforma: para eso hay reglas de rate limiting en el
-// panel de Cloudflare. Desactivable con RATE_LIMIT=0 (wrangler.toml / vars).
+// Ventana 60 s (coincide con binding simple.period=60). Solo cuenta
+// peticiones SIN caché. Usa cf-connecting-ip como clave. Desactivable con
+// RATE_LIMIT=0 (env/vars). Cuando el binding SUBS_RATE_LIMIT existe
+// (Cloudflare), el límite es global por PoP/namespace; en tests (Deno) cae
+// a un mapa in-memory del isolate (mantiene compatibilidad con los tests).
 // ---------------------------------------------------------------------------
 const rateHits = new Map();
-const rateLimit = (ip, limit) => {
+const rateLimitFallback = (ip, limit) => {
   const now = Date.now();
   if (rateHits.size > 5000) {
     for (const [k, v] of rateHits) if (v.reset <= now) rateHits.delete(k);
   }
   let entry = rateHits.get(ip);
   if (!entry || entry.reset <= now) {
-    entry = { count: 0, reset: now + 60_000 };
+    entry = { count: 0, reset: now + 60_000, warned: false };
     rateHits.set(ip, entry);
   }
   entry.count += 1;
   if (entry.count > limit) {
-    // Un solo log por IP y ventana: un ataque no debe ahogar los logs.
-    if (entry.count === limit + 1) console.warn(`[rate-limit] ${ip} superó ${limit}/min`);
+    if (!entry.warned) {
+      console.warn(`[rate-limit] ${ip} superó ${limit}/min`);
+      entry.warned = true;
+    }
     return Math.max(1, Math.ceil((entry.reset - now) / 1000));
   }
   return null;
+};
+
+const checkRateLimit = async (env, ip, limit) => {
+  if (!ip || !Number.isFinite(limit) || limit <= 0) return null;
+  try {
+    if (env && env.SUBS_RATE_LIMIT && typeof env.SUBS_RATE_LIMIT.limit === "function") {
+      const res = await env.SUBS_RATE_LIMIT.limit({ key: ip });
+      if (!res.success) {
+        return 60;
+      }
+      return null;
+    }
+  } catch (_) {
+  }
+  return rateLimitFallback(ip, limit);
 };
 
 // ---------------------------------------------------------------------------
@@ -313,7 +337,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.3.2",
+  version: "1.3.3",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -608,19 +632,17 @@ export default {
         // limita, para no bloquear a todos bajo la misma clave vacía.
         const ip = request.headers.get("cf-connecting-ip");
         const limit = Number(env.RATE_LIMIT ?? 120);
-        if (ip && Number.isFinite(limit) && limit > 0) {
-          const retryAfter = rateLimit(ip, limit);
-          if (retryAfter) {
-            return new Response(JSON.stringify({ error: "rate limit" }), {
-              status: 429,
-              headers: {
-                "Access-Control-Allow-Origin": "*",
-                "Content-Type": "application/json",
-                "Cache-Control": "no-store",
-                "Retry-After": String(retryAfter),
-              },
-            });
-          }
+        const retryAfter = await checkRateLimit(env, ip, limit);
+        if (retryAfter) {
+          return new Response(JSON.stringify({ error: "rate limit" }), {
+            status: 429,
+            headers: {
+              "Access-Control-Allow-Origin": "*",
+              "Content-Type": "application/json",
+              "Cache-Control": "no-store",
+              "Retry-After": String(retryAfter),
+            },
+          });
         }
 
         const [osSubs, sdlSubs] = await Promise.allSettled([

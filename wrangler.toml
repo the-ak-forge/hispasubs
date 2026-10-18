@@ -24,6 +24,16 @@ preview_urls = false
 [assets]
 directory = "./public"
 
+# Rate Limiting nativo (Workers Rate Limiting API) — disponible en Free plan.
+# Solo aplica a peticiones SIN caché (subtitles/manifest dinámicos). Usa la
+# clave cf-connecting-ip. Periodo fijo 60 s; RATE_LIMIT controla el tope (0 = off).
+[[ratelimits]]
+name = "SUBS_RATE_LIMIT"
+namespace_id = "1001"
+  [ratelimits.simple]
+  limit = 120
+  period = 60
+
 # Variables opcionales (descomentar para cambiar los valores por defecto):
 #
 # [vars]

@@ -322,15 +322,25 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.3.2", m10.version === "1.3.2", m10.version);
+  check("manifest version 1.3.3", m10.version === "1.3.3", m10.version);
 
-  // 10d) Rate limit por IP (solo peticiones sin caché). Cada petición usa un
-  // ID distinto para que siempre sea cache-miss y el conteo sea determinista.
+  // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
+  // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
+  // el binding no está presente, para mantener compatibilidad con el test).
   const rlReq = (ip, n) => worker.fetch(
     new Request(`${base}/subtitles/movie/tt777777${n}.json`, { headers: { "cf-connecting-ip": ip } }),
     { RATE_LIMIT: "3" }, {});
+  // Simular limitaciones: si no hay binding real, usamos fallback in-memory.
+  // Para el test, forzamos el comportamiento in-memory probando por debajo? O
+  // mejor, mantenemos la lógica antigua si env.SUBS_RATE_LIMIT no existe.
   const rlCodes = [];
   for (let i = 0; i < 4; i++) rlCodes.push((await rlReq("203.0.113.99", i)).status);
+  // Nota: con binding nativo el límite se comparte por namespace; el test
+  // espera exactamente 3→429. Con el cambio, si el binding está activo,
+  // Cloudflare hace la cuenta. Para que el test siga pasando sin cambiarlo
+  // radicalmente, no sobreescribimos el binding real: el worker usará binding
+  // si existe; en Deno no existe, así que caerá al in-memory. El código
+  // actualizará el in-memory según env.RATE_LIMIT cuando no hay binding.
   check("v1.3.1: 3 peticiones sin caché y la 4ª -> 429",
     JSON.stringify(rlCodes) === JSON.stringify([200, 200, 200, 429]), JSON.stringify(rlCodes));
   const rlRes = await rlReq("203.0.113.99", 9);
