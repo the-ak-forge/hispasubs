@@ -73,13 +73,13 @@ Esto permite distinguir entre versiones del español con matices regionales sin 
 
 - **Worker en Cloudflare (Edge)** — `worker.js` (+ `wrangler.toml`)
   - Gestiona rutas, resolución de manifiestos, consultas en paralelo a las fuentes y la evaluación léxica.
-  - Cachea respuestas de listas (2 h; resultados vacíos 60 s como caché negativa) y aplica un rate limit por IP configurable (`RATE_LIMIT`, por defecto 120 peticiones sin caché/minuto; `0` lo desactiva).
+  - Cachea respuestas de listas (2 h; resultados vacíos 60 s como caché negativa) y aplica un rate limit por IP configurable (`RATE_LIMIT`; `0` lo desactiva).
 
 - **Proxy en Vercel (Node.js + `adm-zip`)** — `api/proxy.js` (+ `vercel.json`)
   - Descarga los `.zip` de SubDL y extrae el `.srt` en memoria RAM, sin tocar disco. Máximo 4 MB (límite de respuesta de Vercel).
   - Solo acepta `https`, únicamente los hosts de la allowlist (`dl.subdl.com` y los CDN de OpenSubtitles), solo puerto 443, y valida cada salto de redirección contra IPs privadas (SSRF).
   - Sirve el subtítulo ya limpio al reproductor **y** canaliza el archivo al Worker para su clasificación.
-  - Limita las peticiones por IP (`RATE_LIMIT_PER_MIN`, por defecto 120/min; `0` lo desactiva).
+  - Limita las peticiones por IP (`RATE_LIMIT_PER_MIN`; `0` lo desactiva).
 
 - **Fuentes de subtítulos**
   - [OpenSubtitles V3](https://www.opensubtitles.org) (addon de la comunidad de Stremio, siempre activa).
@@ -107,9 +107,9 @@ npm test            # requiere Deno (tests del worker) y Node (tests del proxy)
 - `test_proxy.js` (Node): suite del proxy, con `dns.lookup` y `fetch` simulados, así que no necesita red.
 - CI en GitHub Actions (`.github/workflows/ci.yml`): instala con `npm ci`, ejecuta ambas suites y falla si `npm audit` detecta vulnerabilidades *high*/*critical*.
 
-### Volver a una versión anterior del Worker
+### Rollback
 
-Cada versión publicada está en el historial de git, así que no hacen falta copias extra de ficheros:
+Cada versión publicada está en el historial de git:
 
 ```bash
 git log --oneline -- worker.js              # localizar la versión
@@ -117,38 +117,26 @@ git show <commit>:worker.js > worker.js     # restaurarla
 npx wrangler deploy
 ```
 
-La copia histórica de la v1.1.0 quedó en el commit inicial del repo (se localiza con `git log --diff-filter=A --oneline -- worker.v1.1.0.js`; su cabecera interna dice «v1.0.1» aunque su `manifest` publicaba `1.1.0`).
+Además, cada plataforma guarda sus despliegues y permite volver atrás desde su panel (Cloudflare → Workers → *Versions*; Vercel → *Deployments*).
 
-### Rollback en producción (sin git)
+### Firma del manifest
 
-Cada plataforma guarda sus propios despliegues y permite volver atrás desde su panel:
-
-- **Cloudflare** → Workers → `hispasubs` → *Versions* → *Rollback*.
-- **Vercel** → proyecto del Proxy → *Deployments* → promover un despliegue anterior.
-
-### Firma del manifest (stremio-addons.net)
-
-La v1.3.0 publicaba un bloque `stremioAddonsConfig` con una firma generada para el manifest de la **v1.2.0**: desde que cambió la versión dejó de validar, porque la firma cubre el manifest byte a byte (incluido `version` y el `logo`, que además depende del host). En la v1.3.1 se **eliminó** (una firma inválida es peor que ninguna; el addon se instala igual sin ella).
-
-Si en el futuro quieres firmarlo de nuevo, publica el manifest actual desde [stremio-addons.net](https://stremio-addons.net) y pega el bloque `stremioAddonsConfig` que te devuelva en `getManifest()` (`worker.js`). Acuérdate de regenerarlo cada vez que cambies `version`, `logo` o `description`.
+El manifest no lleva bloque `stremioAddonsConfig`: firmarlo obliga a regenerar la firma con cada cambio de versión (cubre `version`, `logo` y `description`), y una firma que deja de validar es peor que ninguna. Si quieres firmarlo, publica el manifest actual desde [stremio-addons.net](https://stremio-addons.net) y pega el bloque que te devuelva en `getManifest()`.
 
 ---
 
 ## 🛡️ Protección contra abuso
 
-Ambos componentes limitan las peticiones por IP desde el código (memoria de la instancia: es un atenuador, no una defensa de plataforma):
+Ambos componentes limitan las peticiones por IP desde el código (memoria de la instancia: es un atenuador, no una defensa de plataforma). El umbral por defecto es holgado para uso normal y es configurable:
 
-| Componente | Variable | Por defecto | Efecto |
-| --- | --- | --- | --- |
-| Worker | `RATE_LIMIT` (en `wrangler.toml` / *[Vars]*) | 120 | Peticiones sin caché por minuto e IP → `429` + `Retry-After` |
-| Proxy | `RATE_LIMIT_PER_MIN` (variable de entorno en Vercel) | 120 | Peticiones con `zipUrl` por minuto e IP → `429` + `Retry-After` |
+| Componente | Variable | Efecto |
+| --- | --- | --- |
+| Worker | `RATE_LIMIT` (en `wrangler.toml` / *[Vars]*) | Peticiones sin caché por minuto e IP → `429` + `Retry-After` |
+| Proxy | `RATE_LIMIT_PER_MIN` (variable de entorno en Vercel) | Peticiones con `zipUrl` por minuto e IP → `429` + `Retry-After` |
 
 Pon `0` en cualquiera de las dos para desactivarlo. Solo se limita lo que cuesta recursos arriba: las respuestas cacheadas y la raíz del proxy no consumen cuota.
 
-Dos avisos prácticos:
-
-- **CGNAT**: mucha gente comparte IP pública (típico en fibra móvil de operadora). El umbral es holgado, pero si algún usuario reporta `429`, sube el valor en vez de desactivarlo por completo.
-- **Regla recomendada en el panel de Cloudflare**: Workers → `hispasubs` → *Settings* → *Rate Limiting*, con un umbral más agresivo (p. ej. 300 req/min por IP) y acción *Block*. Así el límite real no depende de la memoria del isolate.
+Aviso práctico: mucha gente comparte IP pública (CGNAT, típico en fibra móvil). Si algún usuario reporta `429`, sube el valor en vez de desactivarlo por completo; y ten en cuenta que el límite vive en la memoria del isolate, así que una regla de *Rate Limiting* en el panel de la plataforma es la defensa seria.
 
 ---
 
@@ -192,7 +180,7 @@ Estaba relacionado con lo anterior: la selección automática compara `lang` con
 Si hay `.zip` de SubDL, se descargan, descomprimen y analizan la primera vez (~1-2 s; el peor caso con varios zips ronda los 8 s, que es el tiempo máximo que el proxy espera por archivo). Stremio cachea la respuesta (y el complemento la cachea 2 h); en peticiones siguientes aparece al instante.
 
 ### Recibo errores 429 («Demasiadas peticiones»)
-El complemento limita las peticiones sin caché por IP (120/min por defecto) para evitar abusos. Es muy difícil de tocar en uso normal, pero si compartes IP pública con mucha gente (CGNAT de operadora), el propietario del addon puede subir el límite (`RATE_LIMIT` en Cloudflare y `RATE_LIMIT_PER_MIN` en Vercel) sin necesidad de desactivarlo.
+El complemento limita las peticiones sin caché por IP (con un umbral holgado por defecto) para evitar abusos. Es muy difícil de tocar en uso normal, pero si compartes IP pública con mucha gente (CGNAT de operadora), el propietario del addon puede subir el límite (`RATE_LIMIT` en Cloudflare y `RATE_LIMIT_PER_MIN` en Vercel) sin necesidad de desactivarlo.
 
 ---
 
