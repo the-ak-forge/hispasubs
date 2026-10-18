@@ -1,9 +1,12 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.2.0
+// HispaSubs — Cloudflare Worker v1.3.0
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
 //
-// v1.2.0: formatos de `lang` configurables para la app móvil (etiquetas /
-//         híbrido "spa 🇲🇽 Latino" / solo ISO 639-2 "spa").
+// v1.3.0: formato canónico del protocolo: `lang` ISO 639-2 ("spa") + `label`
+//         con la etiqueta visible. La app móvil agrupa por código de idioma
+//         (con `lang` de texto libre no listaba NINGUNA entrada); el
+//         escritorio muestra `label` si existe. Sin config, igual en todos
+//         los dispositivos.
 // Cambios vs 1.0.0 (ver resumen al final del archivo):
 //  - XSS: HTML escapado en la página de configuración.
 //  - Fix del regex ///g que rompía los botones de instalación.
@@ -53,20 +56,20 @@ const hashStr = (s) => {
 const isHttpUrl = (u) => typeof u === "string" && /^https?:\/\//i.test(u);
 const isCompressed = (u) => /\.(zip|rar)(\?|$)/i.test(u);
 
-// Formato del campo `lang`. Tres modos (config.langMode, elegible en
-// /configure):
-//  - "label"  (por defecto): etiqueta descriptiva "🇲🇽 Latino (OS-V3)".
-//  - "iso":    código ISO 639-2 limpio "spa" (máxima compatibilidad móvil).
-//  - "hybrid": "spa 🇲🇽 Latino" — código ISO como prefijo + etiqueta visible.
-// La app móvil de Stremio (núcleo Rust) agrupa los subtítulos por código de
-// idioma y con texto libre no llega a mostrar ninguno en el selector del
-// reproductor; "hybrid" busca compatibilidad SIN perder la etiqueta.
-// isoLang:true se mantiene como alias retrocompatible de "iso".
+// Formato de cada entrada (campos del protocolo de Stremio):
+//  - `lang`: SIEMPRE el código ISO 639-2 "spa". El cliente móvil (núcleo
+//    Rust) agrupa/filtra los subtítulos por código de idioma: con texto
+//    libre ("🇲🇽 Latino (OS-V3)") no listaba NINGUNA entrada en el selector
+//    del reproductor. La selección automática de idioma (escritorio
+//    incluido) matchea códigos contra `languages.find()`, no texto libre.
+//  - `label`: la etiqueta visible. El escritorio (stremio-web) muestra
+//    `label` si existe —`hasValidLabel(track.label)`— y solo recurre a
+//    `languages.label(lang)` en su ausencia: la bandera + variante se
+//    conservan en escritorio.
+// v1.2.0 probó modos configurables (isoLang/langMode) metiendo el código
+// dentro de `lang`; el híbrido siguió sin listarse en el móvil. El formato
+// correcto del protocolo es `lang` + `label` (changelog 19/20).
 const LANG_ISO_ES = "spa";
-const subLang = (langMode, label) =>
-  langMode === "iso" ? LANG_ISO_ES : langMode === "hybrid" ? `${LANG_ISO_ES} ${label}` : label;
-const langModeOf = (config) =>
-  config.langMode === "iso" || config.langMode === "hybrid" ? config.langMode : config.isoLang === true ? "iso" : "label";
 
 // Fetch JSON con timeout. El AbortController cubre también la lectura del body
 // porque abort() corta el stream, no solo las cabeceras.
@@ -151,24 +154,17 @@ const parseConfig = (configStr) => {
 // Página de configuración
 // ---------------------------------------------------------------------------
 
-const getConfigureHTML = (existingConfig = {}) => {
-  // langMode preseleccionado en el <select> (ver langModeOf).
-  const mode = langModeOf(existingConfig);
-  return `
+const getConfigureHTML = (existingConfig = {}) => `
 <!DOCTYPE html>
-<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Configuración | HispaSubs</title><style>body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background-color: #121212; color: #ffffff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; } .container { background-color: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); max-width: 500px; width: 100%; text-align: center; } h1 { margin-top: 10px; color: #00d2ff; font-size: 28px; } p { color: #aaaaaa; font-size: 14px; margin-bottom: 24px; line-height: 1.5; } .form-group { text-align: left; margin-bottom: 20px; } label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 14px; } input { width: 100%; padding: 12px; border: 1px solid #333; border-radius: 6px; background-color: #2a2a2a; color: #fff; box-sizing: border-box; font-family: monospace; } input:focus { outline: none; border-color: #00d2ff; } .btn-container { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; } button { font-size: 16px; font-weight: bold; border-radius: 6px; cursor: pointer; width: 100%; padding: 14px 24px; transition: all 0.3s; } .btn-primary { background-color: #00d2ff; color: #121212; border: none; } .btn-primary:hover { background-color: #00a8cc; transform: translateY(-2px); } .btn-secondary { background-color: transparent; color: #00d2ff; border: 2px solid #00d2ff; } select { width: 100%; padding: 12px; border: 1px solid #333; border-radius: 6px; background-color: #2a2a2a; color: #fff; box-sizing: border-box; font-family: monospace; } select:focus { outline: none; border-color: #00d2ff; } .hint { color: #777; font-size: 12px; margin-top: 4px; line-height: 1.4; }</style></head><body><div class="container"><div>${LOGO_SVG}</div><h1>HispaSubs</h1><p>Clasificación léxica en tiempo real para Stremio.<br>Detecta automáticamente modismos en español y los divide en <strong>🇲🇽 Latino</strong>, <strong>🇪🇸 Castellano</strong> y <strong>🌎 Neutro</strong>.</p><div class="form-group"><label>SubDL API Key (Opcional - Expande catálogo)</label><input type="password" id="subdlKey" placeholder="ej: abc123def456..." value="${esc(existingConfig.subdlKey || "")}"></div><div class="form-group"><label for="langMode">Formato de idioma (compatibilidad móvil)</label><select id="langMode"><option value="label"${mode === "label" ? " selected" : ""}>Etiquetas (🇲🇽 Latino / 🇪🇸 Castellano / 🌎 Neutro)</option><option value="hybrid"${mode === "hybrid" ? " selected" : ""}>Híbrido: ISO + etiqueta (recomendado con app móvil)</option><option value="iso"${mode === "iso" ? " selected" : ""}>Solo ISO "spa" (máxima compatibilidad)</option></select><p class="hint">La app móvil de Stremio agrupa los subtítulos por código de idioma: con "Etiquetas" puede no mostrarlos en el selector del reproductor de Android/iOS.</p></div><div class="btn-container"><button class="btn-primary" onclick="installAddon()">Instalar en Stremio</button><button class="btn-secondary" id="copyBtn" onclick="copyManifest()">Copiar URL del Manifest</button></div></div>
+<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Configuración | HispaSubs</title><style>body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background-color: #121212; color: #ffffff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; } .container { background-color: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); max-width: 500px; width: 100%; text-align: center; } h1 { margin-top: 10px; color: #00d2ff; font-size: 28px; } p { color: #aaaaaa; font-size: 14px; margin-bottom: 24px; line-height: 1.5; } .form-group { text-align: left; margin-bottom: 20px; } label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 14px; } input { width: 100%; padding: 12px; border: 1px solid #333; border-radius: 6px; background-color: #2a2a2a; color: #fff; box-sizing: border-box; font-family: monospace; } input:focus { outline: none; border-color: #00d2ff; } .btn-container { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; } button { font-size: 16px; font-weight: bold; border-radius: 6px; cursor: pointer; width: 100%; padding: 14px 24px; transition: all 0.3s; } .btn-primary { background-color: #00d2ff; color: #121212; border: none; } .btn-primary:hover { background-color: #00a8cc; transform: translateY(-2px); } .btn-secondary { background-color: transparent; color: #00d2ff; border: 2px solid #00d2ff; } </style></head><body><div class="container"><div>${LOGO_SVG}</div><h1>HispaSubs</h1><p>Clasificación léxica en tiempo real para Stremio.<br>Detecta automáticamente modismos en español y los divide en <strong>🇲🇽 Latino</strong>, <strong>🇪🇸 Castellano</strong> y <strong>🌎 Neutro</strong>.</p><div class="form-group"><label>SubDL API Key (Opcional - Expande catálogo)</label><input type="password" id="subdlKey" placeholder="ej: abc123def456..." value="${esc(existingConfig.subdlKey || "")}"></div><div class="btn-container"><button class="btn-primary" onclick="installAddon()">Instalar en Stremio</button><button class="btn-secondary" id="copyBtn" onclick="copyManifest()">Copiar URL del Manifest</button></div></div>
 <script>
 // NOTA: se usa split/join en vez de .replace(/.../) para no depender de
 // escapes anidados dentro del template literal del Worker (el bug ///g de 1.0.0).
 function getManifestUrl(protocol) {
   var key = document.getElementById('subdlKey').value.trim();
-  var langMode = document.getElementById('langMode').value;
   var origin = protocol + '://' + window.location.host;
-  if (!key && langMode === 'label') return origin + '/manifest.json';
-  var config = {};
-  if (key) config.subdlKey = key;
-  if (langMode !== 'label') config.langMode = langMode;
-  var bytes = new TextEncoder().encode(JSON.stringify(config));
+  if (!key) return origin + '/manifest.json';
+  var bytes = new TextEncoder().encode(JSON.stringify({ subdlKey: key }));
   var bin = '';
   for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
   var cfg = btoa(bin).split('+').join('-').split('/').join('_');
@@ -183,7 +179,6 @@ function copyManifest() {
     .catch(function () { btn.innerText = 'Error al copiar'; });
 }
 </script></body></html>`;
-};
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -191,7 +186,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.2.0",
+  version: "1.3.0",
   name: "HispaSubs",
   // Descripción ESTÁTICA: si varía con la config, la firma de abajo deja de
   // coincidir con el manifest registrado en stremio-addons.net.
@@ -311,7 +306,7 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
 // Motor de análisis léxico
 // ---------------------------------------------------------------------------
 
-const classifySubtitle = async (sub, langMode = "label") => {
+const classifySubtitle = async (sub) => {
   // Guard ANTES de cualquier acceso a sub.url (evita el crash en cascada
   // de Promise.all del 1.0.0).
   if (!sub || !isHttpUrl(sub.url)) return null;
@@ -337,11 +332,11 @@ const classifySubtitle = async (sub, langMode = "label") => {
     if (esMatches > latMatches + margin) flag = "🇪🇸 Castellano";
     else if (latMatches > esMatches + margin) flag = "🇲🇽 Latino";
 
-    return { id: sub.id, url: finalUrl, lang: subLang(langMode, `${flag} (${sub.source})`) };
+    return { id: sub.id, url: finalUrl, lang: LANG_ISO_ES, label: `${flag} (${sub.source})` };
   } catch (error) {
     console.error("[classify]", sub.source, error.message);
     // 📄 = "no analizado" (nunca una variante): distinto de 🇪🇸/🇲🇽/🌎.
-    return { id: sub.id, url: finalUrl, lang: subLang(langMode, `📄 Español (sin clasificar · ${sub.source})`) };
+    return { id: sub.id, url: finalUrl, lang: LANG_ISO_ES, label: `📄 Español (sin clasificar · ${sub.source})` };
   }
 };
 
@@ -467,22 +462,19 @@ export default {
 
         // Análisis equilibrado: hasta 3 por fuente. En 1.0.0 las subs de
         // SubDL quedaban siempre sin analizar si OS devolvía ≥5.
-        // langMode (config): formato del campo `lang` — "label" por defecto,
-        // "hybrid" ("spa 🇲🇽 Latino") o "iso" ("spa") para la app móvil.
-        const langMode = langModeOf(config);
         const budget = { "OS-V3": 3, "SubDL": 3 };
         const analyzed = await Promise.all(
           deduped.map((sub) => {
             if (budget[sub.source] > 0) {
               budget[sub.source] -= 1;
-              return classifySubtitle(sub, langMode);
+              return classifySubtitle(sub);
             }
             // Sin presupuesto de análisis: se enrutan igualmente (los .zip
             // vía proxy) y se etiquetan explícitamente como NO analizados.
             const finalUrl = isCompressed(sub.url)
               ? `${VERCEL_UNZIPPER}${encodeURIComponent(sub.url)}`
               : sub.url;
-            return { id: sub.id, url: finalUrl, lang: subLang(langMode, `📄 Español (sin clasificar · ${sub.source})`) };
+            return { id: sub.id, url: finalUrl, lang: LANG_ISO_ES, label: `📄 Español (sin clasificar · ${sub.source})` };
           })
         );
 
@@ -537,7 +529,12 @@ export default {
 // 19. [MÓVIL] La app móvil de Stremio agrupa los subtítulos por código de
 //     idioma y con `lang` libre ("🇲🇽 Latino (OS-V3)") no mostraba NINGUNO de
 //     los resultados en el selector del reproductor (escritorio, más
-//     tolerante, sí los listaba). Nuevos modos configurables en /configure:
-//     "hybrid" ("spa 🇲🇽 Latino", etiqueta visible + prefijo ISO) e "iso"
-//     (ISO 639-2 "spa", máxima compatibilidad); isoLang:true sigue funcionando
-//     como alias de "iso".
+//     tolerante, sí los listaba). v1.2.0 añadió modos configurables (iso /
+//     híbrido "spa 🇲🇽 Latino"); tras probarlo en el dispositivo, el híbrido
+//     siguió sin listarse: el formato con el código dentro de `lang` no basta.
+// 20. [PROTOCOLO] Formato canónico `lang` + `label` (sin config): `lang` es
+//     SIEMPRE el código ISO 639-2 "spa" —lo que agrupa el móvil y con lo que
+//     matchea la selección automática de idioma— y `label` lleva la etiqueta
+//     visible ("🇲🇽 Latino (OS-V3)"), que el escritorio (stremio-web) muestra
+//     tal cual. Retrocompatible: las URLs de config de 1.2.0 (langMode/
+//     isoLang) se ignoran y sirven este mismo formato.
