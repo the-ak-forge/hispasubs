@@ -1,6 +1,15 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.3.1
+// HispaSubs — Cloudflare Worker v1.3.2
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.3.2 (18/10/2026):
+//  - /logo.svg y /favicon.ico se sirven desde la Cache API del borde: el
+//    logo concentra >50 % de las ejecuciones (Stremio lo re-pide en cada
+//    apertura; ~37k req/día) y ahora el borde responde sin ejecutar el
+//    worker. Cabecera x-cache: HIT/MISS para diagnosticar.
+//  - /favicon.ico deja de devolver 404 (los navegadores lo piden siempre
+//    que la página no declara <link rel="icon">).
+//  - Log de SubDL más claro ante HTTP 403 (clave rechazada o cuota agotada).
 //
 // v1.3.1 (auditoría 18/10/2026):
 //  - Firma del manifest eliminada: estaba generada para el manifest de
@@ -301,7 +310,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.3.1",
+  version: "1.3.2",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -413,7 +422,13 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
     }
     return out;
   } catch (e) {
-    console.error("[SubDL]", e.message);
+    // 403 en SubDL casi siempre es clave rechazada/caducada o cuota
+    // agotada, no un fallo de red: se dice explícitamente para no tener que
+    // adivinarlo ante reports de "no veo subs de SubDL".
+    const extra = e.message.includes("403")
+      ? "(clave rechazada o cuota agotada: se omite SubDL en este título)"
+      : "";
+    console.error("[SubDL]", e.message, extra);
     return [];
   }
 };
@@ -490,16 +505,31 @@ export default {
     const url = new URL(request.url);
     const pathParts = url.pathname.split("/").filter(Boolean);
 
-    // Logo propio (antes apuntaba a otro workers.dev: si ese worker muere,
-    // el logo se rompía; además el logo del manifest debe ser HTTPS propio).
-    if (pathParts[0] === "logo.svg") {
-      return new Response(LOGO_SVG, {
+    // Logo y favicon propios (antes el logo apuntaba a otro workers.dev: si
+    // ese worker muere, el logo se rompía; además el logo del manifest debe
+    // ser HTTPS propio). Son recursos estáticos y concentran >50 % del
+    // tráfico (Stremio re-pide el logo en cada apertura de la app), así que
+    // se sirven desde la Cache API del borde: el primer hit los cachea y el
+    // resto responde sin ejecutar lógica. Si la caché no estuviera
+    // disponible en el entorno, se sirven igual que siempre.
+    if (pathParts[0] === "logo.svg" || pathParts[0] === "favicon.ico") {
+      const cached = await cacheMatch(request);
+      if (cached) {
+        const hit = new Response(cached.body, cached);
+        hit.headers.set("x-cache", "HIT");
+        return hit;
+      }
+      const fresh = new Response(LOGO_SVG, {
         headers: {
           "Content-Type": "image/svg+xml; charset=utf-8",
           "Access-Control-Allow-Origin": "*",
           "Cache-Control": "public, max-age=86400",
         },
       });
+      cachePut(ctx, request, fresh.clone());
+      const miss = new Response(fresh.body, fresh);
+      miss.headers.set("x-cache", "MISS");
+      return miss;
     }
 
     // Página de configuración (con config pre-rellenada si viene en la URL).
