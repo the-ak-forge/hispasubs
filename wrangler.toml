@@ -12,6 +12,18 @@ preview_urls = false
 
 # workers_dev es true por defecto: sigue publicando en hispasubs.ak-forge.workers.dev
 
+# Assets estáticos (Workers Static Assets): /logo.svg y /favicon.ico se sirven
+# desde el borde SIN invocar al Worker -> requests gratis e ilimitados y sin
+# eventos en Workers Logs. Importante: el logo lo hotlinkea stremio-addons.net
+# y concentra >50 % del tráfico (~37k req/día); servido como asset no consume
+# la cota Free de 100k req/día ni ensucia los logs. Si una ruta no coincide
+# con ningún fichero de public/, Cloudflare ejecuta el Worker normalmente
+# (subtitles, manifest, configure...), así que el router de worker.js sigue
+# siendo el encargado de todo lo dinámico. La ruta /logo.svg de worker.js
+# queda como fallback muerto (nunca se ejecuta: el asset se sirve antes).
+[assets]
+directory = "./public"
+
 # Variables opcionales (descomentar para cambiar los valores por defecto):
 #
 # [vars]

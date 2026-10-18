@@ -1,0 +1,10 @@
+# Cabeceras para los assets estáticos (logo y favicon).
+# Estos ficheros los sirve el edge de Cloudflare SIN invocar al Worker:
+# peticiones gratis e ilimitadas y sin ruido en Workers Logs.
+/logo.svg
+  Cache-Control: public, max-age=604800
+  Access-Control-Allow-Origin: *
+
+/favicon.ico
+  Cache-Control: public, max-age=604800
+  Access-Control-Allow-Origin: *
