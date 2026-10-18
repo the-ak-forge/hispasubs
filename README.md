@@ -90,14 +90,7 @@ Esto permite distinguir entre versiones del español con matices regionales sin 
 
 ---
 
-## 🚀 Despliegue y rollback
-
-El repositorio reúne los dos componentes:
-
-- **Worker (Cloudflare)**: `worker.js` + `wrangler.toml`. Se despliega con `npx wrangler deploy` (lee `wrangler.toml`: nombre, fichero de entrada y `compatibility_date`).
-- **Proxy (Vercel)**: `api/proxy.js` + `vercel.json`. Vercel lo despliega automáticamente al hacer `push` a `main`, con el *Root Directory* en la raíz del repo. `vercel.json` enruta todo (`/`, `/proxy?...`) a la función y fija un `maxDuration` de 60 s.
-
-### Tests
+## 🧪 Desarrollo
 
 ```bash
 npm test            # requiere Deno (tests del worker) y Node (tests del proxy)
@@ -105,38 +98,15 @@ npm test            # requiere Deno (tests del worker) y Node (tests del proxy)
 
 - `test_worker.js` (Deno): suite del Worker; incluye una llamada real a OpenSubtitles opcional (best effort).
 - `test_proxy.js` (Node): suite del proxy, con `dns.lookup` y `fetch` simulados, así que no necesita red.
-- CI en GitHub Actions (`.github/workflows/ci.yml`): instala con `npm ci`, ejecuta ambas suites y falla si `npm audit` detecta vulnerabilidades *high*/*critical*.
+- El CI de GitHub Actions ejecuta ambas suites en cada *push* y falla si `npm audit` detecta vulnerabilidades *high*/*critical*.
 
-### Rollback
-
-Cada versión publicada está en el historial de git:
-
-```bash
-git log --oneline -- worker.js              # localizar la versión
-git show <commit>:worker.js > worker.js     # restaurarla
-npx wrangler deploy
-```
-
-Además, cada plataforma guarda sus despliegues y permite volver atrás desde su panel (Cloudflare → Workers → *Versions*; Vercel → *Deployments*).
-
-### Firma del manifest
-
-El manifest no lleva bloque `stremioAddonsConfig`: firmarlo obliga a regenerar la firma con cada cambio de versión (cubre `version`, `logo` y `description`), y una firma que deja de validar es peor que ninguna. Si quieres firmarlo, publica el manifest actual desde [stremio-addons.net](https://stremio-addons.net) y pega el bloque que te devuelva en `getManifest()`.
+Para levantar tu propia instancia, los ficheros de despliegue ya están configurados en el repo (`wrangler.toml` para el Worker y `vercel.json` + `api/proxy.js` para el proxy); solo hacen falta las cuentas gratuitas de Cloudflare y Vercel y las variables de entorno descritas en el código.
 
 ---
 
 ## 🛡️ Protección contra abuso
 
-Ambos componentes limitan las peticiones por IP desde el código (memoria de la instancia: es un atenuador, no una defensa de plataforma). El umbral por defecto es holgado para uso normal y es configurable:
-
-| Componente | Variable | Efecto |
-| --- | --- | --- |
-| Worker | `RATE_LIMIT` (en `wrangler.toml` / *[Vars]*) | Peticiones sin caché por minuto e IP → `429` + `Retry-After` |
-| Proxy | `RATE_LIMIT_PER_MIN` (variable de entorno en Vercel) | Peticiones con `zipUrl` por minuto e IP → `429` + `Retry-After` |
-
-Pon `0` en cualquiera de las dos para desactivarlo. Solo se limita lo que cuesta recursos arriba: las respuestas cacheadas y la raíz del proxy no consumen cuota.
-
-Aviso práctico: mucha gente comparte IP pública (CGNAT, típico en fibra móvil). Si algún usuario reporta `429`, sube el valor en vez de desactivarlo por completo; y ten en cuenta que el límite vive en la memoria del isolate, así que una regla de *Rate Limiting* en el panel de la plataforma es la defensa seria.
+Para evitar abusos, ambos componentes aplican un límite de peticiones por IP (las respuestas cacheadas no consumen cuota, así que el uso normal no lo notará). Si compartes IP pública con mucha gente (CGNAT de operadora) y ves errores `429`, consulta [Solución de problemas](#-solución-de-problemas).
 
 ---
 
