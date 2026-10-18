@@ -19,8 +19,8 @@ let html = await res.text();
 check("configure responde 200 HTML", res.status === 200 && html.includes("<!DOCTYPE html>"));
 check("input con type=password", html.includes('type="password"'));
 check("logo SVG inline", html.includes("<svg"));
-check("selector de modo de idioma (langMode) presente",
-  html.includes('id="langMode"') && html.includes('value="hybrid"'));
+check("sin selector de modo de idioma (formato único lang+label)",
+  !html.includes("langMode"));
 
 // 2) XSS reflejado: el payload debe aparecer escapado
 const xssPayload = { subdlKey: '"><img src=x onerror=alert(1)>' };
@@ -29,15 +29,12 @@ html = await res.text();
 check("XSS escapado (sin <img crudo)", !html.includes("<img src=x"));
 check("XSS escapado (entidades presentes)", html.includes("&lt;img") && html.includes("&quot;"));
 
-// 2b) La config existente preselecciona el modo en la página de configure
-res = await get(`/${b64url({ isoLang: true })}/configure`);
+// 2b) Retrocompatibilidad: las configs de v1.2.0 (isoLang/langMode) se
+// ignoran y la página de configure se renderiza sin el selector.
+res = await get(`/${b64url({ isoLang: true, langMode: "hybrid" })}/configure`);
 html = await res.text();
-check("configure preselecciona ISO con config isoLang:true (alias retro)",
-  html.includes('value="iso" selected'));
-res = await get(`/${b64url({ langMode: "hybrid" })}/configure`);
-html = await res.text();
-check("configure preselecciona híbrido con langMode:'hybrid'",
-  html.includes('value="hybrid" selected'));
+check("configure ignora claves antiguas (isoLang/langMode) sin romper",
+  res.status === 200 && html.includes('type="password"') && !html.includes("langMode"));
 
 // 3) El <script> de la pagina parsea sin errores (bug ///g de 1.0.0)
 const scriptSrc = html.split("<script>")[1].split("</script>")[0];
@@ -47,14 +44,10 @@ check("script del navegador parsea (fix ///g)", scriptOk, scriptErr);
 
 // ... y genera una URL de config correcta simulando el navegador
 const fakeWin = { location: { host: "hispasubs.example.workers.dev" } };
-const fakeDoc = (key, langMode) => ({
-  getElementById: (id) =>
-    id === "subdlKey" ? { value: key } : { value: langMode, checked: false },
-});
-const runClient = (key, langMode = "label") =>
+const runClient = (key) =>
   new Function("document", "window", "navigator", "btoa", "TextEncoder",
     scriptSrc + "; return getManifestUrl('https');")(
-    fakeDoc(key, langMode), fakeWin, { clipboard: {} },
+    { getElementById: () => ({ value: key }) }, fakeWin, { clipboard: {} },
     (s) => btoa(s), TextEncoder
   );
 const clientFn = runClient("");
@@ -64,21 +57,17 @@ const clientFn2 = runClient("abc123");
 check("URL del manifest con clave es base64url valido",
   /^https:\/\/hispasubs\.example\.workers\.dev\/[A-Za-z0-9_-]+\/manifest\.json$/.test(clientFn2), clientFn2);
 
-// ...y con cada modo de idioma seleccionado (regresión móvil)
+// ...y la config generada lleva SOLO la clave (el formato lang+label no
+// necesita configuración)
 const decodeCfg = (url) => {
   let b64 = url.split("/")[3].replace(/-/g, "+").replace(/_/g, "/");
   while (b64.length % 4) b64 += "=";
   return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))));
 };
-const isoCfg = decodeCfg(runClient("abc123", "iso"));
-check("modo iso: config lleva langMode='iso' y la clave",
-  isoCfg.langMode === "iso" && isoCfg.subdlKey === "abc123", JSON.stringify(isoCfg));
-const hybCfg = decodeCfg(runClient("", "hybrid"));
-check("modo híbrido sin clave genera config solo con langMode",
-  hybCfg.langMode === "hybrid" && !("subdlKey" in hybCfg), JSON.stringify(hybCfg));
-check("modo etiquetas (default) mantiene la URL limpia",
-  runClient("abc123", "label") === clientFn2 && runClient("", "label") === clientFn,
-  runClient("", "label"));
+const keyCfg = decodeCfg(clientFn2);
+check("config generada lleva solo la clave (sin langMode/isoLang)",
+  keyCfg.subdlKey === "abc123" && !("langMode" in keyCfg) && !("isoLang" in keyCfg),
+  JSON.stringify(keyCfg));
 
 // 4) Manifest sin config
 res = await get("/manifest.json");
@@ -123,7 +112,7 @@ const subs = await res.json();
 check("ruta subtitles responde JSON con array",
   Array.isArray(subs.subtitles), JSON.stringify(subs).slice(0, 120));
 console.log(`  (subtitles obtenidas: ${subs.subtitles.length})`);
-for (const s of subs.subtitles.slice(0, 6)) console.log(`   - ${s.lang}  [${(s.url || "").slice(0, 60)}...]`);
+for (const s of subs.subtitles.slice(0, 6)) console.log(`   - lang=${s.lang} · label=${s.label}  [${(s.url || "").slice(0, 55)}...]`);
 
 // 9) Regresión + funcionalidad: simulamos las respuestas reales de SubDL y
 // OS-V3 interceptando fetch. Cubre: (a) URLs relativas de SubDL, (b) zips
@@ -172,52 +161,45 @@ try {
   const srtEntry = entries.find((e) => e.url === "https://dl.subdl.com/subtitle/333-444.srt");
   const osEntries = entries.filter((e) => e.url.includes("subs5.strem.io"));
 
-  check("SubDL zip relativa -> proxy y CLASIFICADA como Latino",
-    zipEntry?.lang === "🇲🇽 Latino (SubDL)", JSON.stringify(zipEntry).slice(0, 160));
-  check("SubDL url absoluta -> Castellano",
-    srtEntry?.lang === "🇪🇸 Castellano (SubDL)", JSON.stringify(srtEntry).slice(0, 160));
+  check("SubDL zip relativa -> proxy, lang 'spa' y label Latino",
+    zipEntry?.lang === "spa" && zipEntry?.label === "🇲🇽 Latino (SubDL)",
+    JSON.stringify(zipEntry).slice(0, 160));
+  check("SubDL url absoluta -> lang 'spa' y label Castellano",
+    srtEntry?.lang === "spa" && srtEntry?.label === "🇪🇸 Castellano (SubDL)",
+    JSON.stringify(srtEntry).slice(0, 160));
   check("urls javascript/sin url descartadas", entries.length === 7, `entradas=${entries.length}`);
   check("OS-V3: sub no-española (cze) filtrada", osEntries.length === 5, `os=${osEntries.length}`);
-  check("OS-V3: 3 analizadas -> Castellano",
-    osEntries.filter((e) => e.lang === "🇪🇸 Castellano (OS-V3)").length === 3,
-    JSON.stringify(osEntries.map((e) => e.lang)).slice(0, 200));
-  check("OS-V3: fuera de presupuesto -> 'sin clasificar' (no 'Genérico')",
-    osEntries.filter((e) => e.lang === "📄 Español (sin clasificar · OS-V3)").length === 2,
-    JSON.stringify(osEntries.map((e) => e.lang)).slice(0, 200));
+  check("OS-V3: 3 analizadas -> label Castellano",
+    osEntries.filter((e) => e.label === "🇪🇸 Castellano (OS-V3)").length === 3,
+    JSON.stringify(osEntries.map((e) => e.label)).slice(0, 200));
+  check("OS-V3: fuera de presupuesto -> label 'sin clasificar' (no 'Genérico')",
+    osEntries.filter((e) => e.label === "📄 Español (sin clasificar · OS-V3)").length === 2,
+    JSON.stringify(osEntries.map((e) => e.label)).slice(0, 200));
 
-  // 9b) Modo móvil (isoLang): TODOS los lang deben ser el código ISO 639-2,
-  // incluidos los clasificados y los "sin clasificar". Es la regresión del
-  // bug móvil: con lang libre la app Android no mostraba ningún resultado.
-  res = await get(`/${b64url({ subdlKey: "k", isoLang: true })}/subtitles/movie/tt1375666.json`);
-  const jIso = await res.json();
-  const isoEntries = jIso.subtitles || [];
-  check("isoLang: mismas entradas que sin isoLang (7)", isoEntries.length === 7,
-    `entradas=${isoEntries.length}`);
-  check("isoLang: todos los lang son 'spa'",
-    isoEntries.length > 0 && isoEntries.every((e) => e.lang === "spa"),
-    JSON.stringify(isoEntries.map((e) => e.lang)).slice(0, 150));
-  check("isoLang: urls siguen pasando por el proxy en zips",
-    isoEntries.filter((e) => e.url.includes("proxy?zipUrl=")).length === 1,
-    JSON.stringify(isoEntries.map((e) => e.url)).slice(0, 150));
+  // 9b) REGRESIÓN MÓVIL (bug original): TODOS los `lang` deben ser el código
+  // ISO 639-2 "spa" —la app móvil agrupa por código y con texto libre no
+  // listaba ninguna entrada— y la etiqueta visible va en `label`.
+  check("movil: todos los lang son ISO 'spa' (etiqueta en label)",
+    entries.length > 0 && entries.every((e) => e.lang === "spa"),
+    JSON.stringify(entries.map((e) => [e.lang, e.label])).slice(0, 200));
+  const badLabels = entries.filter((e) =>
+    !(typeof e.label === "string" && e.label.endsWith(")") &&
+      (e.label.includes("OS-V3") || e.label.includes("SubDL"))));
+  check("movil: toda entrada tiene label visible (bandera + fuente)",
+    badLabels.length === 0, JSON.stringify(badLabels).slice(0, 300));
 
-  // 9c) Modo híbrido: prefijo ISO "spa" + etiqueta visible, para que el
-  // escritorio conserve las banderas y el móvil reconozca el código.
-  res = await get(`/${b64url({ subdlKey: "k", langMode: "hybrid" })}/subtitles/movie/tt1375666.json`);
-  const jHyb = await res.json();
-  const hybEntries = jHyb.subtitles || [];
-  check("híbrido: mismas entradas (7)", hybEntries.length === 7, `entradas=${hybEntries.length}`);
-  check("híbrido: todos los lang empiezan por 'spa ' y conservan la etiqueta",
-    hybEntries.length > 0 &&
-      hybEntries.every((e) => /^spa .+/.test(e.lang) && /(OS-V3|SubDL)\)/.test(e.lang)),
-    JSON.stringify(hybEntries.map((e) => e.lang)).slice(0, 200));
-
-  // ...y sin langMode, el modo por defecto sigue siendo la etiqueta libre
-  res = await get(`/${b64url({ subdlKey: "k" })}/subtitles/movie/tt1375666.json`);
-  const jLabel = await res.json();
-  check("default: lang con etiqueta libre (sin prefijo ISO)",
-    (jLabel.subtitles || []).length === 7 &&
-      (jLabel.subtitles || []).every((e) => !e.lang.startsWith("spa ")),
-    JSON.stringify((jLabel.subtitles || []).map((e) => e.lang)).slice(0, 150));
+  // 9c) Retrocompatibilidad: las URLs de config instaladas con v1.2.0
+  // (langMode/isoLang) se ignoran y sirven el formato canónico lang+label.
+  res = await get(`/${b64url({ subdlKey: "k", langMode: "hybrid", isoLang: true })}/subtitles/movie/tt1375666.json`);
+  const jOld = await res.json();
+  const oldEntries = jOld.subtitles || [];
+  check("config v1.2.0 -> formato canonico (7, lang spa + label)",
+    oldEntries.length === 7 &&
+      oldEntries.every((e) => e.lang === "spa" && typeof e.label === "string" && e.label.length > 0),
+    JSON.stringify(oldEntries.map((e) => [e.lang, e.label])).slice(0, 200));
+  check("config v1.2.0: urls siguen pasando por el proxy en zips",
+    oldEntries.filter((e) => e.url.includes("proxy?zipUrl=")).length === 1,
+    JSON.stringify(oldEntries.map((e) => e.url)).slice(0, 150));
 } finally {
   globalThis.fetch = origFetch;
 }

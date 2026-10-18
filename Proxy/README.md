@@ -20,8 +20,8 @@ El complemento analiza el texto de los subtítulos, detecta expresiones, pronomb
   - Incluye soporte predeterminado para OpenSubtitles V3.
   - Instala y usa el complemento casi de inmediato.
 
-- Compatibilidad con la app móvil
-  - Tres formatos de etiqueta configurables desde la página de configuración: **Etiquetas** (🇲🇽 Latino / 🇪🇸 Castellano / 🌎 Neutro, por defecto), **Híbrido** (`spa 🇲🇽 Latino`) y **Solo ISO** (`spa`, código ISO 639-2). Los dos últimos hacen que la app de Android/iOS muestre los resultados en el selector del reproductor, que agrupa los subtítulos por código de idioma. El modo elegido viaja en la URL de instalación, así que aplica a todos los dispositivos de tu cuenta: el híbrido está pensado para convivir con el escritorio sin perder las etiquetas.
+- Compatibilidad con todos los clientes (móvil, TV y escritorio)
+  - Cada subtítulo se envía con el formato canónico del protocolo: `lang` = código ISO 639-2 (`spa`, con el que la app móvil agrupa y lista los subtítulos y con el que funciona la selección automática de idioma) y `label` = etiqueta visible con la bandera y la variante (`🇲🇽 Latino (OS-V3)`), que el escritorio muestra tal cual. Un único formato, sin configuración, igual en todos los dispositivos de la cuenta.
 
 - Integración opcional con SubDL
   - Añade tu [clave API gratuita de SubDL](https://subdl.com/panel/api) para ampliar el catálogo de subtítulos.
@@ -105,10 +105,10 @@ Comprueba que tu clave es válida probándola directamente:
 Si responde `"status": false`, regenera la clave en [tu panel de SubDL](https://subdl.com/panel/api) y reinstala el complemento desde la página de configuración.
 
 ### La app móvil (Android/iOS) no muestra ningún resultado
-La app móvil agrupa los subtítulos por código de idioma (ISO 639-2) y la etiqueta descriptiva por defecto (`🇲🇽 Latino (OS-V3)`) no llega a aparecer en el selector del reproductor. Abre la [página de configuración](https://hispasubs.ak-forge.workers.dev), elige **Híbrido** (recomendado: conserva la etiqueta y añade el prefijo `spa`) o **Solo ISO**, y reinstala el complemento. Recuerda que la configuración viaja en la URL de instalación: el modo aplica a todos los dispositivos sincronizados con tu cuenta, no solo al móvil.
+La app móvil agrupa los subtítulos por **código de idioma**, así que `lang` debe ser un código ISO válido (`spa`) y la etiqueta visible va en `label`; ese es el formato que devuelve el complemento desde la v1.3.0 (sin configuración). Si aun así no ves ninguna entrada, reinstala el complemento desde la [página de configuración](https://hispasubs.ak-forge.workers.dev) (el formato ya no depende de la URL de instalación) y reinicia la app. Nota: en Android TV hay un bug conocido de Stremio (versiones 1.11.x) en el que los subtítulos de addons aparecen pero no se muestran al elegirlos, por el servidor local (`127.0.0.1:11470`); se arregla reiniciando la app o desde Stremio.
 
-### El filtro de idiomas de Stremio no agrupa estas etiquetas
-Es una limitación conocida y deliberada del modo **Etiquetas** por defecto: las etiquetas usan banderas y texto descriptivo en lugar del código de idioma nativo, priorizando que la variante sea visible de un vistazo. Si necesitas que el idioma se agrupe bien (p. ej. en la app móvil), usa el modo **Híbrido** o **Solo ISO** descritos arriba.
+### La selección automática de subtítulos en español no funciona
+Estaba relacionado con lo anterior: la selección automática compara `lang` con códigos ISO (`languages.find()`), y con texto libre (`🇲🇽 Latino (OS-V3)`) nunca coincidía. Desde la v1.3.0 `lang` es `spa`, así que el escritorio ya autoselecciona los subtítulos en español y muestra la variante (`label`) sin perderla.
 
 ### La lista de subtítulos tarda un poco en aparecer
 Si hay `.zip` de SubDL, se descargan, descomprimen y analizan la primera vez (~1-2 s). Stremio cachea la respuesta; en peticiones siguientes aparece al instante.
