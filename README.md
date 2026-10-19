@@ -16,11 +16,11 @@ El complemento analiza el texto de los subtítulos, detecta expresiones, pronomb
   - 🇲🇽 Latino: detecta vocabulario, pronombres y expresiones comunes de América Latina (`ustedes`, `celular`, `carro`, `manejar`, `enojar`, etc.).
   - 🇪🇸 Castellano: detecta conjugaciones y giros propios de España (`vosotros`, `ordenador`, `coche`, `conducir`, `enfadar`, etc.).
   - 🌎 Neutro: identifica subtítulos con vocabulario equilibrado o sin localismos marcados (solo se emite cuando el análisis encontró datos reales; un archivo sin ningún match léxico recibe 📄, no 🌎).
-  - Filtro anti-spam: descarta las pistas con publicidad incrustada (casas de apuestas, canales de Telegram/WhatsApp, «descarga nuestra app»…) durante el propio análisis, sin coste de red adicional.
+  - Filtro anti-spam: descarta las pistas con publicidad incrustada (casas de apuestas, canales de Telegram/WhatsApp, enlaces, CTAs en la cabecera o el pie…) durante el propio análisis, sin coste de red adicional. Las frases que también pueden ser diálogo («síguenos en Instagram») solo cuentan al principio o al final del subtítulo, no a mitad de una conversación.
 
 - Solo pistas verificadas
-  - Por título se analizan **hasta 5 subtítulos por fuente** y **solo se muestran las analizadas**: las que no se pueden verificar se descartan en vez de colarse sin revisar. El tope de la lista es 10 pistas, todas limpias y clasificadas.
-  - 📄 Español (sin clasificar): la pista llegó a analizarse, pero su contenido no era texto de subtítulo (HTML de error, binario, vacío) o no dio ninguna palabra del léxico (ver [Solución de problemas](#-solución-de-problemas)).
+  - Por título se **analizan hasta 8 candidatos por fuente** y se muestran **como máximo 5 limpios por fuente** (10 pistas en total). Una pista solo se publica si su contenido se descargó y pasó el filtro anti-spam: las descargas fallidas y las que no se llegan a verificar se descartan en vez de colarse sin revisar.
+  - 📄 Español (sin clasificar): el texto se analizó correctamente, pero no dio un veredicto léxico fiable (contenido válido sin ninguna palabra del léxico). Las descargas que fallan (red, rate limit, HTML de error) no se muestran.
 
 - Sin configuración obligatoria
   - Incluye soporte predeterminado para OpenSubtitles V3.
@@ -67,7 +67,7 @@ HispaSubs inspecciona el contenido textual de cada subtítulo e identifica patro
 | 🇪🇸 Castellano | Analizado. Vocabulario y giros de España. |
 | 🇲🇽 Latino | Analizado. Vocabulario latinoamericano. |
 | 🌎 Neutro | Analizado. Sin inclinación regional marcada (solo si hubo coincidencias léxicas reales). |
-| 📄 Español (sin clasificar) | Analizado, pero sin veredicto fiable: no dio ninguna palabra del léxico o el contenido descargado no era texto de subtítulo (HTML de error, binario, vacío). Las pistas que no se llegan a analizar no se muestran. |
+| 📄 Español (sin clasificar) | El texto se analizó (y pasó el filtro anti-spam), pero no dio un veredicto léxico fiable: contenido válido sin ninguna palabra del léxico. Las descargas que fallan (red, rate limit, HTML de error) no se muestran. |
 
 Esto permite distinguir entre versiones del español con matices regionales sin depender de metadatos ambiguos o genéricos.
 
@@ -110,7 +110,8 @@ Para levantar tu propia instancia, los ficheros de despliegue ya están configur
 
 | Variable | Componente | Default | Efecto |
 | --- | --- | --- | --- |
-| `PROXY_URL` | Worker | proxy de Vercel | URL base del proxy de extracción, para despliegues propios (`https://tu-dominio/proxy`). Se le añade `zipUrl=` como parámetro. |
+| `PROXY_URL` | Worker | proxy de Vercel | URL base del proxy de extracción, para despliegues propios (`https://tu-dominio/proxy`; debe ser **https**). Se le añade `zipUrl=` como parámetro. |
+| `SPAM_FILTER` | Worker | vacío | Con `log`, activa el **modo sombra**: registra en los logs qué pistas se descartarían por spam pero las sirve igual (para medir antes de activar el descarte). Cualquier otro valor descarta. |
 | `RATE_LIMIT` | Worker | `120` | Peticiones sin caché por minuto e IP. `0` lo desactiva; para subir el tope se edita `wrangler.toml` (`[[ratelimits]] simple.limit`). |
 | `RATE_LIMIT_PER_MIN` | Proxy (Vercel) | `120` | Peticiones con descarga por minuto e IP. `0` lo desactiva. |
 | `FETCH_TIMEOUT_MS` | Proxy (Vercel) | `8000` | Timeout que cubre descarga de cabeceras **y** cuerpo del zip. |
@@ -134,7 +135,7 @@ Para evitar abusos, ambos componentes aplican un límite de peticiones por IP (l
 ## 🛠️ Solución de problemas
 
 ### Veo subtítulos con la etiqueta 📄 “Español (sin clasificar)”
-El análisis consume recursos, así que por título se analizan hasta **5 subtítulos por fuente** (OpenSubtitles y SubDL) y **solo se muestra lo analizado**: las pistas que no se llegan a verificar se descartan para no colar publicidad sin revisar. La etiqueta 📄 aparece cuando el análisis sí se hizo pero no dio un veredicto fiable: la descarga falló (p. ej. rate limit del proveedor), el contenido no era texto de subtítulo (una página HTML de error, un binario o un archivo vacío) o no contenía ninguna palabra del léxico — en esos casos no se afirma “🌎 Neutro” porque no hay datos reales que lo respalden. Los subtítulos con publicidad incrustada (casas de apuestas, canales de Telegram/WhatsApp, «descarga nuestra app»…) se descartan automáticamente; una simple línea de crédito (“Traducido por X”) no basta para eliminarlos. Una clave de SubDL amplía el catálogo disponible.
+El análisis consume recursos, así que por título se **descargan hasta 8 candidatos por fuente** (OpenSubtitles y SubDL) y se muestran **como máximo 5 limpios por fuente**: lo que no se puede verificar se descarta, y lo que falla al descargar (rate limit del proveedor, red, HTML de error) no se muestra como pista. La etiqueta 📄 aparece cuando el análisis **sí** se completó sobre un texto válido pero no encontró ninguna palabra del léxico — en ese caso no se afirma “🌎 Neutro” porque no hay datos reales que lo respalden. Los subtítulos con publicidad incrustada (casas de apuestas, canales de Telegram/WhatsApp, CTAs de app/web…) se descartan automáticamente; una simple línea de crédito (“Traducido por X”) no basta para eliminarlos. Una clave de SubDL amplía el catálogo disponible.
 
 ### No veo subtítulos de SubDL
 Comprueba que tu clave es válida probándola directamente:
@@ -151,7 +152,7 @@ Es una limitación del cliente móvil, no del complemento: la app rellena el tí
 La selección automática compara `lang` con códigos ISO; con texto libre en `lang` nunca coincidía, y por eso antes no funcionaba. Con `lang = spa` el escritorio autoselecciona los subtítulos en español y muestra la variante (`label`) sin perderla.
 
 ### La lista de subtítulos tarda un poco en aparecer
-Si hay `.zip` de SubDL, se descargan, descomprimen y analizan la primera vez (~1-2 s; el peor caso con varios zips ronda los 8 s, que es el tiempo máximo que el proxy espera por archivo). Stremio cachea la respuesta (y el complemento la cachea 2 h); en peticiones siguientes aparece al instante.
+Si hay `.zip` de SubDL, se descargan, descomprimen y analizan la primera vez (~1-2 s; el peor caso —fuente lenta + varios zips— puede acercarse a los 10 s, que es el margen que espera Stremio). Stremio cachea la respuesta (y el complemento la cachea 2 h); en peticiones siguientes aparece al instante.
 
 ### Recibo errores 429 («Demasiadas peticiones»)
 El complemento limita las peticiones sin caché por IP (con un umbral holgado por defecto) para evitar abusos; en uso normal es muy difícil de topar. Solo aparece si compartes IP pública con mucha gente (típico de CGNAT en operadora móvil) y pasa en cuanto la ventana de un minuto se reinicia. Las respuestas cacheadas no consumen cuota, así que el uso normal no lo notará.

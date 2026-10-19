@@ -1,6 +1,32 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.2
+// HispaSubs — Cloudflare Worker v1.4.3
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.3 (19/10/2026) — auditoría de la 1.4.2: CPU, falsos positivos y fugas
+// de la política de solo pistas verificadas:
+//  - [CPU] scoreText recorría cada diccionario fuerte DOS veces (esMatches/
+//    latMatches y otra vez strongTotal). Ahora cada uno se recorre una sola
+//    vez. Medido a 80 KB: ~2× menos coste léxico.
+//  - [CPU] El anti-spam ya no rastrea las ~1.000 líneas de un SRT: analiza
+//    solo las primeras y últimas 30 (donde va la publicidad) y salta líneas
+//    de más de 300 caracteres.
+//  - [ReDoS] SPAM_WEAK_LINE era cuadrático con líneas patológicas (20k car.
+//    → 0,5 s; 80k → 9,6 s). El corte de línea lo elimina: un subtítulo
+//    hostil ya no deja el título sin respuesta ni tumba la petición.
+//  - [FP] Las frases-CTA que también son diálogo ("síguenos en Instagram",
+//    "instala la aplicación", "tragamonedas en línea"…) solo descartan si
+//    aparecen en la cabecera o el pie, no en mitad del subtítulo.
+//  - [FUGAS] Una descarga fallida ya no publica un "📄" sin pasar por el
+//    filtro: se descarta (el fallo sigue bajando el TTL a 60 s). El spam de
+//    un SRT UTF-16 con BOM ya se detecta (antes se decodificaba a ciegas).
+//  - [COBERTURA] El presupuesto se gasta DESPUÉS de filtrar: se analizan
+//    hasta 8 candidatos por fuente y se sirven las 5 primeras limpias (antes
+//    5 candidatos, los contaminados vaciaban el título).
+//  - [MODO SOMBRA] SPAM_FILTER=log mide sin descartar (por defecto descarta).
+//  - [ROBUSTEZ] sourceFailed dejaba de ser código muerto: una fuente caída
+//    ahora propaga el error y baja el TTL (el README ya lo prometía). El
+//    léxico sin raíces abiertas (jod*, ching*, cond*…) y el dialecto exigen
+//    al menos un término fuerte. PROXY_URL exige https y el CI fija wrangler.
 //
 // v1.4.2 (19/10/2026) — limpieza anti-spam y solo pistas verificadas:
 //  - Filtro anti-spam durante la clasificación (coste cero: se aplica al texto
@@ -106,8 +132,8 @@
 // como Latino—. Cuentan 0,25 en vez de 1 para que una palabra suelta no
 // decida la clasificación; solo pesan cuando aparecen muchas veces.
 const WEAK_WEIGHT = 0.25;
-const DICT_ES = /(?<![\p{L}\p{N}_])(?:vosotros|ordenador(?:es)?|coche[s]?|gilipollas|hostias?|chaval(?:es)?|foll(?:ar|a|an|en|ó|o|ado|ando)|jod[\p{L}]*|guay|m[oó]vil(?:es)?|patata[s]?|zumo[s]?|aparqu[\p{L}]*|aparc[\p{L}]*|cond(?:uc|uj|uzc)[\p{L}]*|enfad[\p{L}]*|nevera[s]?|jol[ií]n|mol(?:a|an)|ten[eé]is|sois|est[aá]is)(?![\p{L}\p{N}_])/giu;
-const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?|auto(?:s)?|pendej[\p{L}]*|ching[\p{L}]*|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion[\p{L}]*|manej[\p{L}]*|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|carajo|[oó]rale|chido|bacano)(?![\p{L}\p{N}_])/giu;
+const DICT_ES = /(?<![\p{L}\p{N}_])(?:vosotros|ordenador(?:es)?|coche[s]?|gilipollas|hostias?|chaval(?:es)?|foll(?:ar|a|an|en|ó|o|ado|ando)|jod(?:e|es|en|emos|er|a|as|an|ía|ías|íamos|ían|ió|ieron|iendo|ido|ida|idos|idas)|guay|m[oó]vil(?:es)?|patata[s]?|zumo[s]?|aparqu[\p{L}]*|aparc[\p{L}]*|condu(?:cir|zco|zca|zcan|ces|ce|cen|jiste|jeron|jo|cía|cías|cíamos|cían|ciendo|cido)|enfad[\p{L}]*|nevera[s]?|jol[ií]n|mol(?:a|an)|ten[eé]is|sois|est[aá]is)(?![\p{L}\p{N}_])/giu;
+const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?|auto(?:s)?|pendej[\p{L}]*|ching(?:ar|a|as|an|o|ó|aron|aba|aban|ado|ada|ando|ón|ones|ue|ues|uen|ué|adera)|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion(?:ar|a|as|an|ó|é|aste|aron|aba|abas|ábamos|aban|ado|ada|ando|amiento)|manej[\p{L}]*|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|carajo|[oó]rale|chido|bacano)(?![\p{L}\p{N}_])/giu;
 const DICT_ES_WEAK = /(?<![\p{L}\p{N}_])vale(?![\p{L}\p{N}_])/giu;
 const DICT_LAT_WEAK = /(?<![\p{L}\p{N}_])(?:papa[s]?|neta[s]?|ustedes)(?![\p{L}\p{N}_])/giu;
 
@@ -122,7 +148,9 @@ const VERCEL_UNZIPPER = "https://hispasubs.vercel.app/proxy?zipUrl=";
 const proxyBase = (env) => {
   const custom = env && typeof env.PROXY_URL === "string" ? env.PROXY_URL.trim() : "";
   if (!custom) return VERCEL_UNZIPPER;
-  if (!/^https?:\/\//.test(custom)) return VERCEL_UNZIPPER; // basura -> valor por defecto
+  // Solo https: el proxy propio también debe ir cifrado (antes se aceptaba
+  // http:// y podía degradar la privacidad del zipUrl en tránsito).
+  if (!/^https:\/\//i.test(custom)) return VERCEL_UNZIPPER; // basura o http -> valor por defecto
   return custom.includes("?") ? `${custom}&zipUrl=` : `${custom}?zipUrl=`;
 };
 
@@ -214,7 +242,9 @@ const fetchJSON = async (url, ms = 2500) => {
 
 // Descarga un .srt y lo decodifica con fallback: muchos SRTs antiguos son
 // Windows-1252; en UTF-8 los acentos se rompen y el diccionario deja de
-// matchear, sesgando todo hacia "Neutro".
+// matchear, sesgando todo hacia "Neutro". Un SRT UTF-16 (con BOM) se detecta
+// por el BOM y se decodifica como tal: si no, el léxico y el anti-spam se
+// saltaban el fichero entero.
 //
 // La lectura va ACOTADA a 1 MB: con arrayBuffer() completo, un fichero
 // enorme (o una respuesta que no es un subtítulo) podía cargar cientos de MB
@@ -234,9 +264,20 @@ const fetchSubtitleText = async (url, ms = 2000) => {
     const declared = Number(res.headers.get("content-length") || 0);
     if (declared > MAX_ANALYZE_BYTES) throw new Error("subtítulo demasiado grande");
     const buf = await readCapped(res, MAX_ANALYZE_BYTES);
-    let text = new TextDecoder("utf-8").decode(buf);
-    if (text.includes("\uFFFD")) {
-      try { text = new TextDecoder("windows-1252").decode(buf); } catch { /* codec no disponible: nos quedamos con UTF-8 */ }
+    // BOM primero: un SRT UTF-16 decodificado a ciegas como UTF-8/windows-1252
+    // intercala bytes NUL entre caracteres y NINGÚN patrón (ni el léxico ni el
+    // anti-spam) matchea; el spam se servía como "📄". El BOM lo delata.
+    let text;
+    if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
+      text = new TextDecoder("utf-16le").decode(buf); // quita el BOM
+    } else if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
+      try { text = new TextDecoder("utf-16be").decode(buf); }
+      catch { text = new TextDecoder("utf-8").decode(buf); } // codec no disponible
+    } else {
+      text = new TextDecoder("utf-8").decode(buf);
+      if (text.includes("\uFFFD")) {
+        try { text = new TextDecoder("windows-1252").decode(buf); } catch { /* codec no disponible: nos quedamos con UTF-8 */ }
+      }
     }
     return text;
   } finally {
@@ -406,7 +447,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.2",
+  version: "1.4.3",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -436,9 +477,9 @@ const getManifest = (host) => ({
 // abortando la fuente entera y devolviendo "0 resultados" temporal para
 // títulos que sí tienen subs (logs 19/10/2026: 2 abortos en 88 peticiones,
 // ambos acabando en lista vacía). El cliente de Stremio espera ~10-15 s, y
-// el presupuesto total se mantiene holgado: fuentes en paralelo (máx 4,5 s)
-// + clasificación (2 s en paralelo) ≈ 6,5 s peor caso. SubDL —API comercial,
-// más rápida— se queda en 2500 ms.
+// el presupuesto total apura ese margen: fuentes en paralelo (máx 4,5 s) +
+// clasificación en paralelo (2 s; 6 s para un .zip vía proxy) = 10,5 s de
+// peor caso. SubDL —API comercial, más rápida— se queda en 2500 ms.
 const OS_V3_TIMEOUT_MS = 4500;
 
 const getOpenSubtitlesV3 = async (type, fullId) => {
@@ -465,7 +506,11 @@ const getOpenSubtitlesV3 = async (type, fullId) => {
       }));
   } catch (e) {
     console.error("[OS-V3]", e.message);
-    return [];
+    // Se propaga el error: promesa RECHAZADA en allSettled. Antes se devolvía
+    // [] y la fuente caída era indistinguible de "0 resultados", así que
+    // sourceFailed (TTL corto) nunca se activaba: la lista se cacheaba 2 h con
+    // una fuente entera ausente. El router ya sabe fusionar [] cuando rechaza.
+    throw e;
   }
 };
 
@@ -536,7 +581,11 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
       ? "(clave rechazada o cuota agotada: se omite SubDL en este título)"
       : "";
     console.error("[SubDL]", e.message, extra);
-    return [];
+    // Igual que OS-V3: se propaga para que allSettled marque la fuente como
+    // rechazada y el TTL baje a 60 s. Los casos "sin resultados" (sin clave,
+    // id inválido, status:false) ya retornan [] ANTES de este catch: no son
+    // fallos transitorios y no deben degradar la caché.
+    throw e;
   }
 };
 
@@ -569,9 +618,14 @@ const scoreText = (text) => {
   // Los términos ambiguos (WEAK) valen 0,25: "No vale la pena", "el Papa",
   // "ganancia neta" o un "ustedes" formal de España ya no deciden solos.
   const score = (dict, weight) => (text.match(dict) || []).length * weight;
-  const esMatches = score(DICT_ES, 1) + score(DICT_ES_WEAK, WEAK_WEIGHT);
-  const latMatches = score(DICT_LAT, 1) + score(DICT_LAT_WEAK, WEAK_WEIGHT);
-  const strongTotal = score(DICT_ES, 1) + score(DICT_LAT, 1);
+  // Una sola pasada por diccionario fuerte: strongEs/strongLat alimentan tanto
+  // las puntuaciones por dialecto como strongTotal (antes se volvían a
+  // recorrer, duplicando el coste léxico).
+  const strongEs = score(DICT_ES, 1);
+  const strongLat = score(DICT_LAT, 1);
+  const esMatches = strongEs + score(DICT_ES_WEAK, WEAK_WEIGHT);
+  const latMatches = strongLat + score(DICT_LAT_WEAK, WEAK_WEIGHT);
+  const strongTotal = strongEs + strongLat;
   const total = esMatches + latMatches;
   if (total === 0) return null;
 
@@ -579,13 +633,14 @@ const scoreText = (text) => {
   // subtítulo entero; hace falta cierta ventaja relativa.
   const margin = Math.max(2, Math.floor(total * 0.15));
 
+  // Sin NINGÚN término fuerte no hay veredicto: los ambiguos (peso 0,25) solo
+  // matizan. Evita que una acumulación de "ustedes" (o "vale"/"papa") decida
+  // un dialecto por aritmética; en ese caso es 📄 "sin clasificar".
+  if (strongTotal === 0) return null;
+
   let flag = "🌎 Neutro";
   if (esMatches > latMatches + margin) flag = "🇪🇸 Castellano";
   else if (latMatches > esMatches + margin) flag = "🇲🇽 Latino";
-  // Cero términos fuertes y decisión "Neutro": no hay vocabulario
-  // equilibrado, hay ausencia de datos → 📄 "sin clasificar" (el README solo
-  // promete Neutro cuando hubo coincidencias léxicas reales).
-  if (flag === "🌎 Neutro" && strongTotal === 0) return null;
   return { esMatches, latMatches, total, flag };
 };
 
@@ -610,17 +665,49 @@ const scoreText = (text) => {
 // Fronteras Unicode (?<![\p{L}\p{N}_]) en vez de \b: \b es ASCII y fallaría
 // tras "ú"/"í" ("Únete…"). Sin /g: los .test() no deben arrastrar lastIndex.
 // Sin cuantificadores anidados, para no arriesgar backtracking sobre 1 MB.
-const SPAM_STRONG = /(?<![\p{L}\p{N}_])(?:(?:bet365|1xbet|1win|22bet|betway|melbet|bwin|parimatch|betano|betfair)(?![\p{L}\p{N}_])|(?:casino|bingo|poker|ruleta|tragamonedas|tragaperras)\s+(?:online|en\s+l[ií]nea|virtual)(?![\p{L}\p{N}_])|(?:casas?\s+de\s+apuestas|apuestas\s+deportivas|bono\s+de\s+bienvenida|giros\s+gratis)(?![\p{L}\p{N}_])|(?:t\.me|telegram\.me|wa\.me|chat\.whatsapp\.com|whatsapp\.com\/channel)\/[^\s<>"']+|[uú]nete(?:te)?\s+(?:a|al)\s+(?:nuestro|nuestra|mi)\s+(?:canal|grupo|comunidad|telegram|whatsapp|servidor)(?![\p{L}\p{N}_])|(?:s[ií]guenos|suscr[ií]bete)\s+(?:en|a)\s+(?:telegram|youtube|instagram|facebook|tiktok|nuestro\s+(?:canal|grupo))(?![\p{L}\p{N}_])|(?:descarga|descargar|instala|instalar)\s+(?:la\s+|nuestra\s+)?(?:app|aplicaci[oó]n|apk)(?![\p{L}\p{N}_])|(?:visita|visitar|entra|entrar)\s+(?:en\s+)?(?:www\.|https?:\/\/|nuestra\s+(?:web|p[aá]gina)))/iu;
+//
+// El análisis se ACOTA a las primeras y últimas EDGE_LINES líneas (donde los
+// grupos ponen cabeceras y pies). Eso abarata el filtro (no rastrea 1.000
+// líneas), evita falsos positivos de frases que también son diálogo y corta el
+// ReDoS de SPAM_WEAK_LINE saltando líneas de más de MAX_SPAM_LINE caracteres
+// (una línea "a.a.a…" de 80k tardaba 9,6 s y dejaba el título sin respuesta).
+const EDGE_LINES = 30;
+const MAX_SPAM_LINE = 300;
 
-// Débiles: se evalúan LÍNEA a LÍNEA y se cuentan líneas distintas, no
-// coincidencias ("Traducido por Argenteam" es UNA línea, no dos señales).
-const SPAM_WEAK_LINE = /(?<![\p{L}\p{N}_])(?:(?:https?:\/\/|www\.)[^\s<>"']+|(?:[a-z0-9][a-z0-9-]{0,62}\.)+(?:com|net|org|es|tv|me|info|xyz|top|link|site|online|app|club|cc|io|biz|pro|name|live|vip|bet)(?![\p{L}\p{N}_])|(?:opensubtitles|subdivx|tusubtitulo|argenteam|subtitulamos|elrincondelsub|podnapisi|subs4free)(?![\p{L}\p{N}_])|(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])|(?:canal|grupo)\s+de\s+telegram(?![\p{L}\p{N}_])|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/iu;
+// FUERTE global: marcas y URLs que no aparecen en diálogo normal. Se busca en
+// TODO el texto (una casa de apuestas incrustada a mitad también descarta).
+// `\d{2,}` cubre marcas numéricas (888casino) y `\s*` las variantes con
+// espacios ("bet 365", "t . me").
+const SPAM_STRONG = /(?<![\p{L}\p{N}_])(?:(?:bet\s*365|1xbet|1win|22bet|betway|melbet|bwin|parimatch|betano|betfair)(?![\p{L}\p{N}_])|\d{2,}\s*(?:casino|bingo|poker|ruleta|slots)(?![\p{L}\p{N}_])|(?:casas?\s+de\s+apuestas|apuestas\s+deportivas|bono\s+de\s+bienvenida|giros\s+gratis)(?![\p{L}\p{N}_])|(?:(?:t|telegram|wa)\s*\.\s*me|chat\s*\.\s*whatsapp\s*\.\s*com|whatsapp\s*\.\s*com\s*\/\s*channel)\s*\/\s*[^\s<>"']+)/iu;
+
+// FUERTE solo en BORDES: frases que también pueden ser diálogo legítimo
+// ("síguenos en Instagram", "instala la aplicación", "tragamonedas en línea").
+// En cabecera/pie son publicidad; en mitad del subtítulo, no.
+const SPAM_STRONG_EDGE = /(?<![\p{L}\p{N}_])(?:(?:casino|bingo|poker|ruleta|tragamonedas|tragaperras)\s+(?:online|en\s+l[ií]nea|virtual)(?![\p{L}\p{N}_])|[uú]nete(?:te)?\s+(?:a|al)\s+(?:nuestro|nuestra|mi)\s+(?:canal|grupo|comunidad|telegram|whatsapp|servidor)(?![\p{L}\p{N}_])|(?:s[ií]guenos|suscr[ií]bete)\s+(?:en|a)\s+(?:telegram|youtube|instagram|facebook|tiktok|nuestro\s+(?:canal|grupo))(?![\p{L}\p{N}_])|(?:descarga|descargar|instala|instalar)\s+(?:la\s+|nuestra\s+)?(?:app|aplicaci[oó]n|apk)(?![\p{L}\p{N}_])|(?:visita|visitar|entra|entrar)\s+(?:en\s+)?(?:www\.|https?:\/\/|nuestra\s+(?:web|p[aá]gina)))/iu;
+
+// Débiles: se evalúan LÍNEA a LÍNEA (solo en los bordes) y se cuentan líneas
+// distintas, no coincidencias ("Traducido por Argenteam" es UNA línea, no dos
+// señales). Los TLD "me"/"pro" se han quitado: chocaban con el diálogo
+// ("no.Me importa", "todo.Es posible"). `mx`/`yts` cubren el watermark YTS.
+const SPAM_WEAK_LINE = /(?<![\p{L}\p{N}_])(?:(?:https?:\/\/|www\.)[^\s<>"']+|(?:[a-z0-9][a-z0-9-]{0,62}\.)+(?:com|net|org|es|mx|tv|info|xyz|top|link|site|online|app|club|cc|io|biz|name|live|vip|bet)(?![\p{L}\p{N}_])|(?:opensubtitles|subdivx|tusubtitulo|argenteam|subtitulamos|elrincondelsub|podnapisi|subs4free|yts)(?![\p{L}\p{N}_])|(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])|(?:canal|grupo)\s+de\s+telegram(?![\p{L}\p{N}_])|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/iu;
 
 // Veredicto puro (exportado para tests). Devuelve { discard, reason }.
 const spamVerdict = (text) => {
+  // Marca/URL inequívoca: cualquier parte del subtítulo.
   if (SPAM_STRONG.test(text)) return { discard: true, reason: "fuerte" };
+
+  // Bordes sin duplicar índices cuando el subtítulo es corto.
+  const lines = text.split(/\r?\n/);
+  const edge = new Set();
+  for (let i = 0; i < lines.length && i < EDGE_LINES; i++) edge.add(i);
+  for (let i = Math.max(0, lines.length - EDGE_LINES); i < lines.length; i++) edge.add(i);
+  const edgeLines = [];
+  for (const i of edge) if (lines[i].length <= MAX_SPAM_LINE) edgeLines.push(lines[i]);
+
+  if (SPAM_STRONG_EDGE.test(edgeLines.join("\n"))) return { discard: true, reason: "fuerte" };
+
   let weakLines = 0;
-  for (const line of text.split(/\r?\n/)) {
+  for (const line of edgeLines) {
     if (SPAM_WEAK_LINE.test(line) && ++weakLines >= 2) {
       return { discard: true, reason: `${weakLines} líneas débiles` };
     }
@@ -628,12 +715,14 @@ const spamVerdict = (text) => {
   return { discard: false, reason: "" };
 };
 
-// Presupuesto de análisis por fuente. Cada pista analizada es una descarga (los
-// .zip, además, una invocación al proxy de Vercel): 5+5 acota la respuesta a 10
-// pistas verificadas sin disparar el coste. Ver el bucle de análisis del router.
+// Presupuesto de SIRVIDAS por fuente: el tope de la respuesta sigue siendo
+// 5+5 = 10 pistas verificadas. Pero se DESCARGAN hasta ANALYSIS_FETCH_PER_SOURCE
+// candidatos para poder rellenar el cupo cuando los primeros son spam (ver
+// bucle del router). Ver también SPAM_FILTER=log para medir sin descartar.
 const ANALYSIS_BUDGET_PER_SOURCE = 5;
+const ANALYSIS_FETCH_PER_SOURCE = 8;
 
-const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER) => {
+const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER, spamMode = "drop") => {
   // Guard ANTES de cualquier acceso a sub.url (evita el crash en cascada
   // de Promise.all del 1.0.0).
   if (!sub || !isHttpUrl(sub.url)) return null;
@@ -663,13 +752,18 @@ const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER) => {
     }
 
     // Anti-spam: se descarta la pista entera con el texto que ya está en
-    // memoria (publicidad incrustada). null = fuera de la lista vía
-    // filter(Boolean); un descarte deliberado NO es una respuesta degradada,
-    // así que no marca FAILED ni baja el TTL.
+    // memoria (publicidad incrustada). null = fuera de la lista; un descarte
+    // deliberado NO es una respuesta degradada, así que no marca FAILED ni
+    // baja el TTL. Con SPAM_FILTER=log (modo sombra) se registra el veredicto
+    // pero la pista se sirve: sirve para medir en producción qué se perdería.
     const spam = spamVerdict(text);
     if (spam.discard) {
-      console.log(`[classify] descartado por spam (${spam.reason}) [${sub.source}]`);
-      return null;
+      if (spamMode === "log") {
+        console.log(`[classify] SPAM_FILTER=log: se habría descartado (${spam.reason}) [${sub.source}]`);
+      } else {
+        console.log(`[classify] descartado por spam (${spam.reason}) [${sub.source}]`);
+        return null;
+      }
     }
 
     const scored = scoreText(text);
@@ -689,9 +783,9 @@ const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER) => {
 };
 
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
-// de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam y el
-// presupuesto por fuente para las aserciones de v1.4.2).
-export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE };
+// de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
+// sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
+export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -882,27 +976,38 @@ export default {
           return empty;
         }
 
-        // Análisis equilibrado: hasta 5 por fuente, y SOLO se publican las
-        // pistas analizadas (política estricta). Antes el tope era 3 y el resto
-        // se servía como "📄 sin clasificar": al no descargar su texto no se
-        // puede saber si son spam, así que eran un coladero. Con 5+5 la
-        // respuesta queda acotada a 10 pistas, todas verificadas.
+        // Política estricta: SOLO se publican pistas verificadas. Se DESCARGAN
+        // hasta ANALYSIS_FETCH_PER_SOURCE candidatos por fuente (sobrepaso) y
+        // se SIRVEN los primeros ANALYSIS_BUDGET_PER_SOURCE limpios. Antes el
+        // presupuesto se gastaba antes de filtrar: si los 5 primeros eran
+        // spam, el título quedaba vacío aunque detrás hubiera limpias.
         const pBase = proxyBase(env);
-        const budget = { "OS-V3": ANALYSIS_BUDGET_PER_SOURCE, "SubDL": ANALYSIS_BUDGET_PER_SOURCE };
+        const spamMode = env && env.SPAM_FILTER === "log" ? "log" : "drop";
+        const fetchBudget = { "OS-V3": ANALYSIS_FETCH_PER_SOURCE, "SubDL": ANALYSIS_FETCH_PER_SOURCE };
         const analyzed = await Promise.all(
           deduped.map((sub) => {
-            if (budget[sub.source] > 0) {
-              budget[sub.source] -= 1;
-              return classifySubtitle(sub, pBase);
+            if (fetchBudget[sub.source] > 0) {
+              fetchBudget[sub.source] -= 1;
+              return classifySubtitle(sub, pBase, spamMode);
             }
-            // Fuera de presupuesto: no se puede verificar que no sea spam
-            // (requiere descargar el texto) → no se sirve. Mejor 10 pistas
-            // limpias que 25 con publicidad incrustada.
+            // Más allá del sobrepaso: ni se descarga.
             return null;
           })
         );
 
-        const subtitles = analyzed.filter(Boolean);
+        // Los fallos de descarga (FAILED) NO se sirven: no pasaron por el
+        // filtro anti-spam, así que no son pistas verificadas. Solo cuentan
+        // para degradar el TTL (se calcula sobre `analyzed`, antes de filtrar).
+        const kept = { "OS-V3": 0, "SubDL": 0 };
+        const subtitles = [];
+        for (let i = 0; i < analyzed.length; i++) {
+          const s = analyzed[i];
+          if (!s || s[FAILED]) continue;
+          const source = deduped[i].source;
+          if (kept[source] >= ANALYSIS_BUDGET_PER_SOURCE) continue;
+          kept[source] += 1;
+          subtitles.push(s);
+        }
 
         // TTL según fiabilidad: si ALGÚNA clasificación falló (red/timeout/
         // HTML de error) o una fuente entera rechazó, la lista está incompleta
@@ -1019,3 +1124,25 @@ export default {
 // 30. [LÍMITES] Presupuesto de análisis 3 → 5 por fuente: tope de 10 pistas
 //     verificadas por título.
 // 31. [OS-V3] Timeout de la fuente 2500 → 4500 ms (ver getOpenSubtitlesV3).
+//
+// v1.4.3 (19/10/2026) — auditoría de la 1.4.2:
+// 32. [CPU] scoreText recorría cada diccionario fuerte dos veces (esMatches/
+//     latMatches + strongTotal): ahora una sola. ~2× menos coste léxico.
+// 33. [CPU] Anti-spam acotado a los bordes (EDGE_LINES=30 por lado) y con
+//     corte de líneas patológicas (MAX_SPAM_LINE=300): el rastreo por línea
+//     pasa de varios ms a por debajo de 1 ms por SRT de 80 KB.
+// 34. [ReDoS] El corte de línea también elimina el backtracking cuadrático de
+//     SPAM_WEAK_LINE (20k car. → 0,5 s; 80k → 9,6 s antes).
+// 35. [FP] Las frases-CTA ambiguas (síguenos/instala/únete/entra/tragamonedas
+//     en línea…) solo descartan en cabecera/pie, no en mitad del diálogo.
+// 36. [FUGAS] Una descarga fallida ya no publica un "📄" sin pasar por spam:
+//     se descarta y solo degrada el TTL. Un SRT UTF-16 con BOM se decodifica
+//     y se filtra (antes el léxico y el anti-spam lo ignoraban).
+// 37. [COBERTURA] Se descargan hasta 8 candidatos por fuente y se sirven las
+//     5 primeras limpias (antes 5 candidatos: los contaminados vaciaban el
+//     título). DESCARTES por spam siguen sin degradar el TTL.
+// 38. [OPS] SPAM_FILTER=log (modo sombra) mide sin descartar; sourceFailed ya
+//     puede activarse (las fuentes propagan el error) y baja el TTL a 60 s.
+// 39. [LÉXICO] Fuera las raíces abiertas que colaban "conducta", "Jodie" o
+//     "estacionario": formas explícitas. El dialecto exige ≥1 término fuerte
+//     (9× "ustedes" ya no da Latino). PROXY_URL exige https; CI fija wrangler.
