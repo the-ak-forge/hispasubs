@@ -8,7 +8,7 @@
 
 import AdmZip from "adm-zip";
 import dns from "node:dns/promises";
-import handler, { ALLOWED_HOSTS, MAX_BYTES, isPublicIP, readCapped } from "./api/proxy.js";
+import handler, { ALLOWED_HOSTS, MAX_BYTES, isPublicIP, readCapped, rateLimit, RATE_MAP_CAP } from "./api/proxy.js";
 
 let pass = 0;
 let fail = 0;
@@ -491,6 +491,45 @@ process.env.RATE_LIMIT_PER_MIN = "3";
   }
   check("RATE_LIMIT_PER_MIN=0 desactiva el límite", ok);
   delete process.env.RATE_LIMIT_PER_MIN;
+}
+
+// ===========================================================================
+// 6b. v1.4.4: tope duro del Map del rate limiter (auditoría externa de 1.4.3)
+// ===========================================================================
+section("6b. tope del Map del rate limiter (v1.4.4)");
+{
+  const now = Date.now();
+  const mk = (n, reset, prefix = "198.51.100.") => {
+    const m = new Map();
+    for (let i = 0; i < n; i++) m.set(`${prefix}${i}`, { count: 1, reset });
+    return m;
+  };
+  delete process.env.RATE_LIMIT_PER_MIN; // límite por defecto: 120/min
+
+  const m = mk(RATE_MAP_CAP + 1, now + 60_000);
+  const r = rateLimit("203.0.113.7", m);
+  check("el Map queda en el tope tras una IP nueva (antes crecía sin límite)",
+    m.size === RATE_MAP_CAP && r === null, `size=${m.size}`);
+  check("se expulsa de la cabeza (el Map conserva el orden de inserción)",
+    !m.has("198.51.100.0") && !m.has("198.51.100.1") && m.has("198.51.100.2") && m.has("203.0.113.7"));
+
+  const m2 = mk(RATE_MAP_CAP + 1, now - 1000, "10.0.");
+  rateLimit("203.0.113.8", m2);
+  check("las entradas caducadas se barren completas (sin expulsar vivas)",
+    m2.size === 1 && m2.has("203.0.113.8"), `size=${m2.size}`);
+
+  const m3 = mk(RATE_MAP_CAP + 1, now + 60_000);
+  m3.set("203.0.113.9", { count: 119, reset: now + 60_000 });
+  const r3 = rateLimit("203.0.113.9", m3);
+  check("la IP actual no se expulsa ni se le reinicia el contador",
+    r3 === null && m3.get("203.0.113.9").count === 120 && m3.size <= RATE_MAP_CAP,
+    `count=${m3.get("203.0.113.9").count}, size=${m3.size}`);
+
+  const m4 = mk(RATE_MAP_CAP + 1, now + 60_000);
+  for (let i = 0; i <= 121; i++) rateLimit("203.0.113.10", m4);
+  const r4 = rateLimit("203.0.113.10", m4);
+  check("el tope no rompe el 429: la IP que supera el límite sigue contando",
+    typeof r4 === "number" && r4 >= 1 && m4.size <= RATE_MAP_CAP, `r4=${r4}, size=${m4.size}`);
 }
 
 // ===========================================================================

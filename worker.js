@@ -1,6 +1,23 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.3
+// HispaSubs — Cloudflare Worker v1.4.4
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.4 (19/10/2026) — auditoría externa de la 1.4.3 (verificación medida):
+//  - [MEM] El Map del rate limiter fallback tenía un barrido que NO reduce
+//    nada si toda la ventana sigue viva: por encima de 5000 IPs distintas en
+//    60 s crecía sin límite. Ahora, tras barrer, se expulsa de la cabeza (el
+//    Map conserva el orden de inserción) hasta bajar del tope, sin tocar la
+//    entrada de la IP actual. (En producción manda el binding
+//    SUBS_RATE_LIMIT; este Map es el fallback de tests/entornos sin binding.)
+//  - [CPU/MEM] spamVerdict ya no parte el archivo entero con .split(/\r?\n/)
+//    (0,8 ms y un array de miles de strings por subtítulo de 1 MB): extrae
+//    las primeras/últimas 30 líneas con indexOf/lastIndexOf + slice
+//    (0,007 ms medidos, 111×). Equivalencia verificada con fuzz (20 013
+//    casos: CRLF, líneas de 299/300/301 car., archivos cortos, UTF-8).
+//  - Las otras 3 claims de la auditoría se refutaron con medidas y NO se
+//    aplican (ver NOTAS-INTERNAS.md): fatal:true en TextDecoder empeora los
+//    BOM corruptos, adm-zip está acotado por MAX_ENTRIES/MAX_BYTES_TOTAL y
+//    SPAM_STRONG (5,2 ms/MB) cuesta lo mismo que scoreText (4,5 ms/MB).
 //
 // v1.4.3 (19/10/2026) — auditoría de la 1.4.2: CPU, falsos positivos y fugas
 // de la política de solo pistas verificadas:
@@ -355,15 +372,29 @@ const subtitleCacheUrl = (origin, configStr, type, fullId) =>
 // a un mapa in-memory del isolate (mantiene compatibilidad con los tests).
 // ---------------------------------------------------------------------------
 const rateHits = new Map();
-const rateLimitFallback = (ip, limit) => {
+// Tope del Map fallback: el barrido de expirados no reduce NADA si toda la
+// ventana sigue viva (60 s), así que sin este cap un barrido de IPs distintas
+// lo crecería sin límite (presión de memoria en el isolate) y cada petición
+// pagaría un barrido completo inútil. Es un límite best-effort, no defensa de
+// plataforma: en producción manda el binding SUBS_RATE_LIMIT.
+const RATE_MAP_CAP = 5000;
+const rateLimitFallback = (ip, limit, map = rateHits) => {
   const now = Date.now();
-  if (rateHits.size > 5000) {
-    for (const [k, v] of rateHits) if (v.reset <= now) rateHits.delete(k);
+  if (map.size > RATE_MAP_CAP) {
+    for (const [k, v] of map) if (v.reset <= now) map.delete(k);
+    // Se expulsa de la cabeza (el Map conserva el orden de inserción),
+    // preservando la entrada de la IP actual para no reiniciar su contador.
+    // El bucle para por DEBAJO del tope: con la inserción posterior el Map
+    // queda exactamente en RATE_MAP_CAP.
+    for (const k of map.keys()) {
+      if (map.size < RATE_MAP_CAP) break;
+      if (k !== ip) map.delete(k);
+    }
   }
-  let entry = rateHits.get(ip);
+  let entry = map.get(ip);
   if (!entry || entry.reset <= now) {
     entry = { count: 0, reset: now + 60_000, warned: false };
-    rateHits.set(ip, entry);
+    map.set(ip, entry);
   }
   entry.count += 1;
   if (entry.count > limit) {
@@ -447,7 +478,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.3",
+  version: "1.4.4",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -696,13 +727,43 @@ const spamVerdict = (text) => {
   // Marca/URL inequívoca: cualquier parte del subtítulo.
   if (SPAM_STRONG.test(text)) return { discard: true, reason: "fuerte" };
 
-  // Bordes sin duplicar índices cuando el subtítulo es corto.
-  const lines = text.split(/\r?\n/);
-  const edge = new Set();
-  for (let i = 0; i < lines.length && i < EDGE_LINES; i++) edge.add(i);
-  for (let i = Math.max(0, lines.length - EDGE_LINES); i < lines.length; i++) edge.add(i);
+  // Bordes sin partir el archivo entero (v1.4.4): .split(/\r?\n/) sobre un
+  // SRT de 1 MB asignaba un array de miles de strings por candidato (0,8 ms
+  // medidos); indexOf/lastIndexOf + slice recorre lo mismo con asignaciones
+  // mínimas (0,007 ms). Semántica idéntica: primeras EDGE_LINES líneas
+  // seguidas de las últimas, sin duplicar en archivos cortos, y saltando
+  // líneas de más de MAX_SPAM_LINE caracteres.
+  const headEnds = [];
+  const headStarts = [0];
+  for (let pos = -1; headEnds.length < EDGE_LINES && (pos = text.indexOf("\n", pos + 1)) !== -1;) {
+    headEnds.push(pos);
+    headStarts.push(pos + 1);
+  }
   const edgeLines = [];
-  for (const i of edge) if (lines[i].length <= MAX_SPAM_LINE) edgeLines.push(lines[i]);
+  const addLine = (start, end) => {
+    // En CRLF el "\r" queda justo antes del "\n": se excluye para medir la
+    // longitud real de la línea (el split anterior ya lo hacía).
+    if (end < text.length && end > start && text.charCodeAt(end - 1) === 13) end -= 1;
+    if (end - start <= MAX_SPAM_LINE) edgeLines.push(text.slice(start, end));
+  };
+  for (let i = 0; i < headEnds.length; i++) addLine(headStarts[i], headEnds[i]);
+  if (headEnds.length < EDGE_LINES) {
+    // Sin más saltos: lo que queda es la última línea (ya forma parte de la
+    // "cabeza") y no hay cola que añadir.
+    addLine(headStarts[headEnds.length], text.length);
+  } else {
+    // Cola: últimas líneas completas hacia atrás, sin pisar la cabecera
+    // (boundary = inicio de la primera línea que NO es de cabeza).
+    const boundary = headStarts[EDGE_LINES];
+    const tail = [];
+    for (let end = text.length; tail.length < EDGE_LINES;) {
+      const p = text.lastIndexOf("\n", end - 1);
+      if (p === -1 || p + 1 < boundary) break;
+      tail.unshift([p + 1, end]);
+      end = p;
+    }
+    for (const [s, e] of tail) addLine(s, e);
+  }
 
   if (SPAM_STRONG_EDGE.test(edgeLines.join("\n"))) return { discard: true, reason: "fuerte" };
 
@@ -785,7 +846,7 @@ const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER, spamMode = "drop")
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE };
+export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, rateLimitFallback, RATE_MAP_CAP };
 
 // ---------------------------------------------------------------------------
 // Router

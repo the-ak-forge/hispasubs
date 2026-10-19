@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.3
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.4
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -16,6 +16,16 @@
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
+//
+// v1.4.4 (19/10/2026): tope duro del Map del rate limiter. El barrido de
+// expirados no reducía nada si toda la ventana (60 s) seguía viva: con más de
+// 5000 IPs distintas el Map crecía sin límite y cada petición pagaba un
+// barrido completo. Ahora, tras barrer, se expulsa de la cabeza hasta bajar
+// del tope (el Map conserva el orden de inserción), preservando la entrada de
+// la IP actual. `rateLimit` acepta un Map inyectable y se exporta para tests.
+// (Auditoría externa de la 1.4.3; el reclamo de que adm-zip "destruye la
+// latencia" se refutó: 1,6 ms en un zip típico, ~33 ms en el patológico ya
+// acotado por MAX_ENTRIES/MAX_BYTES_TOTAL.)
 //
 // v1.4.3 (19/10/2026): sin cambios funcionales en el proxy — versión alineada
 // con el Worker (auditoría de la 1.4.2: CPU, falsos positivos y fugas de
@@ -62,7 +72,7 @@ const MAX_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
-const USER_AGENT = "HispaSubs/1.4.3";
+const USER_AGENT = "HispaSubs/1.4.4";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 
@@ -150,6 +160,13 @@ function isPublicIPv4(ip) {
 // endpoint raíz/health check nunca dispara el contador.
 // ---------------------------------------------------------------------------
 const rateHits = new Map();
+// Tope del Map: el barrido de expirados no reduce nada si toda la ventana
+// (60 s) sigue viva, así que sin este cap un barrido de IPs distintas lo
+// dejaría crecer sin límite (presión de memoria de la instancia) y cada
+// petición pagaría un barrido completo inútil (0,2 ms medidos con 5001
+// entradas). Best-effort: la defensa de plataforma es la rate limiting
+// rule del panel de Vercel.
+const RATE_MAP_CAP = 5000;
 
 function clientIp(req) {
   const h = req.headers || {};
@@ -157,17 +174,25 @@ function clientIp(req) {
   return (raw || "").trim();
 }
 
-function rateLimit(ip) {
+function rateLimit(ip, map = rateHits) {
   const limit = Number(process.env.RATE_LIMIT_PER_MIN ?? 120);
   if (!Number.isFinite(limit) || limit <= 0 || !ip) return null;
   const now = Date.now();
-  if (rateHits.size > 5000) {
-    for (const [k, v] of rateHits) if (v.reset <= now) rateHits.delete(k);
+  if (map.size > RATE_MAP_CAP) {
+    for (const [k, v] of map) if (v.reset <= now) map.delete(k);
+    // Expulsión de la cabeza (el Map conserva el orden de inserción),
+    // preservando la entrada de la IP actual para no reiniciar su contador.
+    // El bucle para por DEBAJO del tope: con la inserción posterior el Map
+    // queda exactamente en RATE_MAP_CAP.
+    for (const k of map.keys()) {
+      if (map.size < RATE_MAP_CAP) break;
+      if (k !== ip) map.delete(k);
+    }
   }
-  let e = rateHits.get(ip);
+  let e = map.get(ip);
   if (!e || e.reset <= now) {
     e = { count: 0, reset: now + 60_000 };
-    rateHits.set(ip, e);
+    map.set(ip, e);
   }
   e.count += 1;
   if (e.count > limit) {
@@ -405,4 +430,4 @@ export default async function handler(req, res) {
 }
 
 // Exportados para test_proxy.js (la lógica de SSRF no puede quedar sin tests).
-export { ALLOWED_HOSTS, MAX_BYTES, isPublicIP, assertSafeUrl, readCapped };
+export { ALLOWED_HOSTS, MAX_BYTES, isPublicIP, assertSafeUrl, readCapped, rateLimit, RATE_MAP_CAP };
