@@ -16,7 +16,11 @@ El complemento analiza el texto de los subtítulos, detecta expresiones, pronomb
   - 🇲🇽 Latino: detecta vocabulario, pronombres y expresiones comunes de América Latina (`ustedes`, `celular`, `carro`, `manejar`, `enojar`, etc.).
   - 🇪🇸 Castellano: detecta conjugaciones y giros propios de España (`vosotros`, `ordenador`, `coche`, `conducir`, `enfadar`, etc.).
   - 🌎 Neutro: identifica subtítulos con vocabulario equilibrado o sin localismos marcados (solo se emite cuando el análisis encontró datos reales; un archivo sin ningún match léxico recibe 📄, no 🌎).
-  - 📄 Español (sin clasificar): subtítulos que no llegaron a analizarse o cuyo contenido no resultó ser texto de subtítulo (HTML de error, binario, vacío o sin coincidencias léxicas; ver [Solución de problemas](#-solución-de-problemas)).
+  - Filtro anti-spam: descarta las pistas con publicidad incrustada (casas de apuestas, canales de Telegram/WhatsApp, «descarga nuestra app»…) durante el propio análisis, sin coste de red adicional.
+
+- Solo pistas verificadas
+  - Por título se analizan **hasta 5 subtítulos por fuente** y **solo se muestran las analizadas**: las que no se pueden verificar se descartan en vez de colarse sin revisar. El tope de la lista es 10 pistas, todas limpias y clasificadas.
+  - 📄 Español (sin clasificar): la pista llegó a analizarse, pero su contenido no era texto de subtítulo (HTML de error, binario, vacío) o no dio ninguna palabra del léxico (ver [Solución de problemas](#-solución-de-problemas)).
 
 - Sin configuración obligatoria
   - Incluye soporte predeterminado para OpenSubtitles V3.
@@ -63,7 +67,7 @@ HispaSubs inspecciona el contenido textual de cada subtítulo e identifica patro
 | 🇪🇸 Castellano | Analizado. Vocabulario y giros de España. |
 | 🇲🇽 Latino | Analizado. Vocabulario latinoamericano. |
 | 🌎 Neutro | Analizado. Sin inclinación regional marcada (solo si hubo coincidencias léxicas reales). |
-| 📄 Español (sin clasificar) | En español, pero sin analizar: se analizan hasta 3 subtítulos por fuente por título, el análisis falló (p. ej. rate limit del proveedor) o el contenido no era texto de subtítulo (HTML de error, binario, vacío o sin ninguna palabra del léxico). |
+| 📄 Español (sin clasificar) | Analizado, pero sin veredicto fiable: no dio ninguna palabra del léxico o el contenido descargado no era texto de subtítulo (HTML de error, binario, vacío). Las pistas que no se llegan a analizar no se muestran. |
 
 Esto permite distinguir entre versiones del español con matices regionales sin depender de metadatos ambiguos o genéricos.
 
@@ -130,7 +134,7 @@ Para evitar abusos, ambos componentes aplican un límite de peticiones por IP (l
 ## 🛠️ Solución de problemas
 
 ### Veo subtítulos con la etiqueta 📄 “Español (sin clasificar)”
-El análisis consume recursos, así que por título se analizan hasta **3 subtítulos por fuente** (OpenSubtitles y SubDL); el resto se muestra sin analizar para mantener la respuesta rápida — en la práctica, los primeros de la lista suelen estar clasificados. También aparece 📄 si la descarga del archivo para analizarlo falló, o si el contenido descargado no resultó ser texto de subtítulo (una página HTML de error, un binario, un archivo vacío o uno sin ninguna palabra del léxico): en esos casos no se afirma “🌎 Neutro” porque no hay datos reales que lo respalden. Una clave de SubDL amplía el catálogo disponible.
+El análisis consume recursos, así que por título se analizan hasta **5 subtítulos por fuente** (OpenSubtitles y SubDL) y **solo se muestra lo analizado**: las pistas que no se llegan a verificar se descartan para no colar publicidad sin revisar. La etiqueta 📄 aparece cuando el análisis sí se hizo pero no dio un veredicto fiable: la descarga falló (p. ej. rate limit del proveedor), el contenido no era texto de subtítulo (una página HTML de error, un binario o un archivo vacío) o no contenía ninguna palabra del léxico — en esos casos no se afirma “🌎 Neutro” porque no hay datos reales que lo respalden. Los subtítulos con publicidad incrustada (casas de apuestas, canales de Telegram/WhatsApp, «descarga nuestra app»…) se descartan automáticamente; una simple línea de crédito (“Traducido por X”) no basta para eliminarlos. Una clave de SubDL amplía el catálogo disponible.
 
 ### No veo subtítulos de SubDL
 Comprueba que tu clave es válida probándola directamente:

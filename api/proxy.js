@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.1
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.2
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -16,6 +16,9 @@
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
+//
+// v1.4.2 (19/10/2026): sin cambios funcionales en el proxy — versión alineada
+// con el Worker (filtro anti-spam y política de solo pistas verificadas).
 //
 // v1.4.1 (auditoría de código, 18/10/2026):
 //  - Descarga por STREAMING acotada a 4 MB (readCapped): un origen que miente
@@ -55,7 +58,7 @@ const MAX_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
-const USER_AGENT = "HispaSubs/1.4.1";
+const USER_AGENT = "HispaSubs/1.4.2";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 

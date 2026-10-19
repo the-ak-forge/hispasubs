@@ -1,6 +1,22 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.1
+// HispaSubs — Cloudflare Worker v1.4.2
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.2 (19/10/2026) — limpieza anti-spam y solo pistas verificadas:
+//  - Filtro anti-spam durante la clasificación (coste cero: se aplica al texto
+//    que YA se descarga para el análisis léxico). Diccionario en dos niveles:
+//    los patrones FUERTES (casas de apuestas, casino online, enlaces de
+//    Telegram/WhatsApp, "únete a nuestro canal", CTAs de app/web) descartan
+//    con UNA coincidencia; los DÉBILES (una URL/dominio suelto, créditos
+//    "subtítulos por", nombres de sitios) solo con DOS líneas distintas. Así
+//    "Traducido por Argenteam" sobrevive, pero el sub con publicidad no.
+//  - Política estricta: solo se sirven pistas clasificadas. Antes, las entradas
+//    sin presupuesto de análisis se publicaban como "📄 sin clasificar" y eran
+//    un coladero de spam (no se puede saber sin descargar su texto).
+//  - Presupuesto de análisis 3 → 5 por fuente: con la política estricta, el
+//    tope duro de la respuesta pasa a 10 pistas, todas verificadas.
+//  - OS-V3: timeout de la fuente 2500 → 4500 ms (logs 19/10/2026: 2 abortos en
+//    88 peticiones que acababan en 0 resultados; ver getOpenSubtitlesV3).
 //
 // v1.4.1 (19/10/2026) — auditoría de código (solo versión alineada con el
 // proxy; la lógica del worker no cambia, su último cambio real es v1.4.0):
@@ -390,7 +406,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.1",
+  version: "1.4.2",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -414,11 +430,22 @@ const getManifest = (host) => ({
 // ---------------------------------------------------------------------------
 
 // 1. OpenSubtitles V3 (comunidad)
+//
+// Timeout de la consulta: 4500 ms (antes 2500). El endpoint comunitario
+// opensubtitles-v3.strem.io se congestiona y superaba a menudo los 2,5 s,
+// abortando la fuente entera y devolviendo "0 resultados" temporal para
+// títulos que sí tienen subs (logs 19/10/2026: 2 abortos en 88 peticiones,
+// ambos acabando en lista vacía). El cliente de Stremio espera ~10-15 s, y
+// el presupuesto total se mantiene holgado: fuentes en paralelo (máx 4,5 s)
+// + clasificación (2 s en paralelo) ≈ 6,5 s peor caso. SubDL —API comercial,
+// más rápida— se queda en 2500 ms.
+const OS_V3_TIMEOUT_MS = 4500;
+
 const getOpenSubtitlesV3 = async (type, fullId) => {
   try {
     const data = await fetchJSON(
       `https://opensubtitles-v3.strem.io/subtitles/${type}/${encodeURIComponent(fullId)}.json`,
-      2500
+      OS_V3_TIMEOUT_MS
     );
     return (data.subtitles || [])
       // Guard por entrada: una sub sin URL ya no invalida toda la fuente.
@@ -517,13 +544,14 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
 // Motor de análisis léxico
 // ---------------------------------------------------------------------------
 
-// 📄 = "no analizado" (nunca una variante): distinto de 🇪🇸/🇲🇽/🌎.
+// 📄 = "analizado sin veredicto" (nunca una variante): distinto de 🇪🇸/🇲🇽/🌎.
 //
 // FAILED (símbolo): JSON.stringify ignora las claves-símbolo, así que la marca
 // distingue "sin clasificar porque hubo un ERROR (red, timeout, página HTML de
 // error, bytes que no son texto)" —respuesta degradada, TTL corto— de "sin
-// clasificar porque no hubo presupuesto o 0 coincidencias léxicas" —resultado
-// estable, TTL normal—, sin que el flag llegue nunca a Stremio.
+// clasificar porque 0 coincidencias léxicas" —resultado estable, TTL normal—,
+// sin que el flag llegue nunca a Stremio. (Las pistas sin presupuesto ya no se
+// sirven: se descartan en vez de publicarse sin verificar.)
 const FAILED = Symbol.for("hispasubs.failed");
 const unclassified = (sub, finalUrl, failed = false) => ({
   id: sub.id,
@@ -561,6 +589,50 @@ const scoreText = (text) => {
   return { esMatches, latMatches, total, flag };
 };
 
+// ---------------------------------------------------------------------------
+// Filtro anti-spam
+// ---------------------------------------------------------------------------
+//
+// Los grupos de rippeo incrustan publicidad en el SRT (casas de apuestas,
+// canales de Telegram/WhatsApp, "descarga nuestra app"...) que ocupa un hueco
+// en la lista y ensucia la reproducción. Se DESCARTA la pista entera en vez de
+// limpiar el texto: Stremio descarga el archivo tal cual (o vía proxy) y
+// reescribir bloques SRT en Vercel es frágil (timestamps, BOM, codificaciones).
+//
+// El diccionario va en DOS niveles para no ser una guillotina con los
+// catálogos pequeños:
+//  - FUERTE: publicidad inequívoca. UNA coincidencia descarta la pista.
+//  - DÉBIL: ruido que también aparece en subtítulos legítimos (una URL de
+//    crédito, "Traducido por X", el nombre de un sitio). Solo descarta con DOS
+//    líneas distintas —"Traducido por Argenteam" se conserva; con una segunda
+//    línea ("Entra en nuestra web") cruza la línea—.
+//
+// Fronteras Unicode (?<![\p{L}\p{N}_]) en vez de \b: \b es ASCII y fallaría
+// tras "ú"/"í" ("Únete…"). Sin /g: los .test() no deben arrastrar lastIndex.
+// Sin cuantificadores anidados, para no arriesgar backtracking sobre 1 MB.
+const SPAM_STRONG = /(?<![\p{L}\p{N}_])(?:(?:bet365|1xbet|1win|22bet|betway|melbet|bwin|parimatch|betano|betfair)(?![\p{L}\p{N}_])|(?:casino|bingo|poker|ruleta|tragamonedas|tragaperras)\s+(?:online|en\s+l[ií]nea|virtual)(?![\p{L}\p{N}_])|(?:casas?\s+de\s+apuestas|apuestas\s+deportivas|bono\s+de\s+bienvenida|giros\s+gratis)(?![\p{L}\p{N}_])|(?:t\.me|telegram\.me|wa\.me|chat\.whatsapp\.com|whatsapp\.com\/channel)\/[^\s<>"']+|[uú]nete(?:te)?\s+(?:a|al)\s+(?:nuestro|nuestra|mi)\s+(?:canal|grupo|comunidad|telegram|whatsapp|servidor)(?![\p{L}\p{N}_])|(?:s[ií]guenos|suscr[ií]bete)\s+(?:en|a)\s+(?:telegram|youtube|instagram|facebook|tiktok|nuestro\s+(?:canal|grupo))(?![\p{L}\p{N}_])|(?:descarga|descargar|instala|instalar)\s+(?:la\s+|nuestra\s+)?(?:app|aplicaci[oó]n|apk)(?![\p{L}\p{N}_])|(?:visita|visitar|entra|entrar)\s+(?:en\s+)?(?:www\.|https?:\/\/|nuestra\s+(?:web|p[aá]gina)))/iu;
+
+// Débiles: se evalúan LÍNEA a LÍNEA y se cuentan líneas distintas, no
+// coincidencias ("Traducido por Argenteam" es UNA línea, no dos señales).
+const SPAM_WEAK_LINE = /(?<![\p{L}\p{N}_])(?:(?:https?:\/\/|www\.)[^\s<>"']+|(?:[a-z0-9][a-z0-9-]{0,62}\.)+(?:com|net|org|es|tv|me|info|xyz|top|link|site|online|app|club|cc|io|biz|pro|name|live|vip|bet)(?![\p{L}\p{N}_])|(?:opensubtitles|subdivx|tusubtitulo|argenteam|subtitulamos|elrincondelsub|podnapisi|subs4free)(?![\p{L}\p{N}_])|(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])|(?:canal|grupo)\s+de\s+telegram(?![\p{L}\p{N}_])|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/iu;
+
+// Veredicto puro (exportado para tests). Devuelve { discard, reason }.
+const spamVerdict = (text) => {
+  if (SPAM_STRONG.test(text)) return { discard: true, reason: "fuerte" };
+  let weakLines = 0;
+  for (const line of text.split(/\r?\n/)) {
+    if (SPAM_WEAK_LINE.test(line) && ++weakLines >= 2) {
+      return { discard: true, reason: `${weakLines} líneas débiles` };
+    }
+  }
+  return { discard: false, reason: "" };
+};
+
+// Presupuesto de análisis por fuente. Cada pista analizada es una descarga (los
+// .zip, además, una invocación al proxy de Vercel): 5+5 acota la respuesta a 10
+// pistas verificadas sin disparar el coste. Ver el bucle de análisis del router.
+const ANALYSIS_BUDGET_PER_SOURCE = 5;
+
 const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER) => {
   // Guard ANTES de cualquier acceso a sub.url (evita el crash en cascada
   // de Promise.all del 1.0.0).
@@ -590,6 +662,16 @@ const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER) => {
       return unclassified(sub, finalUrl, true);
     }
 
+    // Anti-spam: se descarta la pista entera con el texto que ya está en
+    // memoria (publicidad incrustada). null = fuera de la lista vía
+    // filter(Boolean); un descarte deliberado NO es una respuesta degradada,
+    // así que no marca FAILED ni baja el TTL.
+    const spam = spamVerdict(text);
+    if (spam.discard) {
+      console.log(`[classify] descartado por spam (${spam.reason}) [${sub.source}]`);
+      return null;
+    }
+
     const scored = scoreText(text);
     if (!scored) {
       // Ni una sola palabra del léxico: probablemente no sea un subtítulo en
@@ -606,8 +688,10 @@ const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER) => {
   }
 };
 
-// Exportado solo para tests (corpus etiquetado en test_worker.js).
-export { scoreText, subtitleCacheUrl };
+// Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
+// de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam y el
+// presupuesto por fuente para las aserciones de v1.4.2).
+export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -798,22 +882,23 @@ export default {
           return empty;
         }
 
-        // Análisis equilibrado: hasta 3 por fuente. En 1.0.0 las subs de
-        // SubDL quedaban siempre sin analizar si OS devolvía ≥5.
+        // Análisis equilibrado: hasta 5 por fuente, y SOLO se publican las
+        // pistas analizadas (política estricta). Antes el tope era 3 y el resto
+        // se servía como "📄 sin clasificar": al no descargar su texto no se
+        // puede saber si son spam, así que eran un coladero. Con 5+5 la
+        // respuesta queda acotada a 10 pistas, todas verificadas.
         const pBase = proxyBase(env);
-        const budget = { "OS-V3": 3, "SubDL": 3 };
+        const budget = { "OS-V3": ANALYSIS_BUDGET_PER_SOURCE, "SubDL": ANALYSIS_BUDGET_PER_SOURCE };
         const analyzed = await Promise.all(
           deduped.map((sub) => {
             if (budget[sub.source] > 0) {
               budget[sub.source] -= 1;
               return classifySubtitle(sub, pBase);
             }
-            // Sin presupuesto de análisis: se enrutan igualmente (los .zip
-            // vía proxy) y se etiquetan explícitamente como NO analizados.
-            const finalUrl = isCompressed(sub.url)
-              ? `${pBase}${encodeURIComponent(sub.url)}`
-              : sub.url;
-            return { id: sub.id, url: finalUrl, lang: LANG_ISO_ES, label: `📄 Español (sin clasificar · ${sub.source})` };
+            // Fuera de presupuesto: no se puede verificar que no sea spam
+            // (requiere descargar el texto) → no se sirve. Mejor 10 pistas
+            // limpias que 25 con publicidad incrustada.
+            return null;
           })
         );
 
@@ -821,10 +906,11 @@ export default {
 
         // TTL según fiabilidad: si ALGÚNA clasificación falló (red/timeout/
         // HTML de error) o una fuente entera rechazó, la lista está incompleta
-        // o degradada → 60 s para reintentar pronto. Solo con resultados
-        // fiables (incluidos los "sin clasificar" estables por presupuesto o
-        // por 0 matches) → 2 h. Antes TODO se cacheaba 2 h y un proveedor
-        // caído dejaba la respuesta rota toda una tarde.
+        // o degradada → 60 s para reintentar pronto. Con resultados fiables
+        // (incluidos los "sin clasificar" estables por 0 coincidencias léxicas)
+        // → 2 h. Los descartes por spam NO cuentan como fallo. Antes TODO se
+        // cacheaba 2 h y un proveedor caído dejaba la respuesta rota toda una
+        // tarde.
         const anyFailed = analyzed.some((s) => s && s[FAILED]);
         const sourceFailed = osSubs.status === "rejected" || sdlSubs.status === "rejected";
         const ttl = anyFailed || sourceFailed ? 60 : 7200;
@@ -921,3 +1007,15 @@ export default {
 //     en el panel de Cloudflare.
 // 27. [IDIOMA] Filtro de OpenSubtitles V3 ampliado a variantes del código
 //     (es-ES, es-419, esp, span): antes solo "spa" o "es" exacto.
+//
+// v1.4.2 (19/10/2026):
+// 28. [SPAM] Filtro anti-spam en dos niveles durante la clasificación (ver
+//     SPAM_STRONG / SPAM_WEAK_LINE): la publicidad incrustada (apuestas,
+//     Telegram/WhatsApp, CTAs de app/web) descarta la pista entera sin coste
+//     de red, porque se evalúa el texto que ya se descarga para el análisis.
+// 29. [CALIDAD] Política estricta: solo se sirven pistas clasificadas. Las
+//     entradas sin presupuesto de análisis (no verificables sin descargarlas)
+//     ya no se publican como "📄 sin clasificar" — eran un coladero de spam.
+// 30. [LÍMITES] Presupuesto de análisis 3 → 5 por fuente: tope de 10 pistas
+//     verificadas por título.
+// 31. [OS-V3] Timeout de la fuente 2500 → 4500 ms (ver getOpenSubtitlesV3).
