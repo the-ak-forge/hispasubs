@@ -300,6 +300,66 @@ section("5. Extracción del zip");
 }
 
 // ===========================================================================
+// 5b. Lote 4: timeout que cubre el CUERPO y .sub binario (VobSub)
+// ===========================================================================
+section("5b. Lote 4: timeout del cuerpo y .sub binario");
+{
+  // La descarga de las cabeceras acaba, pero el cuerpo nunca termina (origen
+  // que se corta a mitad). Antes el timer se limpiaba tras las cabeceras y
+  // la función se colgaba; ahora debe volver 504 en ~timeoutMs.
+  process.env.FETCH_TIMEOUT_MS = "80";
+  try {
+    fetchImpl = (url, init) => {
+      const stream = new ReadableStream({
+        start(c) {
+          // Respeta la señal de aborto como haría fetch real.
+          if (init && init.signal) {
+            init.signal.addEventListener("abort", () =>
+              c.error(Object.assign(new Error("The operation was aborted"), { name: "AbortError" })));
+          }
+          // ...pero nunca cierra solo: simula una descarga colgada.
+        },
+      });
+      return new Response(stream, { status: 200 });
+    };
+    const t0 = Date.now();
+    const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+    const elapsed = Date.now() - t0;
+    check("cuerpo colgado -> 504 Timeout", res.statusCode === 504 && bodyJson(res)?.error === "Timeout",
+      `${res.statusCode} ${String(res.body).slice(0, 100)}`);
+    check("el timeout cubre la lectura del cuerpo (<2s)", elapsed < 2000, `${elapsed}ms`);
+  } finally {
+    delete process.env.FETCH_TIMEOUT_MS;
+  }
+}
+{
+  // VobSub: .sub binario (muestreo de vídeo) servido antes como text/plain.
+  const vobsub = Buffer.from([0x00, 0x1a, 0x00, 0x00, 0x00, 0x01, 0xba, 0x44, 0x00, 0xff]);
+  const zip = buildZip([["vobsub.sub", vobsub]]);
+  fetchImpl = () => new Response(zip, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check("zip solo con .sub binario (VobSub) -> 404", res.statusCode === 404, `${res.statusCode}`);
+}
+{
+  // Un .sub de texto (SubViewer: sin bytes NUL) sí es servible.
+  const zip = buildZip([["subtexto.sub", "[INFORMATION]\n1\n[/INFORMATION]\n[SUBTITLE]\n00:01:00,000,000 --> 00:01:02,000,000\nhola\n"]]);
+  fetchImpl = () => new Response(zip, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check(".sub de texto (SubViewer) -> 200", res.statusCode === 200 && String(res.body).includes("hola"),
+    `${res.statusCode}`);
+}
+{
+  // El elegido (el más grande) es binario -> se descarta y se prueba el
+  // siguiente candidato en vez de devolver basura.
+  const vobsubGrande = Buffer.concat([Buffer.from([0x00, 0x1a]), Buffer.alloc(4000, 0x41)]);
+  const zip = buildZip([["grande.sub", vobsubGrande], ["chico.sub", "texto valido\n"]]);
+  fetchImpl = () => new Response(zip, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check(".sub binario elegido -> se sirve el siguiente candidato de texto",
+    res.statusCode === 200 && String(res.body).includes("texto valido"), `${res.statusCode}`);
+}
+
+// ===========================================================================
 // 6. Rate limit por IP
 // ===========================================================================
 section("6. Rate limit por IP");

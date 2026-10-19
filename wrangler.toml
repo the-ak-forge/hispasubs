@@ -37,6 +37,11 @@ namespace_id = "1001"
 # Variables opcionales (descomentar para cambiar los valores por defecto):
 #
 # [vars]
-# RATE_LIMIT = "120"   # peticiones SIN caché por minuto e IP. 0 = desactivado.
-#                      # Si algún usuario reporta 429s (típico tras CGNAT de
-#                      # operadora, donde muchos comparten IP), súbelo.
+# RATE_LIMIT = "120"   # Solo vale para el fallback in-memory (tests/entornos
+#                      # sin binding). 0 = desactiva el límite por completo,
+#                      # incluso con el binding [[ratelimits]] de arriba.
+#                      # Para SUBIR el límite en producción hay que editar
+#                      # [[ratelimits]] simple.limit (el valor de esta variable
+#                      # NO lo cambia: el binding manda). Si algún usuario
+#                      # reporta 429s (típico tras CGNAT de operadora, donde
+#                      # muchos comparten IP), sube simple.limit y redespliega.
