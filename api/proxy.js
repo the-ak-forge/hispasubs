@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.0
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.1
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -16,6 +16,15 @@
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
+//
+// v1.4.1 (auditoría de código, 18/10/2026):
+//  - Descarga por STREAMING acotada a 4 MB (readCapped): un origen que miente
+//    con content-length (o no lo manda) ya no puede volcar GB en la memoria
+//    de la función antes de que actúe el timeout. El exceso devuelve 413.
+//  - .sub UTF-16 (BOM FF FE / FE FF) ya no se descarta como binario VobSub:
+//    los bytes NUL alternos del UTF-16 son texto, no muestreo de vídeo.
+//  - zipUrl se normaliza a String: con el parámetro duplicado en la query,
+//    req.query.zipUrl puede ser un Array (se stringificaba a "url1,url2").
 //
 // Despliegue: Vercel detecta api/proxy.js por convención de directorios y el
 // enrutado vive en vercel.json (rewrites -> /api/proxy).
@@ -46,7 +55,7 @@ const MAX_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
-const USER_AGENT = "HispaSubs/1.4.0";
+const USER_AGENT = "HispaSubs/1.4.1";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 
@@ -171,6 +180,38 @@ function contentDisposition(name) {
   return `attachment; filename="${ascii}"; filename*=UTF-8''${utf8}`;
 }
 
+// Lee como mucho `max` bytes del body por STREAMING y cancela el resto.
+// Devuelve null si la respuesta supera el tope (el caller responde 413):
+// truncar un zip por la mitad solo produciría un 415 "zip corrupto" confuso.
+// Mismo esquema que readCapped en worker.js (ahí truncaba a propósito porque
+// para muestrear el léxico bastaba con la cabeza del fichero).
+async function readCapped(res, max) {
+  if (!res.body || typeof res.body.getReader !== "function") {
+    const ab = await res.arrayBuffer();
+    return ab.byteLength > max ? null : Buffer.from(ab);
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    // Un chunk que no cabe en el espacio restante es exceso REAL (aunque el
+    // body entero venga en un solo chunk, p. ej. new Response(buffer)): se
+    // corta y se devuelve null para que el caller responda 413.
+    if (value.length > max - total) {
+      try { await reader.cancel(); } catch { /* stream ya cerrado */ }
+      return null;
+    }
+    // En Node >= 18 fetch devuelve Uint8Array; Buffer.from copia y adm-zip
+    // trabaja con Buffers.
+    chunks.push(Buffer.from(value));
+    total += value.length;
+  }
+  try { await reader.cancel(); } catch { /* stream ya cerrado */ }
+  return Buffer.concat(chunks, total);
+}
+
 export default async function handler(req, res) {
   // CORS básico por si Stremio lo pita desde navegador.
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -194,7 +235,12 @@ export default async function handler(req, res) {
   }
 
   try {
-    const rawUrl = (req.query && req.query.zipUrl) || "";
+    // String() explícito: con el parámetro duplicado en la query,
+    // req.query.zipUrl puede ser un Array (querystring.parse de Node); sin
+    // normalizar se stringificaría igual dentro de new URL() a "url1,url2",
+    // una URL sucia cuyo host sigue atado a la allowlist. Aquí queda decidido
+    // en un solo sitio y con .trim() de regalo.
+    const rawUrl = req.query && req.query.zipUrl ? String(req.query.zipUrl).trim() : "";
     if (!rawUrl) return res.status(400).json({ error: "Falta zipUrl" });
 
     let target;
@@ -251,7 +297,10 @@ export default async function handler(req, res) {
         if (len && len > MAX_BYTES) {
           return res.status(413).json({ error: "Archivo demasiado grande" });
         }
-        buf = Buffer.from(await upstream.arrayBuffer());
+        // Lectura ACOTADA por streaming (anti-OOM): un origen que miente con
+        // content-length o no lo manda ya no puede cargar GB en la función.
+        buf = await readCapped(upstream, MAX_BYTES);
+        if (buf === null) return res.status(413).json({ error: "Archivo demasiado grande" });
       } finally {
         clearTimeout(timer);
       }
@@ -317,8 +366,16 @@ export default async function handler(req, res) {
       // Un .sub VobSub es BINARIO (muestreo de vídeo, no texto): con la
       // extensión en la allowlist llegaba al reproductor como text/plain y
       // salían glifos aleatorios. Los .sub de texto (SubViewer) no llevan
-      // NUL y sí se sirven. Si el elegido es binario, se prueba el siguiente.
-      if (/\.(sub)$/i.test(cand.name) && data.includes(0x00)) continue;
+      // NUL y sí se sirven. Excepción v1.4.1: UTF-16 (BOM FF FE / FE FF),
+      // que también es texto y cuyos bytes alternan con NULs —sin esta
+      // comprobación se descartaba falsamente como binario—. Si el elegido
+      // es binario, se prueba el siguiente candidato.
+      if (/\.(sub)$/i.test(cand.name) && data.includes(0x00)) {
+        const utf16Bom =
+          data.length >= 2 &&
+          ((data[0] === 0xff && data[1] === 0xfe) || (data[0] === 0xfe && data[1] === 0xff));
+        if (!utf16Bom) continue;
+      }
       chosen = { name: cand.name, data };
       break;
     }
@@ -341,4 +398,4 @@ export default async function handler(req, res) {
 }
 
 // Exportados para test_proxy.js (la lógica de SSRF no puede quedar sin tests).
-export { ALLOWED_HOSTS, MAX_BYTES, isPublicIP, assertSafeUrl };
+export { ALLOWED_HOSTS, MAX_BYTES, isPublicIP, assertSafeUrl, readCapped };

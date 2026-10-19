@@ -1,6 +1,13 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.0
+// HispaSubs — Cloudflare Worker v1.4.1
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.1 (19/10/2026) — auditoría de código (solo versión alineada con el
+// proxy; la lógica del worker no cambia, su último cambio real es v1.4.0):
+//  - Proxy: descarga por streaming acotada a 4 MB (anti-OOM; un origen que
+//    miente con content-length ya no puede volcar GB en memoria), .sub
+//    UTF-16 con BOM no se descarta como binario VobSub y zipUrl se
+//    normaliza a String. Ver cabecera de api/proxy.js.
 //
 // v1.4.0 (18/10/2026) — auditoría externa (5 lotes):
 //  - Léxico: fronteras Unicode (?<![\p{L}\p{N}_], flags giu) porque \b es
@@ -383,7 +390,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.0",
+  version: "1.4.1",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:

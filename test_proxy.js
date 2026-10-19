@@ -8,7 +8,7 @@
 
 import AdmZip from "adm-zip";
 import dns from "node:dns/promises";
-import handler, { ALLOWED_HOSTS, MAX_BYTES, isPublicIP } from "./api/proxy.js";
+import handler, { ALLOWED_HOSTS, MAX_BYTES, isPublicIP, readCapped } from "./api/proxy.js";
 
 let pass = 0;
 let fail = 0;
@@ -360,8 +360,110 @@ section("5b. Lote 4: timeout del cuerpo y .sub binario");
 }
 
 // ===========================================================================
-// 6. Rate limit por IP
+// 5c. Auditoría v1.4.1: streaming acotado (anti-OOM), .sub UTF-16 y zipUrl Array
 // ===========================================================================
+section("5c. v1.4.1: readCapped, .sub UTF-16 y zipUrl duplicado");
+{
+  // readCapped directamente: corta el stream al tope y devuelve null si el
+  // origen seguía mandando datos (para que el caller responda 413, no un
+  // "zip corrupto" por truncado).
+  const body = new ReadableStream({
+    start(c) {
+      for (let i = 0; i < 8; i++) c.enqueue(new Uint8Array(1024).fill(0x41));
+      c.close();
+    },
+  });
+  const res = await readCapped(new Response(body), 4096);
+  check("readCapped corta al tope y devuelve null (exceso)", res === null);
+
+  const body2 = new ReadableStream({
+    start(c) {
+      c.enqueue(new Uint8Array([1, 2, 3]));
+      c.close();
+    },
+  });
+  const res2 = await readCapped(new Response(body2), 4096);
+  check("readCapped devuelve el buffer si cabe", Buffer.isBuffer(res2) && res2.length === 3);
+
+  // El tope exacto NO es exceso.
+  const body3 = new ReadableStream({
+    start(c) {
+      c.enqueue(new Uint8Array(1024));
+      c.close();
+    },
+  });
+  const res3 = await readCapped(new Response(body3), 1024);
+  check("readCapped: tamaño exacto al tope no es exceso", Buffer.isBuffer(res3) && res3.length === 1024);
+}
+{
+  // Zip legítimo que el origen envía por streaming en trozos (sin
+  // content-length): debe reensamblarse y procesarse igual.
+  const zip = buildZip([["pista.srt", "1\n00:00:01,000 --> 00:00:02,000\nstreaming ok\n"]]);
+  const body = new ReadableStream({
+    start(c) {
+      for (let i = 0; i < zip.length; i += 512) c.enqueue(new Uint8Array(zip.subarray(i, i + 512)));
+      c.close();
+    },
+  });
+  fetchImpl = () => new Response(body, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check("zip por streaming en trozos -> 200", res.statusCode === 200 && String(res.body).includes("streaming ok"),
+    `${res.statusCode}`);
+}
+{
+  // Origen malicioso que OMITE content-length y manda >4 MB: antes lo
+  // cargaba entero con arrayBuffer(); ahora readCapped corta y pide 413.
+  const body = new ReadableStream({
+    start(c) {
+      const chunk = new Uint8Array(1024 * 1024).fill(0x50);
+      for (let i = 0; i < 5; i++) c.enqueue(chunk); // 5 MB sin content-length
+      c.close();
+    },
+  });
+  fetchImpl = () => new Response(body, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check("sin content-length y >4 MB por streaming -> 413", res.statusCode === 413,
+    `${res.statusCode} ${String(res.body).slice(0, 80)}`);
+}
+{
+  // .sub UTF-16LE con BOM: bytes NUL alternos pero es TEXTO. Antes se
+  // descartaba como VobSub; ahora se sirve.
+  const utf16 = Buffer.concat([
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from("1\n00:00:01,000 --> 00:00:02,000\nhola utf16\n", "utf16le"),
+  ]);
+  const zip = buildZip([["sub16.sub", utf16]]);
+  fetchImpl = () => new Response(zip, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check(".sub UTF-16LE con BOM -> 200 (no se trata como VobSub)", res.statusCode === 200,
+    `${res.statusCode}`);
+}
+{
+  // Un VobSub real (sin BOM UTF-16) sigue descartándose.
+  const vobsub = Buffer.from([0x00, 0x1a, 0x00, 0x00, 0x00, 0x01, 0xba, 0x44, 0x00, 0xff]);
+  const zip = buildZip([["vobsub.sub", vobsub]]);
+  fetchImpl = () => new Response(zip, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check("VobSub sin BOM UTF-16 sigue descartado -> 404", res.statusCode === 404, `${res.statusCode}`);
+}
+{
+  // zipUrl duplicado en la query -> req.query.zipUrl es un Array. Sin la
+  // normalización, new URL() lo stringificaba a "url1,url2" (URL sucia); el
+  // handler no debe romperse: usa el primer valor y la allowlist manda.
+  fetchImpl = () => new Response(okZip, { status: 200 });
+  const req = {
+    url: "/proxy?zipUrl=a&zipUrl=b",
+    method: "GET",
+    headers: { "user-agent": "test", "x-real-ip": "203.0.113.90" },
+    query: { zipUrl: ["https://dl.subdl.com/a.zip", "https://ejemplo.com/b.zip"] },
+  };
+  const res = mkRes();
+  await handler(req, res);
+  check("zipUrl Array no rompe: procesa el primer valor -> 200",
+    res.statusCode === 200 && String(res.body).includes("00:00:01"), `${res.statusCode}`);
+  check("el fetch va al host del primer valor (allowlist)", String(fetchLog.at(-1)?.url || "").includes("dl.subdl.com"),
+    String(fetchLog.at(-1)?.url));
+}
 section("6. Rate limit por IP");
 process.env.RATE_LIMIT_PER_MIN = "3";
 {
