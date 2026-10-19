@@ -262,6 +262,8 @@ export default async function handler(req, res) {
     }
     const candidates = [];
     let scanned = 0;
+    let totalUncompressed = 0;
+    const MAX_BYTES_TOTAL = MAX_BYTES * 2; // presupuesto agregado conservador (8 MB por zip)
     for (const entry of entries) {
       if (++scanned > MAX_ENTRIES) break;
       if (entry.isDirectory) continue;
@@ -271,6 +273,15 @@ export default async function handler(req, res) {
       // adm-zip 0.6.1 (que ya acota la asignación a los bytes presentes).
       const declared = entry.header && entry.header.size;
       if (declared && declared > MAX_BYTES) continue;
+      if (totalUncompressed + (declared || 0) > MAX_BYTES_TOTAL) {
+        // No podemos estimar con fiabilidad si no hay declared; si declared no está,
+        // intentamos leer pero mantenemos presupuesto razonable descartando si
+        // al acumular supera el total tras obtener data (más abajo).
+        // Descartamos esta entrada y seguimos leyendo nombres? o cortamos.
+        // Para conservar memoria, saltamos entradas con declared no visible
+        if (!declared) continue;
+        break; // corta el escaneo: el resto probablemente igual o mayor
+      }
       let data;
       try {
         data = entry.getData();
@@ -278,6 +289,8 @@ export default async function handler(req, res) {
         continue; // entrada corrupta: la saltamos, no tiramos el zip entero
       }
       if (!data || data.length === 0 || data.length > MAX_BYTES) continue;
+      if (totalUncompressed + data.length > MAX_BYTES_TOTAL) break;
+      totalUncompressed += data.length;
       candidates.push({ name, data });
     }
 
