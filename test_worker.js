@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE } from "./worker.js";
+import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, rateLimitFallback, RATE_MAP_CAP } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -380,7 +380,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.3", m10.version === "1.4.3", m10.version);
+  check("manifest version 1.4.4", m10.version === "1.4.4", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -864,6 +864,74 @@ try {
   } finally {
     globalThis.fetch = origFetch10;
   }
+}
+
+// 16) v1.4.4: auditoría externa de la 1.4.3 — bordes sin .split() equivalentes
+// y tope duro del Map del rate limiter.
+{
+  // --- Bordes: la extracción por indexOf/slice conserva la semántica vieja ---
+  const tailCTA = "Únete a nuestro canal de telegram";
+  const filler = Array.from({ length: 98 }, (_, i) => `Diálogo número ${i} de la escena.`);
+
+  const midFile = ["1", "00:00:01,000 --> 00:00:02,000", " coche", "", ...filler.slice(0, 97)].join("\n") +
+    `\n2\n00:00:03,000 --> 00:00:04,000\n${tailCTA}\n`;
+  check("v1.4.4: la CTA en la ÚLTIMA línea de un archivo largo descarta (cola extraída)",
+    spamVerdict(midFile).discard, JSON.stringify(spamVerdict(midFile)));
+
+  const headOnly = ["1", "00:00:01,000 --> 00:00:02,000", tailCTA, "", ...filler].join("\n") +
+    `\n99\n00:00:58,000 --> 00:00:59,000\ncoche\n`;
+  check("v1.4.4: la misma CTA en la cabecera descarta (cabeza extraída)",
+    spamVerdict(headOnly).discard, JSON.stringify(spamVerdict(headOnly)));
+
+  // La misma CTA a mitad exacta del archivo (línea ~54 de ~103: fuera de la
+  // cabeza 0-29 y de la cola 73-102) se conserva.
+  const midOnly = ["1", "00:00:01,000 --> 00:00:02,000", "coche", "", ...filler.slice(0, 50)].join("\n") +
+    `\n${tailCTA}\n` + filler.slice(50).join("\n") + "\n";
+  check("v1.4.4: CTA a mitad del archivo se conserva (solo bordes)",
+    !spamVerdict(midOnly).discard, JSON.stringify(spamVerdict(midOnly)));
+
+  // Límite de longitud sin el \r del CRLF: 300 car. cuentan, 301 no.
+  const weak1 = "www.argenteam.net".padEnd(300, "x");
+  const weak2 = "www.subdivx.com".padEnd(300, "y");
+  const crlfHead = [weak1, weak2].join("\r\n");
+  check("v1.4.4: CRLF — línea de 300 car. en la cabeza sí cuenta (el \\r no suma)",
+    spamVerdict(crlfHead).discard, JSON.stringify(spamVerdict(crlfHead)));
+  const weak1b = "www.argenteam.net".padEnd(301, "x");
+  check("v1.4.4: CRLF — línea de 301 car. se salta (máx. 300)",
+    !spamVerdict([weak1b, weak2].join("\r\n")).discard);
+  check("v1.4.4: LF puro con las mismas líneas también descarta",
+    spamVerdict([weak1, weak2].join("\n")).discard);
+
+  // Archivo corto: la única línea débil NO se duplica (no alcanza el umbral 2).
+  const shortFile = ["hola", "coche", "www.argenteam.net", "vosotros", "adiós"].join("\n");
+  check("v1.4.4: archivo corto con UNA línea débil no descarta (sin duplicados)",
+    !spamVerdict(shortFile).discard, JSON.stringify(spamVerdict(shortFile)));
+  check("v1.4.4: texto vacío no descarta ni revienta",
+    !spamVerdict("").discard);
+
+  // --- Rate limiter: tope del Map fallback ---
+  const now = Date.now();
+  const m = new Map();
+  for (let i = 0; i <= RATE_MAP_CAP; i++) m.set(`198.51.100.${i}`, { count: 5, reset: now + 60_000 });
+  const r = rateLimitFallback("203.0.113.7", 120, m);
+  check("v1.4.4: el Map queda en el tope tras una IP nueva (antes crecía sin límite)",
+    m.size === RATE_MAP_CAP && r === null, `size=${m.size}`);
+  check("v1.4.4: se expulsa de la cabeza (orden de inserción)",
+    !m.has("198.51.100.0") && !m.has("198.51.100.1") && m.has("198.51.100.2") && m.has("203.0.113.7"));
+
+  const m2 = new Map();
+  for (let i = 0; i <= RATE_MAP_CAP; i++) m2.set(`10.0.${i >> 8}.${i & 255}`, { count: 1, reset: now - 1000 });
+  rateLimitFallback("203.0.113.8", 120, m2);
+  check("v1.4.4: las entradas caducadas se barren completas (sin expulsar vivas)",
+    m2.size === 1 && m2.has("203.0.113.8"), `size=${m2.size}`);
+
+  const m3 = new Map();
+  m3.set("203.0.113.9", { count: 119, reset: now + 60_000 });
+  for (let i = 1; i <= RATE_MAP_CAP + 1; i++) m3.set(`198.51.100.${i}`, { count: 1, reset: now + 60_000 });
+  const r3 = rateLimitFallback("203.0.113.9", 120, m3);
+  check("v1.4.4: la IP actual no se expulsa ni se le reinicia el contador",
+    r3 === null && m3.get("203.0.113.9").count === 120 && m3.size <= RATE_MAP_CAP,
+    `count=${m3.get("203.0.113.9").count}, size=${m3.size}`);
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);
