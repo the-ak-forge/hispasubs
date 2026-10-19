@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.4
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.5
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -16,6 +16,20 @@
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
+//
+// v1.4.5 (19/10/2026):
+//  - [SERIES] Cuando la petición incluye &s=<season>&e=<episode> (series), el
+//    orden de candidatos prioriza las entradas cuyo nombre coincida con el
+//    episodio (S01E03 / 1x03, con bordes numéricos para no confundir E3 con
+//    E30) antes de desempatar por .srt y tamaño declarado. Así un pack de
+//    temporada sirve el episodio pedido y no el más largo.
+//  - [CACHÉ] Cache-Control añade s-maxage=86400, stale-while-revalidate=3600:
+//    Vercel exige s-maxage para cachear respuestas de Functions en el Edge;
+//    así la descarga del reproductor reutiliza el zip ya extraído por el
+//    Worker sin re-invocar la función ni volver a pedirlo a SubDL.
+//  - [SSRF] isPublicIP cubre IPv4-mapped en formato hexadecimal (::ffff:7f00:1)
+//    y bloquea los prefijos de transición/documentación NAT64 (64:ff9b::/96),
+//    6to4 (2002::/16) y 2001:db8::/32.
 //
 // v1.4.4 (19/10/2026): tope duro del Map del rate limiter. El barrido de
 // expirados no reducía nada si toda la ventana (60 s) seguía viva: con más de
@@ -72,7 +86,7 @@ const MAX_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
-const USER_AGENT = "HispaSubs/1.4.4";
+const USER_AGENT = "HispaSubs/1.4.5";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 
@@ -122,15 +136,23 @@ async function assertPublicHost(hostname, viaRedirect = false) {
 
 function isPublicIP(ip) {
   if (net.isIPv4(ip)) return isPublicIPv4(ip);
-  // IPv6: loopback, ULA, link-local, multicast, NAT64 e IPv4 embebida
+  // IPv6: loopback, ULA, link-local, multicast, NAT64, 6to4, doc e IPv4 embebida
   const h = ip.toLowerCase().replace(/^\[|\]$/g, "");
   if (h === "::1" || h === "::") return false;
   if (h.startsWith("fe8") || h.startsWith("fe9") || h.startsWith("fea") || h.startsWith("feb")) return false;
   if (h.startsWith("fc") || h.startsWith("fd")) return false;
   if (h.startsWith("ff")) return false; // multicast ff00::/8
-  // IPv4 embebida: ::ffff:127.0.0.1 (mapped) y ::127.0.0.1 (compatible)
+  if (h.startsWith("64:ff9b:") || h.startsWith("2002:") || h.startsWith("2001:db8:")) return false;
+  // IPv4 embebida decimal: ::ffff:127.0.0.1 (mapped) y ::127.0.0.1 (compatible)
   const v4 = h.match(/^::(?:ffff:)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
   if (v4) return isPublicIPv4(v4[1]);
+  // IPv4 embebida hex (WHATWG URL normaliza ::ffff:127.0.0.1 a ::ffff:7f00:1)
+  const v4Hex = h.match(/^::(?:ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (v4Hex) {
+    const hi = parseInt(v4Hex[1], 16);
+    const lo = parseInt(v4Hex[2], 16);
+    return isPublicIPv4(`${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`);
+  }
   return true;
 }
 
@@ -372,9 +394,26 @@ export default async function handler(req, res) {
       candidates.push({ entry, name, declared: declared || 0 });
     }
 
-    // Preferimos .srt sobre el resto y, dentro de cada tipo, el más grande
-    // (suele ser la pista completa, no un fragmento de prueba).
+    // En series (&s=<season>&e=<episode>), priorizamos las entradas cuyo
+    // nombre coincida con el episodio pedido (S01E03 / 1x03, con bordes
+    // numéricos para no confundir E3 con E30). Si ninguna entrada coincide (o
+    // es película), desempatamos como siempre: .srt primero y el más grande.
+    const rawS = req.query && req.query.s ? String(req.query.s).trim() : "";
+    const rawE = req.query && req.query.e ? String(req.query.e).trim() : "";
+    const epRegex =
+      /^\d+$/.test(rawS) && /^\d+$/.test(rawE)
+        ? new RegExp(
+            `(?:(?<![0-9a-z])s0*${Number(rawS)}[._\\s-]*e0*${Number(rawE)}|(?<![0-9])0*${Number(rawS)}x0*${Number(rawE)})(?![0-9])`,
+            "i"
+          )
+        : null;
+
     candidates.sort((a, b) => {
+      if (epRegex) {
+        const epMatch = (x) => (epRegex.test(x.name) ? 1 : 0);
+        const diff = epMatch(b) - epMatch(a);
+        if (diff !== 0) return diff;
+      }
       const score = (x) => (x.name.toLowerCase().endsWith(".srt") ? 2 : 1);
       return score(b) - score(a) || b.declared - a.declared;
     });
@@ -417,7 +456,7 @@ export default async function handler(req, res) {
     }
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Content-Disposition", contentDisposition(chosen.name));
-    res.setHeader("Cache-Control", "public, max-age=86400"); // evita re-descargas
+    res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=86400, stale-while-revalidate=3600"); // evita re-descargas en cliente y CDN de Vercel
     return res.status(200).send(chosen.data);
   } catch (err) {
     if (err instanceof ProxyError) {

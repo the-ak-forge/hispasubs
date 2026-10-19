@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, rateLimitFallback, RATE_MAP_CAP } from "./worker.js";
+import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -380,7 +380,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.4", m10.version === "1.4.4", m10.version);
+  check("manifest version 1.4.5", m10.version === "1.4.5", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -932,6 +932,127 @@ try {
   check("v1.4.4: la IP actual no se expulsa ni se le reinicia el contador",
     r3 === null && m3.get("203.0.113.9").count === 120 && m3.size <= RATE_MAP_CAP,
     `count=${m3.get("203.0.113.9").count}, size=${m3.size}`);
+}
+
+// 17) v1.4.5: auditoría de código (H-01, H-02, H-05, H-06.1)
+{
+  // --- H-02a: spamVerdict con truncated=true solo evalúa la cabeza (la cola
+  // de un archivo cortado en 1 MB es diálogo a mitad de película) ---
+  const midCTA = "Síguenos en Instagram para ver la foto";
+  const filler = Array.from({ length: 60 }, (_, i) => `Línea limpia de diálogo ${i}.`);
+  const truncatedSample = [...filler, midCTA].join("\n");
+  check("v1.4.5 H-02: sin truncar, la CTA al final cuenta como pie y descarta",
+    spamVerdict(truncatedSample, false).discard === true);
+  check("v1.4.5 H-02: con truncated=true, las últimas líneas (mitad del archivo) NO descartan",
+    spamVerdict(truncatedSample, true).discard === false,
+    JSON.stringify(spamVerdict(truncatedSample, true)));
+  check("v1.4.5 H-02: con truncated=true, la cabecera sigue descartando igual",
+    spamVerdict([midCTA, ...filler].join("\n"), true).discard === true);
+
+  // --- H-02b: SRT UTF-8 de >1 MB cortado por readCapped a mitad de un
+  // carácter multibyte (p.ej. 'ó' = C3 B3 cortado tras C3) NO debe disparar
+  // el fallback a windows-1252 ni corromper las tildes previas ---
+  const origFetch11 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({ subtitles: [
+        { id: "cut1", url: "https://subs5.strem.io/utf8_cut.srt", lang: "spa" },
+      ] }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("utf8_cut.srt")) {
+      // Cabecera con léxico con tilde ("órale güey") + relleno ASCII hasta
+      // MAX_ANALYZE_BYTES - 1 + primer byte huérfano de 'ó' (0xC3) + cola.
+      // Sin content-length para que readCapped corte exactamente en 1 MB.
+      const headBytes = new TextEncoder().encode(
+        "1\n00:00:01,000 --> 00:00:02,000\nórale güey chido carro celular\n\n"
+      );
+      const big = new Uint8Array(MAX_ANALYZE_BYTES + 32);
+      big.set(headBytes, 0);
+      big.fill(0x20, headBytes.length, MAX_ANALYZE_BYTES - 1); // espacios
+      big[MAX_ANALYZE_BYTES - 1] = 0xc3; // 1ª mitad de 'ó' justo en el corte de 1 MB
+      big[MAX_ANALYZE_BYTES] = 0xb3;     // 2ª mitad (queda fuera del corte)
+      const stream = new ReadableStream({
+        start(c) { c.enqueue(big); c.close(); },
+      });
+      return Promise.resolve(new Response(stream, { status: 200 }));
+    }
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get("/subtitles/movie/tt7770010.json");
+    const cutSubs = (await res.json()).subtitles || [];
+    check("v1.4.5 H-02: corte UTF-8 multibyte en 1 MB conserva UTF-8 ('órale/güey' -> Latino)",
+      cutSubs.length === 1 && cutSubs[0].label === "🇲🇽 Latino (OS-V3)",
+      JSON.stringify(cutSubs));
+  } finally {
+    globalThis.fetch = origFetch11;
+  }
+
+  // --- H-05: TTL por fuente — 1 enlace roto entre 8 pero la fuente llena su
+  // cupo de 5 limpias -> TTL 7200 s (el fallo quedó absorbido por el sobrepaso) ---
+  const origFetch12 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({ subtitles: [
+        { id: "b1", url: "https://subs5.strem.io/roto.srt", lang: "spa" },
+        { id: "g1", url: "https://subs5.strem.io/ok1.srt", lang: "spa" },
+        { id: "g2", url: "https://subs5.strem.io/ok2.srt", lang: "spa" },
+        { id: "g3", url: "https://subs5.strem.io/ok3.srt", lang: "spa" },
+        { id: "g4", url: "https://subs5.strem.io/ok4.srt", lang: "spa" },
+        { id: "g5", url: "https://subs5.strem.io/ok5.srt", lang: "spa" },
+      ] }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("roto.srt")) return Promise.resolve(new Response("err", { status: 503 }));
+    if (u.includes("subs5.strem.io/ok")) return Promise.resolve(textResp(TXT_CAST));
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get("/subtitles/movie/tt7770011.json");
+    const fullQuota = (await res.json()).subtitles || [];
+    check("v1.4.5 H-05: 1 fallo + 5 limpias (cupo completo) -> sirve 5 y cachea 7200s",
+      fullQuota.length === 5 && res.headers.get("cache-control") === "public, max-age=7200",
+      `len=${fullQuota.length} cc=${res.headers.get("cache-control")}`);
+  } finally {
+    globalThis.fetch = origFetch12;
+  }
+
+  // --- H-01: en series, la URL del proxy lleva &s=<season>&e=<episode> ---
+  const origFetch13 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("api.subdl.com")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        status: true,
+        subtitles: [{ url: "/subtitle/pack-s01.zip" }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("proxy?zipUrl=")) return Promise.resolve(textResp(TXT_LAT));
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get(`/${b64url({ subdlKey: "k" })}/subtitles/series/tt0903747:2:5.json`);
+    const serSubs = (await res.json()).subtitles || [];
+    check("v1.4.5 H-01: zip de serie pasa &s=2&e=5 al proxy",
+      serSubs.length === 1 && serSubs[0].url.endsWith("&s=2&e=5"),
+      JSON.stringify(serSubs));
+  } finally {
+    globalThis.fetch = origFetch13;
+  }
+
+  // --- H-06.1: readCapped sin getReader devuelve Uint8Array (con .length) ---
+  const fakeRes = {
+    body: null,
+    arrayBuffer: async () => new Uint8Array([0xff, 0xfe, 0x41, 0x00, 0x42, 0x00]).buffer,
+  };
+  const capped = await readCapped(fakeRes, 4);
+  check("v1.4.5 H-06.1: readCapped sin getReader devuelve Uint8Array con .length",
+    capped instanceof Uint8Array && capped.length === 4 && capped[0] === 0xff && capped[1] === 0xfe,
+    `type=${capped?.constructor?.name} len=${capped?.length}`);
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

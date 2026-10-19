@@ -1,6 +1,24 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.4
+// HispaSubs — Cloudflare Worker v1.4.5
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.5 (19/10/2026) — auditoría de la 1.4.4 (6 mejoras aplicadas):
+//  - [UTF-8] Un SRT UTF-8 de >1 MB cortado por readCapped a mitad de un
+//    carácter multibyte dejaba un \uFFFD al final y disparaba el fallback a
+//    windows-1252, corrompiendo todas las tildes del archivo (órale -> Ã³rale).
+//    Ahora el probe de \uFFFD ignora el borde del corte (slice(0, -4)) cuando
+//    el buffer fue truncado, y spamVerdict recibe `truncated` para evaluar
+//    solo la cabecera (la cola de un corte a 1 MB es diálogo a mitad).
+//  - [SERIES] En series, los .zip enrutados al proxy llevan &s=<season>&e=<ep>
+//    para que en packs de temporada el proxy priorice el episodio pedido en
+//    vez del archivo más grande.
+//  - [TTL] El TTL degradado (60 s) por fallos de descarga se evalúa POR FUENTE:
+//    solo degrada si una fuente tuvo >=1 fallo Y no alcanzó su cupo de 5
+//    pistas limpias (o si una fuente entera rechazó). Si el sobrepaso de 8
+//    candidatos rellenó las 5 limpias pese a un enlace roto, se cachea 2 h.
+//  - [TIPOS] readCapped devuelve siempre Uint8Array también en el camino sin
+//    ReadableStream.getReader (antes devolvía ArrayBuffer y buf.length era
+//    undefined en la detección de BOM).
 //
 // v1.4.4 (19/10/2026) — auditoría externa de la 1.4.3 (verificación medida):
 //  - [MEM] El Map del rate limiter fallback tenía un barrido que NO reduce
@@ -269,7 +287,7 @@ const fetchJSON = async (url, ms = 2500) => {
 // 1 MB es un techo más que holgado.
 const MAX_ANALYZE_BYTES = 1024 * 1024;
 
-const fetchSubtitleText = async (url, ms = 2000) => {
+const fetchSubtitle = async (url, ms = 2000) => {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   try {
@@ -281,6 +299,7 @@ const fetchSubtitleText = async (url, ms = 2000) => {
     const declared = Number(res.headers.get("content-length") || 0);
     if (declared > MAX_ANALYZE_BYTES) throw new Error("subtítulo demasiado grande");
     const buf = await readCapped(res, MAX_ANALYZE_BYTES);
+    const truncated = buf.length >= MAX_ANALYZE_BYTES;
     // BOM primero: un SRT UTF-16 decodificado a ciegas como UTF-8/windows-1252
     // intercala bytes NUL entre caracteres y NINGÚN patrón (ni el léxico ni el
     // anti-spam) matchea; el spam se servía como "📄". El BOM lo delata.
@@ -292,11 +311,16 @@ const fetchSubtitleText = async (url, ms = 2000) => {
       catch { text = new TextDecoder("utf-8").decode(buf); } // codec no disponible
     } else {
       text = new TextDecoder("utf-8").decode(buf);
-      if (text.includes("\uFFFD")) {
+      // Si readCapped cortó en MAX_ANALYZE_BYTES a mitad de un carácter UTF-8
+      // multibyte, el último carácter es \uFFFD por el corte, no porque el
+      // archivo sea Windows-1252: ignoramos los últimos 4 caracteres en el
+      // probe para no corromper las tildes de un UTF-8 legítimo.
+      const probe = truncated ? text.slice(0, -4) : text;
+      if (probe.includes("\uFFFD")) {
         try { text = new TextDecoder("windows-1252").decode(buf); } catch { /* codec no disponible: nos quedamos con UTF-8 */ }
       }
     }
-    return text;
+    return { text, truncated };
   } finally {
     clearTimeout(timer); // también cubre el body: abort() corta el stream
   }
@@ -307,7 +331,7 @@ const fetchSubtitleText = async (url, ms = 2000) => {
 async function readCapped(res, max) {
   if (!res.body || typeof res.body.getReader !== "function") {
     const ab = await res.arrayBuffer();
-    return ab.byteLength > max ? ab.slice(0, max) : ab;
+    return new Uint8Array(ab.byteLength > max ? ab.slice(0, max) : ab);
   }
   const reader = res.body.getReader();
   const chunks = [];
@@ -478,7 +502,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.4",
+  version: "1.4.5",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -723,7 +747,10 @@ const SPAM_STRONG_EDGE = /(?<![\p{L}\p{N}_])(?:(?:casino|bingo|poker|ruleta|trag
 const SPAM_WEAK_LINE = /(?<![\p{L}\p{N}_])(?:(?:https?:\/\/|www\.)[^\s<>"']+|(?:[a-z0-9][a-z0-9-]{0,62}\.)+(?:com|net|org|es|mx|tv|info|xyz|top|link|site|online|app|club|cc|io|biz|name|live|vip|bet)(?![\p{L}\p{N}_])|(?:opensubtitles|subdivx|tusubtitulo|argenteam|subtitulamos|elrincondelsub|podnapisi|subs4free|yts)(?![\p{L}\p{N}_])|(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])|(?:canal|grupo)\s+de\s+telegram(?![\p{L}\p{N}_])|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/iu;
 
 // Veredicto puro (exportado para tests). Devuelve { discard, reason }.
-const spamVerdict = (text) => {
+// Si `truncated` es true (el archivo superó MAX_ANALYZE_BYTES y se cortó a
+// mitad), solo se extrae la cabeza: las últimas líneas del buffer truncado
+// son diálogo de mitad de película, no el pie del subtítulo.
+const spamVerdict = (text, truncated = false) => {
   // Marca/URL inequívoca: cualquier parte del subtítulo.
   if (SPAM_STRONG.test(text)) return { discard: true, reason: "fuerte" };
 
@@ -751,7 +778,7 @@ const spamVerdict = (text) => {
     // Sin más saltos: lo que queda es la última línea (ya forma parte de la
     // "cabeza") y no hay cola que añadir.
     addLine(headStarts[headEnds.length], text.length);
-  } else {
+  } else if (!truncated) {
     // Cola: últimas líneas completas hacia atrás, sin pisar la cabecera
     // (boundary = inicio de la primera línea que NO es de cabeza).
     const boundary = headStarts[EDGE_LINES];
@@ -783,20 +810,22 @@ const spamVerdict = (text) => {
 const ANALYSIS_BUDGET_PER_SOURCE = 5;
 const ANALYSIS_FETCH_PER_SOURCE = 8;
 
-const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER, spamMode = "drop") => {
+const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER, spamMode = "drop", epSuffix = "") => {
   // Guard ANTES de cualquier acceso a sub.url (evita el crash en cascada
   // de Promise.all del 1.0.0).
   if (!sub || !isHttpUrl(sub.url)) return null;
 
   // Los .zip no se pueden analizar en crudo, PERO el proxy de Vercel los
   // descomprime y devuelve el SRT: se clasifican a través de él. El URL que
-  // recibe Stremio es también el del proxy (Stremio no descomprime).
+  // recibe Stremio es también el del proxy (Stremio no descomprime). En
+  // series se adjunta &s=<season>&e=<episode> para que el proxy priorice el
+  // episodio pedido dentro de los zips de temporada completa.
   const isZip = isCompressed(sub.url);
-  const finalUrl = isZip ? `${pBase}${encodeURIComponent(sub.url)}` : sub.url;
+  const finalUrl = isZip ? `${pBase}${encodeURIComponent(sub.url)}${epSuffix}` : sub.url;
 
   try {
     // El proxy tarda más (descarga + descomprime): timeout amplio para zips.
-    const text = await fetchSubtitleText(finalUrl, isZip ? 6000 : 2000);
+    const { text, truncated } = await fetchSubtitle(finalUrl, isZip ? 6000 : 2000);
 
     // Validación del CONTENIDO antes de etiquetar. "🌎 Neutro" significaba
     // "vocabulario equilibrado", pero con HTML de error, binario (un zip sin
@@ -817,7 +846,7 @@ const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER, spamMode = "drop")
     // deliberado NO es una respuesta degradada, así que no marca FAILED ni
     // baja el TTL. Con SPAM_FILTER=log (modo sombra) se registra el veredicto
     // pero la pista se sirve: sirve para medir en producción qué se perdería.
-    const spam = spamVerdict(text);
+    const spam = spamVerdict(text, truncated);
     if (spam.discard) {
       if (spamMode === "log") {
         console.log(`[classify] SPAM_FILTER=log: se habría descartado (${spam.reason}) [${sub.source}]`);
@@ -846,7 +875,7 @@ const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER, spamMode = "drop")
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, rateLimitFallback, RATE_MAP_CAP };
+export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1044,12 +1073,16 @@ export default {
         // spam, el título quedaba vacío aunque detrás hubiera limpias.
         const pBase = proxyBase(env);
         const spamMode = env && env.SPAM_FILTER === "log" ? "log" : "drop";
+        const epSuffix =
+          season && episode && /^\d+$/.test(season) && /^\d+$/.test(episode)
+            ? `&s=${season}&e=${episode}`
+            : "";
         const fetchBudget = { "OS-V3": ANALYSIS_FETCH_PER_SOURCE, "SubDL": ANALYSIS_FETCH_PER_SOURCE };
         const analyzed = await Promise.all(
           deduped.map((sub) => {
             if (fetchBudget[sub.source] > 0) {
               fetchBudget[sub.source] -= 1;
-              return classifySubtitle(sub, pBase, spamMode);
+              return classifySubtitle(sub, pBase, spamMode, epSuffix);
             }
             // Más allá del sobrepaso: ni se descarga.
             return null;
@@ -1058,28 +1091,36 @@ export default {
 
         // Los fallos de descarga (FAILED) NO se sirven: no pasaron por el
         // filtro anti-spam, así que no son pistas verificadas. Solo cuentan
-        // para degradar el TTL (se calcula sobre `analyzed`, antes de filtrar).
+        // para degradar el TTL si su fuente no alcanzó el cupo de 5 limpias.
         const kept = { "OS-V3": 0, "SubDL": 0 };
+        const failed = { "OS-V3": 0, "SubDL": 0 };
         const subtitles = [];
         for (let i = 0; i < analyzed.length; i++) {
           const s = analyzed[i];
-          if (!s || s[FAILED]) continue;
           const source = deduped[i].source;
+          if (!s) continue;
+          if (s[FAILED]) {
+            failed[source] += 1;
+            continue;
+          }
           if (kept[source] >= ANALYSIS_BUDGET_PER_SOURCE) continue;
           kept[source] += 1;
           subtitles.push(s);
         }
 
-        // TTL según fiabilidad: si ALGÚNA clasificación falló (red/timeout/
-        // HTML de error) o una fuente entera rechazó, la lista está incompleta
-        // o degradada → 60 s para reintentar pronto. Con resultados fiables
-        // (incluidos los "sin clasificar" estables por 0 coincidencias léxicas)
-        // → 2 h. Los descartes por spam NO cuentan como fallo. Antes TODO se
-        // cacheaba 2 h y un proveedor caído dejaba la respuesta rota toda una
-        // tarde.
-        const anyFailed = analyzed.some((s) => s && s[FAILED]);
+        // TTL según fiabilidad (v1.4.5, por fuente): una fuente se considera
+        // degradada si rechazó entera (`sourceFailed`) o si tuvo >=1 fallo de
+        // descarga Y no alcanzó su cupo de ANALYSIS_BUDGET_PER_SOURCE pistas
+        // limpias. Así: (a) un catálogo pequeño legítimo (3 subs y 0 fallos)
+        // se cachea 2 h; (b) si 1 de los 8 candidatos falló pero los otros
+        // llenaron las 5 limpias, el fallo quedó absorbido por el sobrepaso y
+        // se cachea 2 h; (c) si el fallo dejó la fuente incompleta (<5), baja
+        // a 60 s para reintentar pronto. Los descartes por spam NO son fallos.
+        const anyDegradedSource = Object.keys(failed).some(
+          (src) => failed[src] > 0 && kept[src] < ANALYSIS_BUDGET_PER_SOURCE
+        );
         const sourceFailed = osSubs.status === "rejected" || sdlSubs.status === "rejected";
-        const ttl = anyFailed || sourceFailed ? 60 : 7200;
+        const ttl = anyDegradedSource || sourceFailed ? 60 : 7200;
         if (ttl !== 7200) {
           console.log(`[subtitles] respuesta degradada (fallo de clasificación o fuente): TTL ${ttl}s`);
         }

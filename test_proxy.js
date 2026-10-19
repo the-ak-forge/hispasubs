@@ -102,11 +102,12 @@ for (const ip of ["127.0.0.1", "10.0.0.1", "172.16.5.5", "192.168.1.1", "169.254
 check("IPv4 8.8.8.8 es pública", isPublicIP("8.8.8.8") === true);
 check("IPv4 172.32.5.5 es pública (fuera de 172.16/12)", isPublicIP("172.32.5.5") === true);
 check("IPv4 100.128.0.1 es pública (fuera de CGNAT 100.64/10)", isPublicIP("100.128.0.1") === true);
-for (const ip of ["::1", "::", "fe80::1", "fc00::1", "fd12::1", "ff02::1", "::ffff:127.0.0.1", "::10.0.0.1"]) {
+for (const ip of ["::1", "::", "fe80::1", "fc00::1", "fd12::1", "ff02::1", "::ffff:127.0.0.1", "::10.0.0.1", "::ffff:7f00:1", "::ffff:a00:1", "::ffff:c0a8:101", "64:ff9b::10.0.0.1", "2002:7f00:1::", "2001:db8::1"]) {
   check(`IPv6 ${ip} es privada`, isPublicIP(ip) === false);
 }
 check("IPv6 2001:4860:4860::8888 es pública", isPublicIP("2001:4860:4860::8888") === true);
 check("IPv6 ::ffff:8.8.8.8 (mapped) es pública", isPublicIP("::ffff:8.8.8.8") === true);
+check("IPv6 ::ffff:808:808 (mapped hex 8.8.8.8) es pública", isPublicIP("::ffff:808:808") === true);
 
 // ===========================================================================
 // 2. Rutas y errores de usuario
@@ -229,7 +230,41 @@ section("5. Extracción del zip");
   check("devuelve el contenido del .srt", String(res.body).includes("hola"));
   check("content-type text/plain", res.headers["content-type"] === "text/plain; charset=utf-8");
   check("content-disposition con el nombre", String(res.headers["content-disposition"]).includes('filename="pista.srt"'));
-  check("cache-control 86400", res.headers["cache-control"] === "public, max-age=86400");
+  check("cache-control 86400 + s-maxage (Edge de Vercel)",
+    res.headers["cache-control"] === "public, max-age=86400, s-maxage=86400, stale-while-revalidate=3600",
+    res.headers["cache-control"]);
+}
+{
+  // v1.4.5 H-01: Pack de temporada con varios episodios -> con &s=&e= elige el
+  // episodio pedido aunque otro episodio sea mucho más grande; y no confunde
+  // S01E03 con S01E30.
+  const seasonPack = buildZip([
+    ["Show.S01E30.Finale.srt", "f".repeat(9000)],
+    ["Show.S01E03.Episode.srt", "episodio tres correcto\n"],
+    ["Show.S01E10.Big.srt", "b".repeat(8000)],
+  ]);
+  fetchImpl = () => new Response(seasonPack, { status: 200 });
+  const resEp = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/pack.zip") + "&s=1&e=3");
+  check("v1.4.5 H-01: con &s=1&e=3 elige S01E03 (no S01E30 ni el más grande)",
+    resEp.statusCode === 200 && String(resEp.body).includes("episodio tres correcto"),
+    String(resEp.body).slice(0, 80));
+
+  const pack1x = buildZip([
+    ["Show.1x12.srt", "x".repeat(5000)],
+    ["Show.1x02.srt", "formato 1x02 correcto\n"],
+  ]);
+  fetchImpl = () => new Response(pack1x, { status: 200 });
+  const res1x = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/pack2.zip") + "&s=1&e=2");
+  check("v1.4.5 H-01: soporta nomenclatura 1x02",
+    res1x.statusCode === 200 && String(res1x.body).includes("formato 1x02 correcto"),
+    String(res1x.body).slice(0, 80));
+
+  // Si ningún nombre del zip coincide con el episodio, cae al comportamiento
+  // normal (el .srt más grande).
+  fetchImpl = () => new Response(seasonPack, { status: 200 });
+  const resFallback = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/pack.zip") + "&s=1&e=99");
+  check("v1.4.5 H-01: si ningún archivo coincide con &s/&e, sirve el .srt más grande",
+    resFallback.statusCode === 200 && String(resFallback.body).startsWith("f"));
 }
 {
   const zip = buildZip([["a.vtt", "WEBVTT\n"], ["b.srt", "1\n00:00:01,000 --> 00:00:02,000\nx\n"], ["c_small.srt", "peque\n"], ["d_big.srt", "g".repeat(5000)]]);
