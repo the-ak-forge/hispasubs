@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker from "./worker.js";
+import worker, { scoreText, subtitleCacheUrl } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -17,6 +17,8 @@ const check = (name, cond, extra = "") => {
 let res = await get("/configure");
 let html = await res.text();
 check("configure responde 200 HTML", res.status === 200 && html.includes("<!DOCTYPE html>"));
+check("configure con Cache-Control no-store (página puede llevar la clave)",
+  res.headers.get("cache-control") === "no-store", String(res.headers.get("cache-control")));
 check("input con type=password", html.includes('type="password"'));
 check("logo SVG inline", html.includes("<svg"));
 check("sin selector de modo de idioma (formato único lang+label)",
@@ -224,6 +226,10 @@ try {
   check("SubDL zip relativa -> proxy, lang 'spa' y label Latino",
     zipEntry?.lang === "spa" && zipEntry?.label === "🇲🇽 Latino (SubDL)",
     JSON.stringify(zipEntry).slice(0, 160));
+
+  // Lote 2: lista SIN fallos de clasificación -> TTL completo de 2 h.
+  check("lista limpia (sin fallos) -> Cache-Control 7200",
+    res.headers.get("cache-control") === "public, max-age=7200", res.headers.get("cache-control"));
   check("SubDL url absoluta -> lang 'spa' y label Castellano",
     srtEntry?.lang === "spa" && srtEntry?.label === "🇪🇸 Castellano (SubDL)",
     JSON.stringify(srtEntry).slice(0, 160));
@@ -260,6 +266,35 @@ try {
   check("config v1.2.0: urls siguen pasando por el proxy en zips",
     oldEntries.filter((e) => e.url.includes("proxy?zipUrl=")).length === 1,
     JSON.stringify(oldEntries.map((e) => e.url)).slice(0, 150));
+
+  // 9d-lote4) PROXY_URL (env) reemplaza la base del proxy para despliegues
+  // propios; sin la variable se mantiene el de Vercel por defecto.
+  res = await worker.fetch(
+    new Request(`${base}/${b64url({ subdlKey: "k" })}/subtitles/movie/tt1375666.json`),
+    { PROXY_URL: "https://proxy.propio.example/proxy" }, {});
+  const customEntries = (await res.json()).subtitles || [];
+  check("lote4: PROXY_URL env reemplaza la base del proxy",
+    customEntries.some((e) => e.url.startsWith("https://proxy.propio.example/proxy?zipUrl=")) &&
+      !customEntries.some((e) => e.url.includes("hispasubs.vercel.app")),
+    JSON.stringify(customEntries.map((e) => e.url)).slice(0, 250));
+
+  // ...y con query string existente se usa &zipUrl= (no un segundo ?).
+  res = await worker.fetch(
+    new Request(`${base}/${b64url({ subdlKey: "k" })}/subtitles/movie/tt1375666.json`),
+    { PROXY_URL: "https://proxy.propio.example/proxy?a=1" }, {});
+  const customEntries2 = (await res.json()).subtitles || [];
+  check("lote4: PROXY_URL con query -> &zipUrl= (no doble '?')",
+    customEntries2.some((e) => e.url.includes("proxy?a=1&zipUrl=")),
+    JSON.stringify(customEntries2.map((e) => e.url)).slice(0, 250));
+
+  // ...y un valor basura (no-URL) cae al proxy por defecto.
+  res = await worker.fetch(
+    new Request(`${base}/${b64url({ subdlKey: "k" })}/subtitles/movie/tt1375666.json`),
+    { PROXY_URL: "javascript:alert(1)" }, {});
+  const garbageEntries = (await res.json()).subtitles || [];
+  check("lote4: PROXY_URL inválido -> proxy por defecto (no se rompe)",
+    garbageEntries.some((e) => e.url.includes("hispasubs.vercel.app/proxy?zipUrl=")),
+    JSON.stringify(garbageEntries.map((e) => e.url)).slice(0, 250));
 } finally {
   globalThis.fetch = origFetch;
 }
@@ -280,10 +315,14 @@ try {
         { id: "g1", url: "https://subs5.strem.io/gibberish.srt", lang: "spa" },
         { id: "ok", url: "https://subs5.strem.io/ok.srt", lang: "spa" },
         { id: "eses", url: "https://subs5.strem.io/eses.srt", lang: "es-ES" },
+      ] : u.includes("tt5551113") ? [
+        { id: "t1", url: "https://subs5.strem.io/timeout.srt", lang: "spa" },
+        { id: "t2", url: "https://subs5.strem.io/ok.srt", lang: "spa" },
       ] : [];
       return Promise.resolve(new Response(JSON.stringify({ subtitles }),
         { status: 200, headers: { "content-type": "application/json" } }));
     }
+    if (u.includes("timeout.srt")) return Promise.reject(new Error("network timeout"));
     if (u.includes("html.srt")) {
       return Promise.resolve(textResp("<!DOCTYPE html><html><body>404 Not Found</body></html>"));
     }
@@ -309,12 +348,22 @@ try {
     gibEntry?.label === "📄 Español (sin clasificar · OS-V3)", JSON.stringify(gibEntry).slice(0, 160));
   check("v1.3.1: filtro de idioma acepta variantes (es-ES)",
     e10.some((e) => e.url.includes("eses.srt")), JSON.stringify(e10.map((e) => e.url)).slice(0, 200));
-  check("v1.3.1: Cache-Control explícito de 2h en la lista",
-    res.headers.get("cache-control") === "public, max-age=7200", res.headers.get("cache-control"));
+
+  // 10-actual) TTL según fiabilidad: esta lista contiene html.srt, cuya
+  // clasificación FALLA (el origen devolvió una página HTML de error), así que
+  // la respuesta está degradada → 60 s y no 2 h (reintento pronto).
+  check("v1.3.1: lista con clasificación fallida -> TTL corto 60s (no 2h)",
+    res.headers.get("cache-control") === "public, max-age=60", res.headers.get("cache-control"));
 
   // 10b) Caché negativa: la lista vacía lleva TTL corto (60 s).
   res = await get("/subtitles/movie/tt8888888.json"); // ambas fuentes -> []
   check("v1.3.1: lista vacía con Cache-Control 60s (caché negativa)",
+    res.headers.get("cache-control") === "public, max-age=60", res.headers.get("cache-control"));
+
+  // 10c-lote2) Fallo de RED bajando una sub -> respuesta degradada -> 60 s
+  // (antes se cacheaba 2 h con la entrada rota).
+  res = await get("/subtitles/movie/tt5551113.json"); // 1 sub con timeout
+  check("lote2: sub con error de red -> TTL 60s (respuesta degradada)",
     res.headers.get("cache-control") === "public, max-age=60", res.headers.get("cache-control"));
 
   // 10c) Manifest: sin la firma inválida (estaba generada para v1.2.0).
@@ -322,7 +371,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.3.3", m10.version === "1.3.3", m10.version);
+  check("manifest version 1.4.0", m10.version === "1.4.0", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -351,8 +400,110 @@ try {
     new Request(`${base}/subtitles/movie/tt7777778.json`), { RATE_LIMIT: "3" }, {});
   check("v1.3.1: sin cf-connecting-ip no se limita (tests/entornos sin CF)",
     noIp.status === 200, String(noIp.status));
+
+  // 10e-lote3) Binding real de la Workers Rate Limiting API. Cuando existe
+  // env.SUBS_RATE_LIMIT.limit se usa ÉL (RATE_LIMIT ya no cuenta): solo el
+  // valor 0 lo desactiva por completo.
+  let bindingCalls = 0;
+  let bindingSuccess = true;
+  const bindEnv = {
+    RATE_LIMIT: "999", // subir RATE_LIMIT NO sube el binding: lo ignora
+    SUBS_RATE_LIMIT: {
+      limit: async ({ key }) => {
+        bindingCalls += 1;
+        check("lote3: el binding recibe la clave (IP)", key === "198.51.100.50", String(key));
+        return { success: bindingSuccess };
+      },
+    },
+  };
+  const bindReq = (id) => worker.fetch(
+    new Request(`${base}/subtitles/movie/${id}.json`, { headers: { "cf-connecting-ip": "198.51.100.50" } }),
+    bindEnv, {});
+
+  res = await bindReq("tt4440001");
+  check("lote3: binding con success=true -> 200 (no usa el fallback in-memory)",
+    res.status === 200 && bindingCalls === 1, `${res.status} calls=${bindingCalls}`);
+
+  bindingSuccess = false;
+  res = await bindReq("tt4440002");
+  check("lote3: binding con success=false -> 429",
+    res.status === 429, String(res.status));
+  check("lote3: 429 del binding lleva Retry-After 60 (periodo del binding)",
+    res.headers.get("retry-after") === "60", String(res.headers.get("retry-after")));
+  bindingSuccess = true;
+
+  // RATE_LIMIT=0 desactiva el límite ANTES de consultar el binding.
+  const callsBefore = bindingCalls;
+  res = await worker.fetch(
+    new Request(`${base}/subtitles/movie/tt4440003.json`, { headers: { "cf-connecting-ip": "198.51.100.50" } }),
+    { ...bindEnv, RATE_LIMIT: "0" }, {});
+  check("lote3: RATE_LIMIT=0 desactiva el límite aunque haya binding",
+    res.status === 200 && bindingCalls === callsBefore,
+    `${res.status} calls=${bindingCalls} (antes ${callsBefore})`);
 } finally {
   globalThis.fetch = origFetch2;
+}
+
+// 11) Corpus etiquetado de scoreText (Lote 1: léxico Unicode)
+{
+  const C = (t) => scoreText(t);
+
+  // Fronteras Unicode: \b es ASCII, "ó"/"ñ"/"á" no son \w, así que antes
+  // "órale" o "aparcáis" no matcheaban tras un espacio.
+  check("corpus: 'órale' con tilde clasifica como Latino",
+    C("órale güey, chido")?.flag === "🇲🇽 Latino",
+    JSON.stringify(C("órale güey, chido")));
+  check("corpus: conjugación ES 'aparcáis/vosotros' clasifica como Castellano",
+    C("vosotros aparcáis el coche en la nevera")?.flag === "🇪🇸 Castellano",
+    JSON.stringify(C("vosotros aparcáis el coche en la nevera")));
+  check("corpus: conjugaciones LAT 'manejó/enojó' clasifican como Latino",
+    C("manejó el carro y se enojó")?.flag === "🇲🇽 Latino",
+    JSON.stringify(C("manejó el carro y se enojó")));
+  check("corpus: raíces 'condujo' y 'tenéis' detectadas",
+    (C("condujo muy tenéis")?.total ?? 0) >= 2, JSON.stringify(C("condujo muy tenéis")));
+
+  // Términos ambiguos (WEAK, peso 0,25): no deciden solos.
+  check("corpus: 'No vale la pena' NO es Castellano (sin clasificar)",
+    C("No vale la pena") === null, JSON.stringify(C("No vale la pena")));
+  check("corpus: 'el Papa' NO es Latino (sin clasificar)",
+    C("el Papa lo dijo") === null, JSON.stringify(C("el Papa lo dijo")));
+  check("corpus: 'ganancia neta' NO es Latino (sin clasificar)",
+    C("ganancia neta del ejercicio") === null,
+    JSON.stringify(C("ganancia neta del ejercicio")));
+  check("corpus: 'ustedes' solo NO es Latino (sin clasificar)",
+    C("ustedes bien") === null, JSON.stringify(C("ustedes bien")));
+  check("corpus: débil no voltea un claro léxico ES",
+    C("coche coche vale")?.flag === "🇪🇸 Castellano",
+    JSON.stringify(C("coche coche vale")));
+
+  // Fronteras de palabra: "vale" dentro de "valencia" o "papa" en "papaya".
+  check("corpus: 'valencia' no contiene el término 'vale'",
+    C("valencia") === null, JSON.stringify(C("valencia")));
+  check("corpus: 'papaya' no contiene el término 'papa'",
+    C("papaya") === null, JSON.stringify(C("papaya")));
+
+  // Neutro exige léxico real equilibrado; sin datos -> null (📄).
+  check("corpus: léxico equilibrado con fuerte real -> Neutro",
+    C("coche carro coche carro")?.flag === "🌎 Neutro",
+    JSON.stringify(C("coche carro coche carro")));
+  check("corpus: texto sin léxico -> null (sin clasificar)",
+    C("hola mundo, adiós") === null, JSON.stringify(C("hola mundo, adiós")));
+}
+
+// 12) Lote 2: clave canónica de caché (config, type, id)
+{
+  const O = "https://hispasubs.example.workers.dev";
+  check("cache: la clave ignora params de query de la petición",
+    subtitleCacheUrl(O, "abc", "series", "tt1:1:2") ===
+      `${O}/abc/subtitles/series/tt1:1:2.json`,
+    subtitleCacheUrl(O, "abc", "series", "tt1:1:2"));
+  check("cache: id sin config -> ruta sin segmento de config",
+    subtitleCacheUrl(O, "", "movie", "tt123") === `${O}/subtitles/movie/tt123.json`,
+    subtitleCacheUrl(O, "", "movie", "tt123"));
+  check("cache: %3A y ':' comparten la MISMA clave (una sola entrada)",
+    subtitleCacheUrl(O, "abc", "series", "tt1:1:2") ===
+      subtitleCacheUrl(O, "abc", "series", decodeURIComponent("tt1%3A1%3A2")),
+    "codificaciones distintas fragmentaban la caché");
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

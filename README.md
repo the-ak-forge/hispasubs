@@ -31,7 +31,7 @@ El complemento analiza el texto de los subtítulos, detecta expresiones, pronomb
 
 - Privacidad y rendimiento
   - Ejecuta la lógica en Edge con baja latencia.
-  - No almacena datos ni credenciales del usuario: tu clave de SubDL vive en tu configuración de Stremio, no en servidores propios. *Nota de transparencia:* esa clave viaja codificada en la URL de instalación (formato base64url del propio protocolo de configuración de Stremio) y se usa como cabecera `Api-Key` en las llamadas a la API de SubDL; no se registra en ningún servidor propio, pero cualquiera que intercepte la petición a `api.subdl.com` podría leerla (igual que con cualquier addon que use esta API).
+  - No almacena datos ni credenciales del usuario: tu clave de SubDL vive en tu configuración de Stremio, no en servidores propios. *Nota de transparencia:* esa clave viaja codificada en la URL de instalación (formato base64url del propio protocolo de configuración de Stremio) y se envía como parámetro de consulta `api_key` en las llamadas a la API de SubDL; no se registra en ningún servidor propio, pero cualquiera que intercepte la petición a `api.subdl.com` podría leerla (igual que con cualquier addon que use esta API).
 
 ---
 
@@ -73,7 +73,7 @@ Esto permite distinguir entre versiones del español con matices regionales sin 
 
 - **Worker en Cloudflare (Edge)** — `worker.js` (+ `wrangler.toml`)
   - Gestiona rutas, resolución de manifiestos, consultas en paralelo a las fuentes y la evaluación léxica.
-  - Cachea respuestas de listas (2 h; resultados vacíos 60 s como caché negativa) y aplica un rate limit por IP configurable (`RATE_LIMIT`; `0` lo desactiva).
+  - Cachea respuestas de listas (2 h; resultados vacíos o con fallos 60 s) y aplica un rate limit por IP (Workers Rate Limiting API; el tope vive en `wrangler.toml` → `[[ratelimits]] simple.limit`, y `RATE_LIMIT = "0"` lo desactiva).
 
 - **Proxy en Vercel (Node.js + `adm-zip`)** — `api/proxy.js` (+ `vercel.json`)
   - Descarga los `.zip` de SubDL y extrae el `.srt` en memoria RAM, sin tocar disco. Máximo 4 MB (límite de respuesta de Vercel).
@@ -98,9 +98,18 @@ npm test            # requiere Deno (tests del worker) y Node (tests del proxy)
 
 - `test_worker.js` (Deno): suite del Worker; incluye una llamada real a OpenSubtitles opcional (best effort).
 - `test_proxy.js` (Node): suite del proxy, con `dns.lookup` y `fetch` simulados, así que no necesita red.
-- El CI de GitHub Actions ejecuta ambas suites en cada *push* y falla si `npm audit` detecta vulnerabilidades *high*/*critical*.
+- El CI de GitHub Actions ejecuta ambas suites en cada *push*, valida `wrangler.toml` con `wrangler deploy --dry-run` y falla si `npm audit` detecta vulnerabilidades *high*/*critical*.
 
-Para levantar tu propia instancia, los ficheros de despliegue ya están configurados en el repo (`wrangler.toml` para el Worker y `vercel.json` + `api/proxy.js` para el proxy); solo hacen falta las cuentas gratuitas de Cloudflare y Vercel y las variables de entorno descritas en el código.
+Para levantar tu propia instancia, los ficheros de despliegue ya están configurados en el repo (`wrangler.toml` para el Worker y `vercel.json` + `api/proxy.js` para el proxy); solo hacen falta las cuentas gratuitas de Cloudflare y Vercel y las variables de entorno descritas abajo.
+
+### Variables de entorno
+
+| Variable | Componente | Default | Efecto |
+| --- | --- | --- | --- |
+| `RATE_LIMIT` | Worker (env var) | `120` | Solo el fallback in-memory (tests/entornos sin binding). `0` desactiva el rate limit por completo. **No** sube el tope en producción: para eso se edita `[[ratelimits]] simple.limit` en `wrangler.toml`. |
+| `PROXY_URL` | Worker (env var) | proxy de Vercel | URL base del proxy de extracción, para despliegues propios (`https://tu-dominio/proxy`). Se le añade `zipUrl=` como parámetro. |
+| `RATE_LIMIT_PER_MIN` | Proxy (Vercel) | `120` | Peticiones con descarga por minuto e IP. `0` lo desactiva. |
+| `FETCH_TIMEOUT_MS` | Proxy (Vercel) | `8000` | Timeout que cubre descarga de cabeceras **y** cuerpo del zip. |
 
 ---
 
@@ -150,7 +159,7 @@ Estaba relacionado con lo anterior: la selección automática compara `lang` con
 Si hay `.zip` de SubDL, se descargan, descomprimen y analizan la primera vez (~1-2 s; el peor caso con varios zips ronda los 8 s, que es el tiempo máximo que el proxy espera por archivo). Stremio cachea la respuesta (y el complemento la cachea 2 h); en peticiones siguientes aparece al instante.
 
 ### Recibo errores 429 («Demasiadas peticiones»)
-El complemento limita las peticiones sin caché por IP (con un umbral holgado por defecto) para evitar abusos. Es muy difícil de tocar en uso normal, pero si compartes IP pública con mucha gente (CGNAT de operadora), el propietario del addon puede subir el límite (`RATE_LIMIT` en Cloudflare y `RATE_LIMIT_PER_MIN` en Vercel) sin necesidad de desactivarlo.
+El complemento limita las peticiones sin caché por IP (con un umbral holgado por defecto) para evitar abusos. Es muy difícil de tocar en uso normal, pero si compartes IP pública con mucha gente (CGNAT de operadora), el propietario del addon puede subir el límite sin necesidad de desactivarlo: en el Worker editando `[[ratelimits]] simple.limit` de `wrangler.toml` y redesplegando (la variable `RATE_LIMIT` solo sirve para ponerlo a `0`; no cambia el tope del binding), y en el Vercel con `RATE_LIMIT_PER_MIN`.
 
 ---
 

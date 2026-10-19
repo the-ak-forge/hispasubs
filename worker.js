@@ -1,6 +1,20 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.3.3
+// HispaSubs — Cloudflare Worker v1.4.0
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.0 (18/10/2026) — auditoría externa (5 lotes):
+//  - Léxico: fronteras Unicode (?<![\p{L}\p{N}_], flags giu) porque \b es
+//    ASCII y perdía "órale"/"aparcáis"; raíces con conjugaciones (README
+//    cumplido); términos ambiguos (vale/papa/neta/ustedes) con peso 0,25 en
+//    vez de 1; Neutro exige términos fuertes reales (si no, 📄).
+//  - Caché: TTL 60 s si la respuesta está degradada (clasificación con error
+//    o fuente caída) en vez de 2 h; clave canónica (config, type, id) que
+//    ignora params de query y %3A (antes se fragmentaba la caché).
+//  - Rate limit: tests del binding de la Workers Rate Limiting API; docs
+//    corregidas (RATE_LIMIT solo desactiva con 0; el tope vive en
+//    wrangler.toml [[ratelimits]] simple.limit).
+//  - Proxy: variable PROXY_URL (env) para despliegues propios.
+//  - /configure con Cache-Control: no-store (la página puede llevar la clave).
 //
 // v1.3.3 (18/10/2026):
 //  - Rate limiting nativo via Workers Rate Limiting API (ratelimit binding).
@@ -52,17 +66,42 @@
 // ============================================================================
 
 // Diccionarios léxicos. Notas:
-//  - Se añaden plurales con (?:es)? / s? porque "\bcoche\b" no matchea "coches".
+//  - Fronteras Unicode (?<![\p{L}\p{N}_]) en vez de \b: \b es solo ASCII, y
+//    "ó" o "ñ" NO son \w, así que \b[oó]rale\b nunca matcheaba "órale" tras
+//    un espacio (el caso más grave del informe de auditoría). Flags giu.
+//  - Raíces con [\p{L}]* para capturar conjugaciones ("manejo", "condujo",
+//    "aparqué", "tenéis"), no solo infinitivos: el README promete
+//    conjugaciones y antes solo matcheaban las formas exactas.
+//  - Los plurales siguen con (?:es)? / s? donde la raíz no aplica.
 //  - "m[oó]vil" tolera SRTs mal codificados.
 //  - String.match(/g/) resetea lastIndex, así que el flag g es seguro aquí
 //    (NO cambiar a .test() sin resetear lastIndex a mano).
-const DICT_ES = /\b(vosotros|ordenador(?:es)?|coche[s]?|gilipollas|hostias?|chaval(?:es)?|follar|joder|guay|m[oó]vil(?:es)?|patata[s]?|zumo[s]?|aparcar|conducir|enfadar|nevera[s]?|jol[ií]n|mola|vale)\b/gi;
-const DICT_LAT = /\b(computadora[s]?|carro[s]?|auto(?:s)?|pendejo(?:s|jas)?|chingar|platicar|celular(?:es)?|jugo[s]?|estacionar|manejar|enojar|refrigerador(?:es)?|ustedes|chavo(?:s)?|wey|güey|neta[s]?|papa[s]?|carajo|[oó]rale|chido|bacano)\b/gi;
+//
+// Términos ambiguos (DICT_*_WEAK, peso WEAK_WEIGHT): comunes a ambos lados
+// o con falsos positivos demostrados —"No vale la pena" contaba como España,
+// "el Papa" y "ganancia neta" como Latino, "ustedes" (formal en España)
+// como Latino—. Cuentan 0,25 en vez de 1 para que una palabra suelta no
+// decida la clasificación; solo pesan cuando aparecen muchas veces.
+const WEAK_WEIGHT = 0.25;
+const DICT_ES = /(?<![\p{L}\p{N}_])(?:vosotros|ordenador(?:es)?|coche[s]?|gilipollas|hostias?|chaval(?:es)?|foll(?:ar|a|an|en|ó|o|ado|ando)|jod[\p{L}]*|guay|m[oó]vil(?:es)?|patata[s]?|zumo[s]?|aparqu[\p{L}]*|aparc[\p{L}]*|cond(?:uc|uj|uzc)[\p{L}]*|enfad[\p{L}]*|nevera[s]?|jol[ií]n|mol(?:a|an)|ten[eé]is|sois|est[aá]is)(?![\p{L}\p{N}_])/giu;
+const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?|auto(?:s)?|pendej[\p{L}]*|ching[\p{L}]*|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion[\p{L}]*|manej[\p{L}]*|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|carajo|[oó]rale|chido|bacano)(?![\p{L}\p{N}_])/giu;
+const DICT_ES_WEAK = /(?<![\p{L}\p{N}_])vale(?![\p{L}\p{N}_])/giu;
+const DICT_LAT_WEAK = /(?<![\p{L}\p{N}_])(?:papa[s]?|neta[s]?|ustedes)(?![\p{L}\p{N}_])/giu;
 
 // Túnel Node.js en Vercel como motor de extracción de zips.
 // IMPORTANTE: el proxy DEBE llevar allowlist de hosts (ver api/proxy.js),
 // si no, cualquiera puede usar tu servidor como open proxy/SSRF.
 const VERCEL_UNZIPPER = "https://hispasubs.vercel.app/proxy?zipUrl=";
+
+// PROXY_URL (env, opcional): sobrescribe la URL base del proxy para despliegues
+// propios (dominio propio, otro proyecto de Vercel...). Se le añade el
+// parámetro ?zipUrl= / &zipUrl= según lleve o no query string.
+const proxyBase = (env) => {
+  const custom = env && typeof env.PROXY_URL === "string" ? env.PROXY_URL.trim() : "";
+  if (!custom) return VERCEL_UNZIPPER;
+  if (!/^https?:\/\//.test(custom)) return VERCEL_UNZIPPER; // basura -> valor por defecto
+  return custom.includes("?") ? `${custom}&zipUrl=` : `${custom}?zipUrl=`;
+};
 
 const LOGO_SVG = `<svg width="80" height="80" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="10" y="20" width="80" height="60" rx="10" fill="#00d2ff" fill-opacity="0.2" stroke="#00d2ff" stroke-width="4"/><rect x="25" y="45" width="20" height="8" rx="4" fill="#00d2ff"/><rect x="55" y="45" width="20" height="8" rx="4" fill="#00d2ff"/><rect x="35" y="60" width="30" height="8" rx="4" fill="#00d2ff"/></svg>`;
 
@@ -235,6 +274,13 @@ const jsonResponse = (obj, cacheSeconds) =>
     },
   });
 
+// Clave CANÓNICA de caché de la ruta de subtítulos: (config, type, id).
+// La petición de Stremio puede traer params de query y el id codificado como
+// %3A; usar la URL cruda fragmentaba la caché en variantes y cada variante
+// pagaba las descargas de las 5 subs otra vez. Exportada para test_worker.js.
+const subtitleCacheUrl = (origin, configStr, type, fullId) =>
+  `${origin}/${configStr ? `${configStr}/` : ""}subtitles/${type}/${fullId}.json`;
+
 // ---------------------------------------------------------------------------
 // Rate limit por IP (Workers Rate Limiting API + fallback in-memory)
 //
@@ -337,7 +383,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.3.3",
+  version: "1.4.0",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -465,14 +511,50 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
 // ---------------------------------------------------------------------------
 
 // 📄 = "no analizado" (nunca una variante): distinto de 🇪🇸/🇲🇽/🌎.
-const unclassified = (sub, finalUrl) => ({
+//
+// FAILED (símbolo): JSON.stringify ignora las claves-símbolo, así que la marca
+// distingue "sin clasificar porque hubo un ERROR (red, timeout, página HTML de
+// error, bytes que no son texto)" —respuesta degradada, TTL corto— de "sin
+// clasificar porque no hubo presupuesto o 0 coincidencias léxicas" —resultado
+// estable, TTL normal—, sin que el flag llegue nunca a Stremio.
+const FAILED = Symbol.for("hispasubs.failed");
+const unclassified = (sub, finalUrl, failed = false) => ({
   id: sub.id,
   url: finalUrl,
   lang: LANG_ISO_ES,
   label: `📄 Español (sin clasificar · ${sub.source})`,
+  ...(failed ? { [FAILED]: true } : {}),
 });
 
-const classifySubtitle = async (sub) => {
+// Puntuación pura de un texto. Exportada para test_worker.js, que la ejercita
+// contra un corpus etiquetado (fronteras Unicode, conjugaciones y términos
+// ambiguos). Devuelve null cuando NO hay datos suficientes para afirmar nada
+// (📄 "sin clasificar"); nunca decide por defecto.
+const scoreText = (text) => {
+  // Los términos ambiguos (WEAK) valen 0,25: "No vale la pena", "el Papa",
+  // "ganancia neta" o un "ustedes" formal de España ya no deciden solos.
+  const score = (dict, weight) => (text.match(dict) || []).length * weight;
+  const esMatches = score(DICT_ES, 1) + score(DICT_ES_WEAK, WEAK_WEIGHT);
+  const latMatches = score(DICT_LAT, 1) + score(DICT_LAT_WEAK, WEAK_WEIGHT);
+  const strongTotal = score(DICT_ES, 1) + score(DICT_LAT, 1);
+  const total = esMatches + latMatches;
+  if (total === 0) return null;
+
+  // Margen proporcional: con 3 apariciones de "coche" ya no decides un
+  // subtítulo entero; hace falta cierta ventaja relativa.
+  const margin = Math.max(2, Math.floor(total * 0.15));
+
+  let flag = "🌎 Neutro";
+  if (esMatches > latMatches + margin) flag = "🇪🇸 Castellano";
+  else if (latMatches > esMatches + margin) flag = "🇲🇽 Latino";
+  // Cero términos fuertes y decisión "Neutro": no hay vocabulario
+  // equilibrado, hay ausencia de datos → 📄 "sin clasificar" (el README solo
+  // promete Neutro cuando hubo coincidencias léxicas reales).
+  if (flag === "🌎 Neutro" && strongTotal === 0) return null;
+  return { esMatches, latMatches, total, flag };
+};
+
+const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER) => {
   // Guard ANTES de cualquier acceso a sub.url (evita el crash en cascada
   // de Promise.all del 1.0.0).
   if (!sub || !isHttpUrl(sub.url)) return null;
@@ -481,7 +563,7 @@ const classifySubtitle = async (sub) => {
   // descomprime y devuelve el SRT: se clasifican a través de él. El URL que
   // recibe Stremio es también el del proxy (Stremio no descomprime).
   const isZip = isCompressed(sub.url);
-  const finalUrl = isZip ? `${VERCEL_UNZIPPER}${encodeURIComponent(sub.url)}` : sub.url;
+  const finalUrl = isZip ? `${pBase}${encodeURIComponent(sub.url)}` : sub.url;
 
   try {
     // El proxy tarda más (descarga + descomprime): timeout amplio para zips.
@@ -496,32 +578,29 @@ const classifySubtitle = async (sub) => {
     const looksLikeZip = sample.charCodeAt(0) === 0x50 && sample.charCodeAt(1) === 0x4b;
     if (!sample || looksLikeZip || isHtml) {
       console.error("[classify]", sub.source, "contenido que no es texto de subtítulo");
-      return unclassified(sub, finalUrl);
+      // El origen devolvió algo que no es un subtítulo (página de error,
+      // binario…): es un FALLO transitorio, no un veredicto léxico.
+      return unclassified(sub, finalUrl, true);
     }
 
-    const esMatches = (text.match(DICT_ES) || []).length;
-    const latMatches = (text.match(DICT_LAT) || []).length;
-    const total = esMatches + latMatches;
-    if (total === 0) {
+    const scored = scoreText(text);
+    if (!scored) {
       // Ni una sola palabra del léxico: probablemente no sea un subtítulo en
-      // español ni siquiera (idioma erróneo, fichero de créditos...).
+      // español ni siquiera (idioma erróneo, fichero de créditos...). El texto
+      // llegó y se analizó sin error → no es fallo transitorio → TTL normal.
       return unclassified(sub, finalUrl);
     }
 
-    // Margen proporcional: con 3 apariciones de "coche" ya no decides un
-    // subtítulo entero; hace falta cierta ventaja relativa.
-    const margin = Math.max(2, Math.floor(total * 0.15));
-
-    let flag = "🌎 Neutro";
-    if (esMatches > latMatches + margin) flag = "🇪🇸 Castellano";
-    else if (latMatches > esMatches + margin) flag = "🇲🇽 Latino";
-
-    return { id: sub.id, url: finalUrl, lang: LANG_ISO_ES, label: `${flag} (${sub.source})` };
+    return { id: sub.id, url: finalUrl, lang: LANG_ISO_ES, label: `${scored.flag} (${sub.source})` };
   } catch (error) {
     console.error("[classify]", sub.source, error.message);
-    return unclassified(sub, finalUrl);
+    // Timeout / red caída: fallo transitorio → TTL corto para reintentar pronto.
+    return unclassified(sub, finalUrl, true);
   }
 };
+
+// Exportado solo para tests (corpus etiquetado en test_worker.js).
+export { scoreText, subtitleCacheUrl };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -562,6 +641,8 @@ export default {
     }
 
     // Página de configuración (con config pre-rellenada si viene en la URL).
+    // no-store: la página puede llevar la clave de SubDL del usuario en el
+    // input; no debe guardarla el caché del navegador ni del proxy.
     if (pathParts.length === 0 || pathParts[pathParts.length - 1] === "configure") {
       let existingConfig = {};
       if (pathParts.length > 1) existingConfig = parseConfig(pathParts[0]);
@@ -569,6 +650,7 @@ export default {
         headers: {
           "Content-Type": "text/html; charset=utf-8",
           "Access-Control-Allow-Origin": "*",
+          "Cache-Control": "no-store",
         },
       });
     }
@@ -593,6 +675,9 @@ export default {
     }
 
     if (pathParts[actionIndex] === "subtitles") {
+      // Clave de caché canónica; se rellena al validar la ruta y se usa también
+      // en el catch (si el error llega antes, se cae a la URL cruda).
+      let cacheReq = null;
       try {
         const type = pathParts[actionIndex + 1];
         const rawId = (pathParts[actionIndex + 2] || "").replace(".json", "");
@@ -623,7 +708,13 @@ export default {
         }
 
         // Cache: Stremio repite peticiones; sin cache descargas 5 SRT en cada una.
-        const cached = await cacheMatch(request);
+        //
+        // Clave CANÓNICA (config, type, id): la URL de la petición puede traer
+        // params de query del cliente y el id en %3A o en ":"; usar la URL
+        // cruda fragmentaba la caché en variantes y cada una pagaba las 5
+        // descargas. Se normaliza todo a la forma exacta de la ruta.
+        cacheReq = new Request(subtitleCacheUrl(url.origin, configStr, type, fullId));
+        const cached = await cacheMatch(cacheReq);
         if (cached) return cached;
 
         // Límite por IP, solo en peticiones sin caché (las cacheadas no cuestan
@@ -696,31 +787,45 @@ export default {
         if (deduped.length === 0) {
           console.log(`[subtitles] 0 resultados para ${type}/${fullId}`);
           const empty = jsonResponse({ subtitles: [] }, 60);
-          cachePut(ctx, request, empty);
+          cachePut(ctx, cacheReq, empty);
           return empty;
         }
 
         // Análisis equilibrado: hasta 3 por fuente. En 1.0.0 las subs de
         // SubDL quedaban siempre sin analizar si OS devolvía ≥5.
+        const pBase = proxyBase(env);
         const budget = { "OS-V3": 3, "SubDL": 3 };
         const analyzed = await Promise.all(
           deduped.map((sub) => {
             if (budget[sub.source] > 0) {
               budget[sub.source] -= 1;
-              return classifySubtitle(sub);
+              return classifySubtitle(sub, pBase);
             }
             // Sin presupuesto de análisis: se enrutan igualmente (los .zip
             // vía proxy) y se etiquetan explícitamente como NO analizados.
             const finalUrl = isCompressed(sub.url)
-              ? `${VERCEL_UNZIPPER}${encodeURIComponent(sub.url)}`
+              ? `${pBase}${encodeURIComponent(sub.url)}`
               : sub.url;
             return { id: sub.id, url: finalUrl, lang: LANG_ISO_ES, label: `📄 Español (sin clasificar · ${sub.source})` };
           })
         );
 
         const subtitles = analyzed.filter(Boolean);
-        const response = jsonResponse({ subtitles }, 7200);
-        cachePut(ctx, request, response);
+
+        // TTL según fiabilidad: si ALGÚNA clasificación falló (red/timeout/
+        // HTML de error) o una fuente entera rechazó, la lista está incompleta
+        // o degradada → 60 s para reintentar pronto. Solo con resultados
+        // fiables (incluidos los "sin clasificar" estables por presupuesto o
+        // por 0 matches) → 2 h. Antes TODO se cacheaba 2 h y un proveedor
+        // caído dejaba la respuesta rota toda una tarde.
+        const anyFailed = analyzed.some((s) => s && s[FAILED]);
+        const sourceFailed = osSubs.status === "rejected" || sdlSubs.status === "rejected";
+        const ttl = anyFailed || sourceFailed ? 60 : 7200;
+        if (ttl !== 7200) {
+          console.log(`[subtitles] respuesta degradada (fallo de clasificación o fuente): TTL ${ttl}s`);
+        }
+        const response = jsonResponse({ subtitles }, ttl);
+        cachePut(ctx, cacheReq || request, response);
         return response;
       } catch (err) {
         // Los errores de una request no deben romper la respuesta de Stremio,
@@ -728,7 +833,7 @@ export default {
         // para no repetir el fallo en cada petición del mismo título.
         console.error("[subtitles] error inesperado:", err.message);
         const failed = jsonResponse({ subtitles: [] }, 60);
-        cachePut(ctx, request, failed);
+        cachePut(ctx, cacheReq || request, failed);
         return failed;
       }
     }

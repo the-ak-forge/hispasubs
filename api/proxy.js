@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.0.3
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.0
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -46,7 +46,7 @@ const MAX_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
-const USER_AGENT = "HispaSubs/1.0.3";
+const USER_AGENT = "HispaSubs/1.4.0";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 
@@ -214,39 +214,49 @@ export default async function handler(req, res) {
     // Descarga con validación en CADA salto (origen + hasta MAX_REDIRECTS
     // redirecciones). redirect:"manual" siempre: con "follow" el segundo
     // salto viajaba sin validar (bypass de allowlist / SSRF).
-    let upstream;
+    //
+    // El timeout cubre cabeceras Y cuerpo: antes se limpiaba el timer tras
+    // recibir las cabeceras, así que una descarga lenta o truncada (origen
+    // que manda Content-Length y se corta a mitad) podía dejar la función
+    // colgada indefinidamente hasta el límite de la plataforma.
+    const timeoutMs = Number(process.env.FETCH_TIMEOUT_MS) || FETCH_TIMEOUT_MS;
+    let buf = null;
     let redirects = 0;
     for (;;) {
       await assertSafeUrl(target, redirects > 0);
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
       try {
-        upstream = await fetch(target, {
+        const upstream = await fetch(target, {
           signal: controller.signal,
           redirect: "manual",
           headers: { "User-Agent": USER_AGENT },
         });
+        if (upstream.status >= 300 && upstream.status < 400) {
+          if (++redirects > MAX_REDIRECTS) {
+            throw new ProxyError(403, "Demasiadas redirecciones");
+          }
+          const loc = upstream.headers.get("location");
+          try {
+            target = new URL(loc, target); // location relativa -> absoluta
+          } catch {
+            throw new ProxyError(403, "Redirección ilegible");
+          }
+          continue;
+        }
+        if (!upstream.ok) {
+          return res.status(502).json({ error: `Origen respondió ${upstream.status}` });
+        }
+        const len = Number(upstream.headers.get("content-length") || 0);
+        if (len && len > MAX_BYTES) {
+          return res.status(413).json({ error: "Archivo demasiado grande" });
+        }
+        buf = Buffer.from(await upstream.arrayBuffer());
       } finally {
         clearTimeout(timer);
       }
-      if (upstream.status < 300 || upstream.status >= 400) break;
-      if (++redirects > MAX_REDIRECTS) {
-        throw new ProxyError(403, "Demasiadas redirecciones");
-      }
-      const loc = upstream.headers.get("location");
-      try {
-        target = new URL(loc, target); // location relativa -> absoluta
-      } catch {
-        throw new ProxyError(403, "Redirección ilegible");
-      }
+      break;
     }
-
-    if (!upstream.ok) return res.status(502).json({ error: `Origen respondió ${upstream.status}` });
-
-    const len = Number(upstream.headers.get("content-length") || 0);
-    if (len && len > MAX_BYTES) return res.status(413).json({ error: "Archivo demasiado grande" });
-
-    const buf = Buffer.from(await upstream.arrayBuffer());
     if (buf.length > MAX_BYTES) return res.status(413).json({ error: "Archivo demasiado grande" });
 
     // ¿Es realmente un zip? (PK\x03\x04)
@@ -260,52 +270,62 @@ export default async function handler(req, res) {
     } catch {
       return res.status(415).json({ error: "Zip corrupto o ilegible" });
     }
+    // FASE 1 — Solo metadatos: nombre + tamaño declarado en la cabecera del
+    // zip. Antes se descomprimía CADA candidato con getData() para poder
+    // ordenarlos por bytes reales, con lo que un zip con muchas pistas
+    // pagaba la descompresión de todas aunque solo se sirviera una.
     const candidates = [];
     let scanned = 0;
-    let totalUncompressed = 0;
     const MAX_BYTES_TOTAL = MAX_BYTES * 2; // presupuesto agregado conservador (8 MB por zip)
     for (const entry of entries) {
       if (++scanned > MAX_ENTRIES) break;
       if (entry.isDirectory) continue;
       const name = entry.entryName || "";
       if (!ALLOWED_EXT.test(name)) continue;
-      // Tamaño declarado ANTES de descomprimir: defensa adicional al fix de
-      // adm-zip 0.6.1 (que ya acota la asignación a los bytes presentes).
+      // Tamaño declarado ANTES de descomprimir: es el mismo que GetData()
+      // produciría (bytes sin comprimir), así que ordenar por él equivale a
+      // ordenar por data.length sin haber descomprimido nada, y además es
+      // defensa adicional al fix de adm-zip 0.6.1 (zip bomb).
       const declared = entry.header && entry.header.size;
       if (declared && declared > MAX_BYTES) continue;
-      if (totalUncompressed + (declared || 0) > MAX_BYTES_TOTAL) {
-        // No podemos estimar con fiabilidad si no hay declared; si declared no está,
-        // intentamos leer pero mantenemos presupuesto razonable descartando si
-        // al acumular supera el total tras obtener data (más abajo).
-        // Descartamos esta entrada y seguimos leyendo nombres? o cortamos.
-        // Para conservar memoria, saltamos entradas con declared no visible
-        if (!declared) continue;
-        break; // corta el escaneo: el resto probablemente igual o mayor
-      }
-      let data;
-      try {
-        data = entry.getData();
-      } catch {
-        continue; // entrada corrupta: la saltamos, no tiramos el zip entero
-      }
-      if (!data || data.length === 0 || data.length > MAX_BYTES) continue;
-      if (totalUncompressed + data.length > MAX_BYTES_TOTAL) break;
-      totalUncompressed += data.length;
-      candidates.push({ name, data });
-    }
-
-    if (!candidates.length) {
-      return res.status(404).json({ error: "El zip no contiene subtítulos válidos" });
+      candidates.push({ entry, name, declared: declared || 0 });
     }
 
     // Preferimos .srt sobre el resto y, dentro de cada tipo, el más grande
     // (suele ser la pista completa, no un fragmento de prueba).
     candidates.sort((a, b) => {
       const score = (x) => (x.name.toLowerCase().endsWith(".srt") ? 2 : 1);
-      return score(b) - score(a) || b.data.length - a.data.length;
+      return score(b) - score(a) || b.declared - a.declared;
     });
 
-    const chosen = candidates[0];
+    // FASE 2 — Descomprimimos SOLO hasta encontrar la pista elegida (o las
+    // que fallen y haya que descartar). Si getData() lanza o el dato no sirve
+    // (binario, vacío, enorme), seguimos con la siguiente candidata.
+    let chosen = null;
+    let totalUncompressed = 0;
+    for (const cand of candidates) {
+      if (totalUncompressed >= MAX_BYTES_TOTAL) break;
+      let data;
+      try {
+        data = cand.entry.getData();
+      } catch {
+        continue; // entrada corrupta: la saltamos, no tiramos el zip entero
+      }
+      if (!data || data.length === 0 || data.length > MAX_BYTES) continue;
+      if (totalUncompressed + data.length > MAX_BYTES_TOTAL) break;
+      totalUncompressed += data.length;
+      // Un .sub VobSub es BINARIO (muestreo de vídeo, no texto): con la
+      // extensión en la allowlist llegaba al reproductor como text/plain y
+      // salían glifos aleatorios. Los .sub de texto (SubViewer) no llevan
+      // NUL y sí se sirven. Si el elegido es binario, se prueba el siguiente.
+      if (/\.(sub)$/i.test(cand.name) && data.includes(0x00)) continue;
+      chosen = { name: cand.name, data };
+      break;
+    }
+
+    if (!chosen) {
+      return res.status(404).json({ error: "El zip no contiene subtítulos válidos" });
+    }
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Content-Disposition", contentDisposition(chosen.name));
     res.setHeader("Cache-Control", "public, max-age=86400"); // evita re-descargas
