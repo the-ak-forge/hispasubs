@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE } from "./worker.js";
+import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -239,9 +239,10 @@ try {
   check("OS-V3: 5 analizadas -> label Castellano",
     osEntries.filter((e) => e.label === "🇪🇸 Castellano (OS-V3)").length === 5,
     JSON.stringify(osEntries.map((e) => e.label)).slice(0, 200));
-  // v1.4.2 política estricta: la 6ª (fuera del presupuesto de 5) ya NO se
-  // sirve como "sin clasificar" — no se puede verificar que no sea spam.
-  check("v1.4.2: fuera de presupuesto -> NO se sirve (antes 'sin clasificar')",
+  // v1.4.3: se descargan hasta 8 candidatos por fuente, pero se sirven como
+  // máximo 5 LIMPIOS. os6 es la 6ª limpia -> no se sirve (mismo tope de
+  // lista, pero ahora se descargan las de detrás para rellenar si hay spam).
+  check("v1.4.3: más de 5 limpias por fuente -> solo se sirven 5",
     !entries.some((e) => e.url.includes("os6.srt")) &&
       entries.every((e) => e.label !== "📄 Español (sin clasificar · OS-V3)"),
     JSON.stringify(entries.map((e) => e.url)).slice(0, 250));
@@ -344,11 +345,15 @@ try {
     !e10.some((e) => e.url.includes(".rar")), JSON.stringify(e10.map((e) => e.url)).slice(0, 200));
   check("v1.3.1: .zip fuera de la allowlist del proxy descartado",
     !e10.some((e) => e.url.includes("ejemplo.com")), JSON.stringify(e10.map((e) => e.url)).slice(0, 200));
-  const htmlEntry = e10.find((e) => e.url.includes("html.srt"));
-  check("v1.3.1: HTML de error -> 'sin clasificar' (antes caía en Neutro)",
-    htmlEntry?.label === "📄 Español (sin clasificar · OS-V3)", JSON.stringify(htmlEntry).slice(0, 160));
+  // v1.4.3: una descarga que NO es texto de subtítulo (HTML de error) es un
+  // FALLO de verificación: no pasó por el filtro anti-spam, así que ya no se
+  // publica como "📄" (solo pistas verificadas). Sí degrada el TTL.
+  check("v1.4.3: HTML de error -> NO se sirve (falló, no verificado contra spam)",
+    !e10.some((e) => e.url.includes("html.srt")), JSON.stringify(e10.map((e) => e.url)).slice(0, 200));
+  // ...pero el "sin clasificar" ESTABLE (texto válido, 0 matches léxicos) sí
+  // se sirve: sí pasó por el filtro anti-spam.
   const gibEntry = e10.find((e) => e.url.includes("gibberish.srt"));
-  check("v1.3.1: 0 matches léxicos -> 'sin clasificar' (antes caía en Neutro)",
+  check("v1.4.3: 0 matches léxicos (texto válido) -> sigue 'sin clasificar'",
     gibEntry?.label === "📄 Español (sin clasificar · OS-V3)", JSON.stringify(gibEntry).slice(0, 160));
   check("v1.3.1: filtro de idioma acepta variantes (es-ES)",
     e10.some((e) => e.url.includes("eses.srt")), JSON.stringify(e10.map((e) => e.url)).slice(0, 200));
@@ -375,7 +380,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.2", m10.version === "1.4.2", m10.version);
+  check("manifest version 1.4.3", m10.version === "1.4.3", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -543,10 +548,12 @@ try {
   }
 }
 
-// 14) v1.4.2: filtro anti-spam (dos niveles) y política estricta.
+// 14) v1.4.2/1.4.3: filtro anti-spam (dos niveles) y política estricta.
 {
-  check("v1.4.2: presupuesto de análisis por fuente = 5",
+  check("v1.4.3: se sirven como máximo 5 por fuente",
     ANALYSIS_BUDGET_PER_SOURCE === 5, String(ANALYSIS_BUDGET_PER_SOURCE));
+  check("v1.4.3: se descargan hasta 8 candidatos por fuente (sobrepaso)",
+    ANALYSIS_FETCH_PER_SOURCE === 8, String(ANALYSIS_FETCH_PER_SOURCE));
 
   // --- Diccionario FUERTE: una sola coincidencia descarta ---
   const fuertes = [
@@ -630,18 +637,232 @@ try {
       !urls.some((x) => x.includes("spam_tg.srt")), JSON.stringify(urls));
     check("v1.4.2: pista con 2 líneas débiles no se sirve",
       !urls.some((x) => x.includes("spam_weak.srt")), JSON.stringify(urls));
-    check("v1.4.2: fuera de presupuesto no se sirve (política estricta)",
-      !urls.some((x) => x.includes("extra.srt")), JSON.stringify(urls));
-    check("v1.4.2: la pista con UN crédito débil se conserva",
+    check("v1.4.3: el cupo se rellena con las limpias de detrás (extra se sirve)",
+      urls.some((x) => x.includes("extra.srt")), JSON.stringify(urls));
+    check("v1.4.3: la pista con UN crédito débil se conserva",
       urls.some((x) => x.includes("weak1.srt")), JSON.stringify(urls));
-    check("v1.4.2: quedan solo las pistas limpias (3)",
-      ej.length === 3, JSON.stringify(ej.map((e) => [e.url, e.label])));
+    check("v1.4.3: quedan las 4 pistas limpias (2 con spam fuera)",
+      ej.length === 4, JSON.stringify(ej.map((e) => [e.url, e.label])));
     // Clave: los descartes intencionados NO son fallos -> TTL de 2 h intacto.
     check("v1.4.2: descartes por spam no degradan el TTL (sigue 7200)",
       res.headers.get("cache-control") === "public, max-age=7200",
       res.headers.get("cache-control"));
   } finally {
     globalThis.fetch = origFetch4;
+  }
+}
+
+// 15) v1.4.3: correcciones de la auditoría de la 1.4.2 (CPU, falsos positivos,
+// ReDoS y fugas de "solo pistas verificadas").
+{
+  // --- Falsos positivos: frases-CTA que también son diálogo ---
+  // En MITAD del subtítulo se conservan (antes descartaban con una sola línea).
+  const filler = "Una frase cualquiera de relleno.";
+  const mid = (frase) =>
+    [filler, ...Array(40).fill(filler), frase, ...Array(40).fill(filler)].join("\n");
+  const falsosPositivos = [
+    "Instala la aplicación para verlo en HD",
+    "Descarga la app y disfruta sin límites",
+    "Síguenos en Instagram",
+    "Suscríbete a YouTube",
+    "Únete a nuestro grupo",
+    "Únete a nuestra comunidad",
+    "Entra en nuestra página",
+    "Vamos a jugar a las tragamonedas en línea",
+  ];
+  for (const fp of falsosPositivos) {
+    check(`v1.4.3 FP en mitad del diálogo -> conservado: "${fp.slice(0, 34)}"`,
+      spamVerdict(mid(fp)).discard === false, JSON.stringify(spamVerdict(mid(fp))));
+  }
+  // La MISMA frase en cabecera (borde) sí descarta: es publicidad.
+  check("v1.4.3 CTA en el borde -> descarta",
+    spamVerdict("Instala la aplicación para verlo en HD\n" + filler).discard === true,
+    JSON.stringify(spamVerdict("Instala la aplicación para verlo en HD\n" + filler)));
+
+  // --- ReDoS: línea patológica en el borde -> se salta, respuesta inmediata ---
+  const hostil = "a.".repeat(40000) + "z"; // 80.001 caracteres en UNA línea
+  const t0 = performance.now();
+  const veredictoHostil = spamVerdict(hostil);
+  const dtHostil = performance.now() - t0;
+  check("v1.4.3 ReDoS: línea hostil de 80k se salta (<200 ms)",
+    veredictoHostil.discard === false && dtHostil < 200, `${dtHostil.toFixed(0)} ms`);
+
+  // --- Falsos dominios "me"/"pro" ya no chocan con el diálogo ---
+  check("v1.4.3: 'no.Me' + 'todo.Es' ya no son 2 líneas débiles",
+    spamVerdict("no.Me importa lo que digas\ntodo.Es posible").discard === false,
+    JSON.stringify(spamVerdict("no.Me importa lo que digas\ntodo.Es posible")));
+  // ...pero los créditos/URLs reales siguen descartando en pareja.
+  check("v1.4.3: 2 créditos/URL reales siguen descartando",
+    spamVerdict("Subtitulado por Argenteam\nwww.argenteam.net").discard === true,
+    JSON.stringify(spamVerdict("Subtitulado por Argenteam\nwww.argenteam.net")));
+
+  // --- Léxico: fuera raíces abiertas; el dialecto exige término fuerte ---
+  for (const w of ["conducta", "conductor", "conductividad", "estaciones", "estacionario", "Jodie", "Jodorowsky", "Ching-whatever"]) {
+    check(`v1.4.3 léxico: "${w}" ya no puntúa`, scoreText(w) === null, JSON.stringify(scoreText(w)));
+  }
+  check("v1.4.3 léxico: 'condujo' sigue puntuando como ES",
+    (scoreText("condujo el coche")?.esMatches ?? 0) >= 2, JSON.stringify(scoreText("condujo el coche")));
+  check("v1.4.3 léxico: 'estacionó' sigue puntuando como LAT",
+    (scoreText("estacionó el carro")?.latMatches ?? 0) >= 2, JSON.stringify(scoreText("estacionó el carro")));
+  check("v1.4.3 léxico: 9× 'ustedes' ya no da Latino sin término fuerte",
+    scoreText(Array(9).fill("ustedes").join(" ")) === null,
+    JSON.stringify(scoreText(Array(9).fill("ustedes").join(" "))));
+
+  // --- PROXY_URL exige https (antes aceptaba http://) ---
+  const origFetch5 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("api.subdl.com")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        status: true, subtitles: [{ url: "/subtitle/1-2.zip" }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await worker.fetch(
+      new Request(`${base}/${b64url({ subdlKey: "k" })}/subtitles/movie/tt7770001.json`),
+      { PROXY_URL: "http://proxy.inseguro.example/proxy" }, {});
+    const httpEntries = (await res.json()).subtitles || [];
+    check("v1.4.3: PROXY_URL http:// se rechaza (cae al proxy por defecto)",
+      httpEntries.some((e) => e.url.includes("hispasubs.vercel.app/proxy?zipUrl=")),
+      JSON.stringify(httpEntries.map((e) => e.url)).slice(0, 200));
+  } finally {
+    globalThis.fetch = origFetch5;
+  }
+
+  // --- Fuga: SRT UTF-16 con BOM y spam -> se decodifica y se descarta ---
+  const origFetch6 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({ subtitles: [
+        { id: "u1", url: "https://subs5.strem.io/utf16.srt", lang: "spa" },
+      ] }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("utf16.srt")) {
+      const srt = "1\n00:00:01,000 --> 00:00:02,000\nRegístrate en bet365 y gana ya\n";
+      const b = new Uint8Array(2 + srt.length * 2);
+      b[0] = 0xff; b[1] = 0xfe; // BOM UTF-16LE
+      for (let i = 0; i < srt.length; i++) {
+        const c = srt.charCodeAt(i);
+        b[2 + i * 2] = c & 0xff;
+        b[2 + i * 2 + 1] = c >> 8;
+      }
+      return Promise.resolve(new Response(b, { status: 200 }));
+    }
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get("/subtitles/movie/tt7770002.json");
+    const utf16 = (await res.json()).subtitles || [];
+    check("v1.4.3: SRT UTF-16 con BOM y bet365 -> decodificado y descartado",
+      !utf16.some((e) => e.url.includes("utf16.srt")), JSON.stringify(utf16));
+  } finally {
+    globalThis.fetch = origFetch6;
+  }
+
+  // --- Fuga: descarga fallida (503) no se sirve como "📄" (no verificada) ---
+  const origFetch7 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({ subtitles: [
+        { id: "f1", url: "https://subs5.strem.io/boom.srt", lang: "spa" },
+        { id: "f2", url: "https://subs5.strem.io/okf.srt", lang: "spa" },
+      ] }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("boom.srt")) return Promise.resolve(new Response("nope", { status: 503 }));
+    if (u.includes("okf.srt")) return Promise.resolve(textResp(TXT_CAST));
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get("/subtitles/movie/tt7770003.json");
+    const fb = (await res.json()).subtitles || [];
+    check("v1.4.3: descarga 503 -> NO se sirve (no verificada contra spam)",
+      !fb.some((e) => e.url.includes("boom.srt")), JSON.stringify(fb.map((e) => e.url)));
+    check("v1.4.3: el fallo sí degrada el TTL (sigue 60 s)",
+      res.headers.get("cache-control") === "public, max-age=60", res.headers.get("cache-control"));
+  } finally {
+    globalThis.fetch = origFetch7;
+  }
+
+  // --- sourceFailed: una fuente caída baja el TTL aunque la otra sirva ---
+  const origFetch8 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) return Promise.reject(new Error("OS-V3 down"));
+    if (u.includes("api.subdl.com")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        status: true, subtitles: [{ url: "https://dl.subdl.com/subtitle/9-9.srt" }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("dl.subdl.com/subtitle/9-9.srt")) return Promise.resolve(textResp(TXT_CAST));
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get(`/${b64url({ subdlKey: "k" })}/subtitles/movie/tt7770004.json`);
+    const sf = (await res.json()).subtitles || [];
+    check("v1.4.3: fuente caída + otra con resultados -> TTL 60 s (no 7200)",
+      sf.length === 1 && res.headers.get("cache-control") === "public, max-age=60",
+      `${sf.length} subs · ${res.headers.get("cache-control")}`);
+  } finally {
+    globalThis.fetch = origFetch8;
+  }
+
+  // --- Escenario del informe: 5 con spam delante y limpias detrás -> se sirven ---
+  const origFetch9 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      const subtitles = [];
+      for (let i = 1; i <= 5; i++) subtitles.push({ id: `s${i}`, url: `https://subs5.strem.io/spam${i}.srt`, lang: "spa" });
+      for (let i = 1; i <= 3; i++) subtitles.push({ id: `c${i}`, url: `https://subs5.strem.io/limpia${i}.srt`, lang: "spa" });
+      return Promise.resolve(new Response(JSON.stringify({ subtitles }),
+        { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (/spam\d\.srt/.test(u)) {
+      return Promise.resolve(textResp("1\n00:00:01,000 --> 00:00:02,000\nVisita www.casino-gana.com\n\ncoche vosotros"));
+    }
+    if (/limpia\d\.srt/.test(u)) return Promise.resolve(textResp(TXT_CAST));
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get("/subtitles/movie/tt7770005.json");
+    const mix = (await res.json()).subtitles || [];
+    check("v1.4.3: 5 con spam + 3 limpias -> se sirven las 3 limpias (antes 0)",
+      mix.length === 3 && mix.every((e) => e.url.includes("limpia")),
+      JSON.stringify(mix.map((e) => e.url)));
+  } finally {
+    globalThis.fetch = origFetch9;
+  }
+
+  // --- Modo sombra SPAM_FILTER=log: mide sin descartar ---
+  const SHADOW_SPAM = "1\n00:00:01,000 --> 00:00:03,000\nÚnete a nuestro canal t.me/rippeos\n\ncoche vosotros ordenador vale";
+  const origFetch10 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({ subtitles: [
+        { id: "sp", url: "https://subs5.strem.io/spam_shadow.srt", lang: "spa" },
+      ] }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("spam_shadow.srt")) return Promise.resolve(textResp(SHADOW_SPAM));
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await worker.fetch(new Request(`${base}/subtitles/movie/tt7770006.json`), { SPAM_FILTER: "log" }, {});
+    const shadow = (await res.json()).subtitles || [];
+    check("v1.4.3: SPAM_FILTER=log sirve la pista que se habría descartado",
+      shadow.some((e) => e.url.includes("spam_shadow.srt")), JSON.stringify(shadow.map((e) => e.url)));
+  } finally {
+    globalThis.fetch = origFetch10;
   }
 }
 

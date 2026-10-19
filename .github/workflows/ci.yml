@@ -38,5 +38,7 @@ jobs:
 
       # wrangler.toml inválido (sintaxis, bindings, assets) solo se detecta al
       # desplegar; --dry-run valida la configuración sin publicar nada.
+      # Fijado a la major 4: `npx wrangler` sin versión puede saltar a una
+      # major nueva (5) y romper el build sin que nadie toque este repo.
       - name: Validar configuración de Cloudflare (wrangler dry-run)
-        run: npx wrangler deploy --dry-run
+        run: npx wrangler@4 deploy --dry-run
