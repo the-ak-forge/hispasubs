@@ -380,7 +380,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.7", m10.version === "1.4.7", m10.version);
+  check("manifest version 1.4.8", m10.version === "1.4.8", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1291,6 +1291,82 @@ try {
       `len=${s404Partial.length} cc=${res.headers.get("cache-control")}`);
   } finally {
     globalThis.fetch = origFetch19;
+  }
+}
+
+// 20) v1.4.8: distinción de 410/422 vs 404 de proxy en zips, 'os' sensible a
+// mayúsculas y débil, guarda de portugués (ã/õ), lookahead 'manejo de' y
+// strongTotal en scoreText.
+{
+  // --- 20a: 'OS' en mayúsculas (Operating System) no suma para España ---
+  const techLat = `${"OS ".repeat(40)}computadora computadora computadora computadora computadora`;
+  const scoredTech = scoreText(techLat);
+  check("v1.4.8: 40× 'OS' (mayúsculas) + 5× 'computadora' -> 🇲🇽 Latino (es=0)",
+    scoredTech?.flag === "🇲🇽 Latino" && scoredTech?.esMatches === 0 && scoredTech?.strongTotal === 5,
+    JSON.stringify(scoredTech));
+
+  // 'os' solo (religioso/formal) es débil (0,25): sin término fuerte devuelve null (📄).
+  check("v1.4.8: 'os' religioso/formal sin término fuerte -> null (sin clasificar)",
+    scoreText("Dios os bendiga, os dejo la paz, os digo") === null,
+    JSON.stringify(scoreText("Dios os bendiga, os dejo la paz, os digo")));
+
+  // --- 20b: Guarda de portugués (≥10 apariciones de ã/õ -> null) ---
+  const ptSub = "Não tenhão ilusão, o caminhão está no coração da nação, irmão, então atenção ao portão: carro celular estacionamento";
+  check("v1.4.8: subtítulo en portugués (≥10 ã/õ) con 'carro/celular' -> null (no da 🇲🇽 Latino)",
+    scoreText(ptSub) === null, JSON.stringify(scoreText(ptSub)));
+
+  // --- 20c: Lookahead 'manejo de' excluido ---
+  check("v1.4.8: 'manejo de crisis / manejo de datos' NO puntúa como conducir LAT",
+    scoreText("El manejo de crisis, el manejo de datos y el manejo de presupuesto") === null,
+    JSON.stringify(scoreText("El manejo de crisis, el manejo de datos y el manejo de presupuesto")));
+
+  // --- 20d: En zips proxificados, 410/422 descartan sin degradar TTL, pero un
+  // 404 crudo (proxy mal enrutado o caído) SÍ cuenta como FAILED (TTL 60s) ---
+  const origFetch20 = globalThis.fetch;
+  let proxyStatus = 422;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("api.subdl.com")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        status: true,
+        subtitles: [{ url: "/subtitle/pack-missing.zip" }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        subtitles: [{ id: "o1", url: "https://subs5.strem.io/o1.srt", lang: "spa" }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("proxy?zipUrl=")) {
+      return Promise.resolve(new Response("err", { status: proxyStatus }));
+    }
+    if (u.includes("subs5.strem.io/o1.srt")) return Promise.resolve(textResp(TXT_CAST));
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    proxyStatus = 422;
+    res = await get(`/${b64url({ subdlKey: "k" })}/subtitles/series/tt0903747:1:7.json`);
+    const s422 = (await res.json()).subtitles || [];
+    check("v1.4.8: zip con 422 (pack sin el episodio) se descarta sin degradar TTL (7200s)",
+      s422.length === 1 && res.headers.get("cache-control") === "public, max-age=7200",
+      `len=${s422.length} cc=${res.headers.get("cache-control")}`);
+
+    proxyStatus = 410;
+    res = await get(`/${b64url({ subdlKey: "k" })}/subtitles/series/tt0903747:1:8.json`);
+    const s410 = (await res.json()).subtitles || [];
+    check("v1.4.8: zip con 410 (enlace muerto en SubDL) se descarta sin degradar TTL (7200s)",
+      s410.length === 1 && res.headers.get("cache-control") === "public, max-age=7200",
+      `len=${s410.length} cc=${res.headers.get("cache-control")}`);
+
+    proxyStatus = 404;
+    res = await get(`/${b64url({ subdlKey: "k" })}/subtitles/series/tt0903747:1:9.json`);
+    const sProxy404 = (await res.json()).subtitles || [];
+    check("v1.4.8: zip con 404 crudo (proxy caído o PROXY_URL rota) SÍ degrada TTL a 60s",
+      sProxy404.length === 1 && res.headers.get("cache-control") === "public, max-age=60",
+      `len=${sProxy404.length} cc=${res.headers.get("cache-control")}`);
+  } finally {
+    globalThis.fetch = origFetch20;
   }
 }
 

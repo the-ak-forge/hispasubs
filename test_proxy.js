@@ -260,13 +260,13 @@ section("5. Extracción del zip");
     res1x.statusCode === 200 && String(res1x.body).includes("formato 1x02 correcto"),
     String(res1x.body).slice(0, 80));
 
-  // v1.4.6: Si el pack tiene otros episodios explícitos (S01E03, S01E10,
-  // S01E30) y se pide &s=1&e=99 (que NO está en el zip), devuelve 404 en vez
-  // de servir el episodio equivocado más grande.
+  // v1.4.6 / v1.4.8: Si el pack tiene otros episodios explícitos (S01E03, S01E10,
+  // S01E30) y se pide &s=1&e=99 (que NO está en el zip), devuelve 422 en vez
+  // de servir el episodio equivocado más grande (y distinto de un 404 de ruta).
   fetchImpl = () => new Response(seasonPack, { status: 200 });
   const resMissingEp = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/pack.zip") + "&s=1&e=99");
-  check("v1.4.6: pack con otros episodios pero sin el pedido (&s=1&e=99) -> 404 (no sirve otro cap)",
-    resMissingEp.statusCode === 404, `status=${resMissingEp.statusCode}`);
+  check("v1.4.8: pack con otros episodios pero sin el pedido (&s=1&e=99) -> 422 (no sirve otro cap)",
+    resMissingEp.statusCode === 422, `status=${resMissingEp.statusCode}`);
 
   // Pero si el zip trae archivos con nombres neutros (sin token SxxExx/1x02),
   // sigue sirviendo el .srt más grande como fallback legítimo.
@@ -286,22 +286,39 @@ section("5. Extracción del zip");
   check("v1.4.6: soporta nombres 'Ep 03' / 'E03' sin temporada",
     resEpOnly.statusCode === 200 && String(resEpOnly.body).includes("anime episodio 3 ok"));
 
-  // v1.4.7: Nombres multiepisodio (S01E03E04 / S01E03-E04) casan tanto con e=3 como con e=4.
+  // v1.4.7 / v1.4.8: Nombres multiepisodio (S01E03E04 / S01E03-E04 / S01E03-04 / S01E03+E04)
   const multiEpPack = buildZip([
     ["Show.S01E01.srt", "ep 1\n"],
     ["Show.S01E03E04.srt", "doble episodio 3 y 4 ok\n"],
     ["Show.S01E05-E06.srt", "doble episodio 5 y 6 ConGuion ok\n"],
+    ["Show.S01E07-08.srt", "doble episodio 7 y 8 SinE ok\n"],
+    ["Show.S01E09+E10.srt", "doble episodio 9 y 10 ConMas ok\n"],
   ]);
   fetchImpl = () => new Response(multiEpPack, { status: 200 });
   const resMulti3 = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/multi.zip") + "&s=1&e=3");
   const resMulti4 = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/multi.zip") + "&s=1&e=4");
   const resMulti6 = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/multi.zip") + "&s=1&e=6");
+  const resMulti8 = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/multi.zip") + "&s=1&e=8");
+  const resMulti10 = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/multi.zip") + "&s=1&e=10");
   check("v1.4.7: S01E03E04 casa al pedir e=3",
     resMulti3.statusCode === 200 && String(resMulti3.body).includes("doble episodio 3 y 4 ok"));
   check("v1.4.7: S01E03E04 casa también al pedir e=4 (segundo episodio del par)",
     resMulti4.statusCode === 200 && String(resMulti4.body).includes("doble episodio 3 y 4 ok"));
   check("v1.4.7: S01E05-E06 casa al pedir e=6",
     resMulti6.statusCode === 200 && String(resMulti6.body).includes("doble episodio 5 y 6 ConGuion ok"));
+  check("v1.4.8: S01E07-08 (sin segunda E) casa al pedir e=8",
+    resMulti8.statusCode === 200 && String(resMulti8.body).includes("doble episodio 7 y 8 SinE ok"));
+  check("v1.4.8: S01E09+E10 (con '+') casa al pedir e=10",
+    resMulti10.statusCode === 200 && String(resMulti10.body).includes("doble episodio 9 y 10 ConMas ok"));
+
+  // Anti-ReDoS: nombre con 100 dígitos tras S01E01- tarda <50 ms (matcher lineal O(n)).
+  const hostileZip = buildZip([[`Show.S01E01-${"1234567890".repeat(10)}.srt`, "hostil\n"]]);
+  fetchImpl = () => new Response(hostileZip, { status: 200 });
+  const tHostile = Date.now();
+  const resHostile = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/h.zip") + "&s=1&e=99");
+  const dtHostile = Date.now() - tHostile;
+  check("v1.4.8 Anti-ReDoS: matcher multiepisodio lineal (<50 ms con 100 dígitos)",
+    resHostile.statusCode === 422 && dtHostile < 50, `dt=${dtHostile}ms status=${resHostile.statusCode}`);
 }
 {
   const zip = buildZip([["a.vtt", "WEBVTT\n"], ["b.srt", "1\n00:00:01,000 --> 00:00:02,000\nx\n"], ["c_small.srt", "peque\n"], ["d_big.srt", "g".repeat(5000)]]);
@@ -328,7 +345,7 @@ section("5. Extracción del zip");
   const zip = buildZip([["leeme.txt", "no soy un subtitulo"], ["nota.md", "tampoco"]]);
   fetchImpl = () => new Response(zip, { status: 200 });
   const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
-  check("zip sin subtítulos -> 404", res.statusCode === 404);
+  check("zip sin subtítulos -> 422", res.statusCode === 422);
 }
 {
   // Stremio no descomprime .rar: el proxy tampoco debe devolverlos.
@@ -341,14 +358,14 @@ section("5. Extracción del zip");
   const zip = buildZip([["solo.rar", "Rar!\x1a"]]);
   fetchImpl = () => new Response(zip, { status: 200 });
   const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
-  check("zip solo con .rar -> 404", res.statusCode === 404);
+  check("zip solo con .rar -> 422", res.statusCode === 422);
 }
 {
   // Declarado > MAX_BYTES: se descarta ANTES de descomprimirlo.
   const zip = buildZip([["gigante.srt", "a".repeat(MAX_BYTES + 1024)]]);
   fetchImpl = () => new Response(zip, { status: 200 });
   const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
-  check("entrada declarada > MAX_BYTES -> 404 (no se descomprime)", res.statusCode === 404);
+  check("entrada declarada > MAX_BYTES -> 422 (no se descomprime)", res.statusCode === 422);
 }
 {
   fetchImpl = () => new Response(Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x62, 0x61, 0x73, 0x75]), { status: 200 });
@@ -368,7 +385,13 @@ section("5. Extracción del zip");
 {
   fetchImpl = () => new Response("boom", { status: 500 });
   const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
-  check("origen con error -> 502", res.statusCode === 502 && bodyJson(res)?.error === "Origen respondió 500");
+  check("origen con error 500 -> 502", res.statusCode === 502 && bodyJson(res)?.error === "Origen respondió 500");
+}
+{
+  fetchImpl = () => new Response("dead", { status: 404 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
+  check("v1.4.8: origen con 404 (zip muerto en SubDL) -> 410 Gone",
+    res.statusCode === 410 && bodyJson(res)?.error === "Origen respondió 404");
 }
 
 // ===========================================================================
@@ -410,7 +433,7 @@ section("5b. Lote 4: timeout del cuerpo y .sub binario");
   const zip = buildZip([["vobsub.sub", vobsub]]);
   fetchImpl = () => new Response(zip, { status: 200 });
   const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
-  check("zip solo con .sub binario (VobSub) -> 404", res.statusCode === 404, `${res.statusCode}`);
+  check("zip solo con .sub binario (VobSub) -> 422", res.statusCode === 422, `${res.statusCode}`);
 }
 {
   // Un .sub de texto (SubViewer: sin bytes NUL) sí es servible.
@@ -516,7 +539,7 @@ section("5c. v1.4.1: readCapped, .sub UTF-16 y zipUrl duplicado");
   const zip = buildZip([["vobsub.sub", vobsub]]);
   fetchImpl = () => new Response(zip, { status: 200 });
   const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
-  check("VobSub sin BOM UTF-16 sigue descartado -> 404", res.statusCode === 404, `${res.statusCode}`);
+  check("VobSub sin BOM UTF-16 sigue descartado -> 422", res.statusCode === 422, `${res.statusCode}`);
 }
 {
   // zipUrl duplicado en la query -> req.query.zipUrl es un Array. Sin la

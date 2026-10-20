@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.7
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.8
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -16,6 +16,17 @@
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
+//
+// v1.4.8 (20/10/2026):
+//  - [CÓDIGOS HTTP] El proxy distingue sus descartes de contenido de un 404
+//    de plataforma (ruta rota o PROXY_URL mal configurada): devuelve 422
+//    cuando el zip no contiene subtítulos válidos (o falta el episodio en el
+//    pack) y 410 cuando el origen responde 404/410 (enlace muerto en SubDL).
+//    Así el Worker descarta 410/422 sin penalizar el TTL, pero trata un 404
+//    crudo en la URL del proxy como fallo de infraestructura (TTL 60 s).
+//  - [SERIES/ReDoS] Matcher multiepisodio lineal O(n) en dos pasos (SE_HEAD +
+//    EP_NEXT sticky /iy): soporta además S01E03-04 y S01E03+E04 sin riesgo de
+//    backtracking exponencial ante nombres con decenas de dígitos.
 //
 // v1.4.7 (20/10/2026):
 //  - [SERIES] epExactRe soporta nombres multiepisodio (p. ej. S01E03E04,
@@ -109,7 +120,7 @@ const MAX_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
-const USER_AGENT = "HispaSubs/1.4.7";
+const USER_AGENT = "HispaSubs/1.4.8";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 
@@ -405,7 +416,8 @@ export default async function handler(req, res) {
           continue;
         }
         if (!upstream.ok) {
-          return res.status(502).json({ error: `Origen respondió ${upstream.status}` });
+          const code = upstream.status === 404 || upstream.status === 410 ? 410 : 502;
+          return res.status(code).json({ error: `Origen respondió ${upstream.status}` });
         }
         const len = Number(upstream.headers.get("content-length") || 0);
         if (len && len > MAX_BYTES) {
@@ -468,12 +480,25 @@ export default async function handler(req, res) {
     const hasSE = /^\d+$/.test(rawS) && /^\d+$/.test(rawE);
     const sNum = hasSE ? Number(rawS) : 0;
     const eNum = hasSE ? Number(rawE) : 0;
-    const epExactRe = hasSE
-      ? new RegExp(
-          `(?:(?<![0-9a-z])s0*${sNum}(?:[._\\s-]*e\\d+)*[._\\s-]*e0*${eNum}|(?<![0-9])0*${sNum}(?:[._\\s-]*x\\d+)*x0*${eNum})(?![0-9])`,
-          "i"
-        )
-      : null;
+    // Matcher lineal O(n) en dos pasos (SE_HEAD + EP_NEXT sticky /iy): cubre
+    // S01E03, 1x03 y multiepisodios (S01E03E04, S01E03-E04, S01E03-04,
+    // S01E03+E04, 1x03x04) sin backtracking exponencial en cadenas de dígitos.
+    const SE_HEAD = /(?<![0-9a-z])s0*(\d+)[._\s-]*e0*(\d+)(?![0-9])|(?<![0-9])0*(\d+)x0*(\d+)(?![0-9])/gi;
+    const EP_NEXT = /(?:[-+][ex]?|[._\s]*[ex])0*(\d{1,3})(?![0-9])/iy;
+    const hasExactEp = (name) => {
+      SE_HEAD.lastIndex = 0;
+      for (let m; (m = SE_HEAD.exec(name)); ) {
+        const s = Number(m[1] ?? m[3]);
+        const e = Number(m[2] ?? m[4]);
+        if (s !== sNum) continue;
+        if (e === eNum) return true;
+        EP_NEXT.lastIndex = SE_HEAD.lastIndex;
+        for (let n; (n = EP_NEXT.exec(name)); ) {
+          if (Number(n[1]) === eNum) return true;
+        }
+      }
+      return false;
+    };
     const epLooseRe = hasSE
       ? new RegExp(`(?<![0-9a-z])(?:ep(?:isodio)?|cap(?:[ií]tulo)?|e)[._\\s-]*0*${eNum}(?![0-9a-z])`, "i")
       : null;
@@ -481,7 +506,7 @@ export default async function handler(req, res) {
 
     const epRank = (name) => {
       if (!hasSE) return 0;
-      if (epExactRe.test(name)) return 2;
+      if (hasExactEp(name)) return 2;
       if (!anySeTokenRe.test(name) && epLooseRe.test(name)) return 1;
       if (epLooseRe.test(name) && !/(?<![0-9a-z])s\d+[._\s-]*e\d+|(?<![0-9])\d+x\d+/i.test(name)) return 1;
       return 0;
@@ -542,7 +567,7 @@ export default async function handler(req, res) {
     }
 
     if (!chosen) {
-      return res.status(404).json({ error: "El zip no contiene subtítulos válidos" });
+      return res.status(422).json({ error: "El zip no contiene subtítulos válidos" });
     }
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Content-Disposition", contentDisposition(chosen.name));

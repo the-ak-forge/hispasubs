@@ -1,6 +1,25 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.7
+// HispaSubs — Cloudflare Worker v1.4.8
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.8 (20/10/2026) — auditoría externa de la 1.4.7:
+//  - [TTL / PROXY 410/422] Se distingue entre descarte de contenido y caída de
+//    plataforma del proxy: en URLs directas (!isZip) se descartan sin FAILED
+//    los HTTP 404/410; en URLs proxificadas (isZip) solo se descartan HTTP 410
+//    (enlace muerto en SubDL mapeado por el proxy) y HTTP 422 (zip sin
+//    subtítulos válidos o sin el episodio pedido), mientras que un HTTP 404
+//    crudo en la URL del proxy (ruta rota / PROXY_URL mal configurada) sí
+//    marca FAILED y baja el TTL a 60 s. El log resumen incluye `descartes404`.
+//  - [LÉXICO] `os` pasa a un regex débil sensible a mayúsculas (`[oO]s`, sin
+//    flag `i`, peso 0,25) para que 40 apariciones de "OS" (sistema operativo)
+//    o "os" religioso no sumen ni vuelquen un título técnico latino. `fome`
+//    pasa a DICT_LAT_WEAK (0,25), y `scoreText` añade una guarda contra
+//    subtítulos en portugués mal etiquetados (≥10 apariciones de `ã`/`õ` ->
+//    null / 📄 sin clasificar, evitando que "carro"/"celular" en portugués
+//    den 🇲🇽 Latino).
+//  - [OBSERVABILIDAD] Cada clasificación registra el reparto real (`flag`,
+//    `es`, `lat`, `strong`) sin volcar texto del subtítulo, permitiendo medir
+//    en producción la distribución de puntuaciones.
 //
 // v1.4.7 (20/10/2026) — auditoría externa de la 1.4.6:
 //  - [LATENCIA] Presupuesto temporal compartido entre las 2 oleadas
@@ -208,10 +227,16 @@
 // como Latino—. Cuentan 0,25 en vez de 1 para que una palabra suelta no
 // decida la clasificación; solo pesan cuando aparecen muchas veces.
 const WEAK_WEIGHT = 0.25;
-const DICT_ES = /(?<![\p{L}\p{N}_])(?:vosotros|os|ordenador(?:es)?|coche[s]?|gilipollas|hostias?|chaval(?:es)?|foll(?:ar|a|an|en|ó|o|ado|ando)|guay|m[oó]vil(?:es)?(?!\s+del\s+(?:crimen|asesinato|delito|robo|ataque)|\s+perpetuo)|patata[s]?|zumo[s]?|aparqu[\p{L}]*|aparc[\p{L}]*|condu(?:cir|zco|zca|zcan|ces|ce|cen|jiste|jeron|jo|cía|cías|cíamos|cían|ciendo|cido)(?!\s+a\s+(?:nada|eso|esto|ninguna\s+parte|la\s+ruina|un\s+desastre|una?\s+conclusi[oó]n))|enfad[\p{L}]*|nevera[s]?|jol[ií]n|mol(?:a|an)|ten[eé]is|sois|est[aá]is|mogoll[oó]n|curr(?:ar|o|as|a|amos|áis|an|ando|ado|ante[s]?)|flip(?:ar|o|as|a|amos|áis|an|é|ó|ando|ado|ante[s]?))(?![\p{L}\p{N}_])/giu;
-const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?(?!\s+de\s+(?:(?:la\s+)?compra|combate)|\s+blindado)|auto(?:s)?|pendej[\p{L}]*|ching(?:ar|a|as|an|o|ó|aron|aba|aban|ado|ada|ando|ón|ones|ue|ues|uen|ué|adera)|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion(?:ar|a|as|an|ó|é|aste|aron|aba|abas|ábamos|aban|ado|ada|ando|amiento)|manej[\p{L}]*|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|carajo|[oó]rale|chido|bacano|bolud[\p{L}]*|pelotud[\p{L}]*|pibe[s]?|quilombo[s]?|tenés|querés|podés|sabés|decís|vení|mirá|we[oó]n(?:es|a|as)?|huev[oó]n(?:es|a|as)?|cachai|fome[s]?|polol[oa][s]?|parce(?:ro|ra|ros|ras)?|chimba[s]?|chamo[s]?)(?![\p{L}\p{N}_])/giu;
+const DICT_ES = /(?<![\p{L}\p{N}_])(?:vosotros|ordenador(?:es)?|coche[s]?|gilipollas|hostias?|chaval(?:es)?|foll(?:ar|a|an|en|ó|o|ado|ando)|guay|m[oó]vil(?:es)?(?!\s+del\s+(?:crimen|asesinato|delito|robo|ataque)|\s+perpetuo)|patata[s]?|zumo[s]?|aparqu[\p{L}]*|aparc[\p{L}]*|condu(?:cir|zco|zca|zcan|ces|ce|cen|jiste|jeron|jo|cía|cías|cíamos|cían|ciendo|cido)(?!\s+a\s+(?:nada|eso|esto|ninguna\s+parte|la\s+ruina|un\s+desastre|una?\s+conclusi[oó]n))|enfad[\p{L}]*|nevera[s]?|jol[ií]n|mol(?:a|an)|ten[eé]is|sois|est[aá]is|mogoll[oó]n|curr(?:ar|o|as|a|amos|áis|an|ando|ado|ante[s]?)|flip(?:ar|o|as|a|amos|áis|an|é|ó|ando|ado|ante[s]?))(?![\p{L}\p{N}_])/giu;
+const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?(?!\s+de\s+(?:(?:la\s+)?compra|combate)|\s+blindado)|auto(?:s)?|pendej[\p{L}]*|ching(?:ar|a|as|an|o|ó|aron|aba|aban|ado|ada|ando|ón|ones|ue|ues|uen|ué|adera)|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion(?:ar|a|as|an|ó|é|aste|aron|aba|abas|ábamos|aban|ado|ada|ando|amiento)|manej[\p{L}]*(?!\s+de(?![\p{L}\p{N}_]))|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|carajo|[oó]rale|chido|bacano|bolud[\p{L}]*|pelotud[\p{L}]*|pibe[s]?|quilombo[s]?|tenés|querés|podés|sabés|decís|vení|mirá|we[oó]n(?:es|a|as)?|huev[oó]n(?:es|a|as)?|cachai|polol[oa][s]?|parce(?:ro|ra|ros|ras)?|chimba[s]?|chamo[s]?)(?![\p{L}\p{N}_])/giu;
 const DICT_ES_WEAK = /(?<![\p{L}\p{N}_])(?:vale|jod(?:e|es|en|emos|er|a|as|an|ía|ías|íamos|ían|ió|ieron|iendo|ido|ida|idos|idas))(?![\p{L}\p{N}_])/giu;
-const DICT_LAT_WEAK = /(?<![\p{L}\p{N}_])(?:papa[s]?|neta[s]?|ustedes)(?![\p{L}\p{N}_])/giu;
+// Sin flag `i`: "os" / "Os" (inicio de frase) suman 0,25 para España, pero
+// "OS" en mayúsculas (Operating System) no casa nunca.
+const DICT_ES_WEAK_CS = /(?<![\p{L}\p{N}_])[oO]s(?![\p{L}\p{N}_])/gu;
+const DICT_LAT_WEAK = /(?<![\p{L}\p{N}_])(?:papa[s]?|neta[s]?|ustedes|fome[s]?)(?![\p{L}\p{N}_])/giu;
+// Guarda contra archivos en portugués mal etiquetados como español (donde
+// "carro", "celular" o "estacionamento" darían falso positivo Latino).
+const PT_TILDE_RE = /[ãõ]/giu;
 
 // Túnel Node.js en Vercel como motor de extracción de zips.
 // IMPORTANTE: el proxy DEBE llevar allowlist de hosts (ver api/proxy.js),
@@ -544,7 +569,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.7",
+  version: "1.4.8",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -699,6 +724,7 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
 // sin que el flag llegue nunca a Stremio. (Las pistas sin presupuesto ya no se
 // sirven: se descartan en vez de publicarse sin verificar.)
 const FAILED = Symbol.for("hispasubs.failed");
+const DISCARDED_404 = Symbol.for("hispasubs.discarded404");
 const unclassified = (sub, finalUrl, failed = false) => ({
   id: sub.id,
   url: finalUrl,
@@ -712,6 +738,10 @@ const unclassified = (sub, finalUrl, failed = false) => ({
 // ambiguos). Devuelve null cuando NO hay datos suficientes para afirmar nada
 // (📄 "sin clasificar"); nunca decide por defecto.
 const scoreText = (text) => {
+  // Guarda contra portugués mal etiquetado como español: en español no se usan
+  // "ã"/"õ"; con ≥10 apariciones es portugués y no debe salir 🇲🇽 por "carro"/"celular".
+  if ((text.match(PT_TILDE_RE) || []).length >= 10) return null;
+
   // Los términos ambiguos (WEAK) valen 0,25: "No vale la pena", "el Papa",
   // "ganancia neta" o un "ustedes" formal de España ya no deciden solos.
   const score = (dict, weight) => (text.match(dict) || []).length * weight;
@@ -720,7 +750,7 @@ const scoreText = (text) => {
   // recorrer, duplicando el coste léxico).
   const strongEs = score(DICT_ES, 1);
   const strongLat = score(DICT_LAT, 1);
-  const esMatches = strongEs + score(DICT_ES_WEAK, WEAK_WEIGHT);
+  const esMatches = strongEs + score(DICT_ES_WEAK, WEAK_WEIGHT) + score(DICT_ES_WEAK_CS, WEAK_WEIGHT);
   const latMatches = strongLat + score(DICT_LAT_WEAK, WEAK_WEIGHT);
   const strongTotal = strongEs + strongLat;
   const total = esMatches + latMatches;
@@ -738,7 +768,7 @@ const scoreText = (text) => {
   let flag = "🌎 Neutro";
   if (esMatches > latMatches + margin) flag = "🇪🇸 Castellano";
   else if (latMatches > esMatches + margin) flag = "🇲🇽 Latino";
-  return { esMatches, latMatches, total, flag };
+  return { esMatches, latMatches, strongTotal, total, flag };
 };
 
 // ---------------------------------------------------------------------------
@@ -928,21 +958,30 @@ const classifySubtitle = async (
 
     const scored = scoreText(text);
     if (!scored) {
-      // Ni una sola palabra del léxico: probablemente no sea un subtítulo en
-      // español ni siquiera (idioma erróneo, fichero de créditos...). El texto
-      // llegó y se analizó sin error → no es fallo transitorio → TTL normal.
+      // Ni una sola palabra del léxico (o descartado por guarda de portugués):
+      // el texto llegó y se analizó sin error → no es fallo transitorio → TTL normal.
+      console.log(`[classify] ${sub.source} -> 📄 sin clasificar (es=0 lat=0 strong=0)`);
       return unclassified(sub, finalUrl);
     }
 
+    console.log(
+      `[classify] ${sub.source} -> ${scored.flag} (es=${scored.esMatches} lat=${scored.latMatches} strong=${scored.strongTotal})`
+    );
     return { id: sub.id, url: finalUrl, lang: LANG_ISO_ES, label: `${scored.flag} (${sub.source})` };
   } catch (error) {
     console.error("[classify]", sub.source, error.message);
-    // 404 (enlace muerto o pack de temporada en el proxy sin el episodio
-    // pedido) es una ausencia permanente, no un fallo transitorio de red: se
-    // descarta como `null` sin marcar FAILED para no degradar el TTL a 60 s
-    // cuando hay pistas válidas (y permitiendo que la 2ª oleada rellene).
-    if (/\bHTTP 404\b/.test(error.message)) return null;
-    // Timeout / red caída / 429 / 5xx: fallo transitorio → TTL corto para reintentar pronto.
+    // Descarte permanente sin penalizar el TTL:
+    //  - En URL directa (!isZip): HTTP 404 o 410 (enlace muerto en el CDN).
+    //  - En URL del proxy (isZip): HTTP 410 (origen 404/410 mapeado por el
+    //    proxy) o HTTP 422 (el zip no tiene subtítulos válidos / falta el
+    //    episodio en el pack). Un HTTP 404 crudo sobre `isZip` significa que
+    //    el propio endpoint del proxy no existe (PROXY_URL rota o caída de
+    //    enrutamiento) y SÍ debe contar como FAILED (TTL 60 s).
+    const isPermanentDiscard = isZip
+      ? /\bHTTP 4(?:10|22)\b/.test(error.message)
+      : /\bHTTP 4(?:04|10)\b/.test(error.message);
+    if (isPermanentDiscard) return { [DISCARDED_404]: true };
+    // Timeout / red caída / 429 / 5xx / 404 de proxy: fallo transitorio → TTL corto.
     return unclassified(sub, finalUrl, true);
   }
 };
@@ -1182,7 +1221,7 @@ export default {
         const cleanWave1 = { "OS-V3": 0, "SubDL": 0 };
         for (const i of wave1Idx) {
           const s = analyzed[i];
-          if (s && !s[FAILED]) cleanWave1[deduped[i].source] += 1;
+          if (s && !s[FAILED] && !s[DISCARDED_404]) cleanWave1[deduped[i].source] += 1;
         }
 
         const wave2Idx = [];
@@ -1212,11 +1251,16 @@ export default {
         // para degradar el TTL si su fuente no alcanzó el cupo de 5 limpias.
         const kept = { "OS-V3": 0, "SubDL": 0 };
         const failed = { "OS-V3": 0, "SubDL": 0 };
+        let descartes404 = 0;
         const subtitles = [];
         for (let i = 0; i < analyzed.length; i++) {
           const s = analyzed[i];
           const source = deduped[i].source;
           if (!s) continue;
+          if (s[DISCARDED_404]) {
+            descartes404 += 1;
+            continue;
+          }
           if (s[FAILED]) {
             failed[source] += 1;
             continue;
@@ -1244,7 +1288,7 @@ export default {
           `[subtitles] resumen ${type}/${fullId}: total=${Date.now() - tStart}ms w1=${w1Ms}ms w2=${w2Ms}ms ` +
             `descargas=${wave1Idx.length + (wave2Ran ? wave2Idx.length : 0)} ` +
             `servidas=${subtitles.length} (OS-V3=${kept["OS-V3"]},SubDL=${kept["SubDL"]}) ` +
-            `fallos=${failed["OS-V3"] + failed["SubDL"]} ttl=${ttl}s`
+            `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} ttl=${ttl}s`
         );
         const response = jsonResponse({ subtitles }, ttl);
         cachePut(ctx, cacheReq || request, response);
