@@ -34,6 +34,26 @@ namespace_id = "1001"
   limit = 120
   period = 60
 
+# Observabilidad (Workers Logs + Workers Traces) — requiere redespliegue para
+# aplicarse. Logs: invocación + console.log/error en el dashboard (Workers &
+# Pages -> hispasubs -> Observability). Traces: spans automáticos de cada
+# subrequest saliente (API de OpenSubtitles/SubDL y descargas vía proxy) sin
+# tocar código — útiles para medir duración/latencia por fuente.
+# Presupuesto Free: 200k eventos de log/día (retención 3 días); las rutas
+# /logo.svg y /favicon.ico son assets y NO generan invocaciones. Ojo: desde
+# el 1/12/2026 Workers Logs/Traces pasan a la precios de Cloudflare
+# Observability — vigilar el volumen ese mes.
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+persist = true
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
+persist = true
+
 # Variables opcionales (descomentar para cambiar los valores por defecto):
 #
 # [vars]
