@@ -380,7 +380,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.5", m10.version === "1.4.5", m10.version);
+  check("manifest version 1.4.6", m10.version === "1.4.6", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1053,6 +1053,122 @@ try {
   check("v1.4.5 H-06.1: readCapped sin getReader devuelve Uint8Array con .length",
     capped instanceof Uint8Array && capped.length === 4 && capped[0] === 0xff && capped[1] === 0xfe,
     `type=${capped?.constructor?.name} len=${capped?.length}`);
+}
+
+// 18) v1.4.6: descarga en 2 oleadas (5+3), SubDL 403 sin degradar TTL,
+// Content-Length > 1 MB truncado en vez de rechazado, y todos-spam -> TTL 60s.
+{
+  // --- 18a: 2 oleadas (5 + 3) ---
+  // Si las 5 primeras de una fuente están limpias, las candidatas 6, 7 y 8 NO
+  // se llegan ni a pedir por red (ahorra CPU y evita 429 en OS-V3).
+  let fetchedWave1Clean = [];
+  const origFetch14 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        subtitles: Array.from({ length: 8 }, (_, i) => ({
+          id: `w${i + 1}`,
+          url: `https://subs5.strem.io/w${i + 1}.srt`,
+          lang: "spa",
+        })),
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("subs5.strem.io/w")) {
+      fetchedWave1Clean.push(u);
+      return Promise.resolve(textResp(TXT_CAST));
+    }
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get("/subtitles/movie/tt7770020.json");
+    const wSubs = (await res.json()).subtitles || [];
+    check("v1.4.6 2-oleadas: si las 5 primeras son limpias, solo hace 5 descargas (no 8)",
+      wSubs.length === 5 && fetchedWave1Clean.length === 5,
+      `served=${wSubs.length} fetched=${fetchedWave1Clean.length}`);
+  } finally {
+    globalThis.fetch = origFetch14;
+  }
+
+  // --- 18b: SubDL 403 (clave caducada/revocada) no degrada el TTL de OS-V3 ---
+  const origFetch15 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("api.subdl.com")) {
+      return Promise.resolve(new Response("Forbidden", { status: 403 }));
+    }
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        subtitles: [{ id: "o1", url: "https://subs5.strem.io/o1.srt", lang: "spa" }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("subs5.strem.io/o1.srt")) return Promise.resolve(textResp(TXT_CAST));
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get(`/${b64url({ subdlKey: "bad_key" })}/subtitles/movie/tt7770021.json`);
+    const s403 = (await res.json()).subtitles || [];
+    check("v1.4.6 SubDL 403: sirve OS-V3 con TTL 7200s (no degrada por clave inválida)",
+      s403.length === 1 && res.headers.get("cache-control") === "public, max-age=7200",
+      `len=${s403.length} cc=${res.headers.get("cache-control")}`);
+  } finally {
+    globalThis.fetch = origFetch15;
+  }
+
+  // --- 18c: Content-Length > 1 MB se trunca y clasifica en vez de fallar ---
+  const origFetch16 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        subtitles: [{ id: "big1", url: "https://subs5.strem.io/big_cl.srt", lang: "spa" }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("big_cl.srt")) {
+      return Promise.resolve(new Response(TXT_LAT, {
+        status: 200,
+        headers: { "content-type": "text/plain", "content-length": String(MAX_ANALYZE_BYTES + 50000) },
+      }));
+    }
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get("/subtitles/movie/tt7770022.json");
+    const bigCl = (await res.json()).subtitles || [];
+    check("v1.4.6 Content-Length > 1 MB: trunca con readCapped y clasifica (no rechaza)",
+      bigCl.length === 1 && bigCl[0].label === "🇲🇽 Latino (OS-V3)",
+      JSON.stringify(bigCl));
+  } finally {
+    globalThis.fetch = origFetch16;
+  }
+
+  // --- 18d: Si todos los candidatos son spam y quedan 0 pistas -> TTL 60s ---
+  const origFetch17 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        subtitles: [{ id: "sp", url: "https://subs5.strem.io/all_spam.srt", lang: "spa" }],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("all_spam.srt")) {
+      return Promise.resolve(textResp("1\n00:00:01,000 --> 00:00:02,000\nRegístrate en bet365\n"));
+    }
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get("/subtitles/movie/tt7770023.json");
+    const allSpam = (await res.json()).subtitles || [];
+    check("v1.4.6 todos spam (0 pistas resultantes) -> caché negativa 60s (no 7200s)",
+      allSpam.length === 0 && res.headers.get("cache-control") === "public, max-age=60",
+      `len=${allSpam.length} cc=${res.headers.get("cache-control")}`);
+  } finally {
+    globalThis.fetch = origFetch17;
+  }
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

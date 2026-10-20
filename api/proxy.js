@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.5
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.6
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -16,6 +16,20 @@
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
+//
+// v1.4.6 (19/10/2026):
+//  - [SERIES] En packs de temporada (&s=<season>&e=<episode>), si ninguna
+//    entrada del zip coincide con el episodio pedido pero sí hay entradas con
+//    marcador explícito de otro episodio (SxxExx / 1x02), se descartan en vez
+//    de servir el capítulo más largo por error (devuelve 404 para que el
+//    Worker pase al siguiente candidato). Si el zip solo trae archivos sin
+//    marcador de episodio (p. ej. "subtitulo.srt"), mantiene el fallback.
+//    Además se soporta un segundo nivel de match por número de episodio
+//    (E03 / Ep 03 / Cap 03) para animes o miniseries sin temporada en el
+//    nombre.
+//  - [SSRF] isPublicIP usa net.BlockList nativo de Node además de las reglas
+//    existentes: normaliza automáticamente formas IPv6 expandidas
+//    (0:0:0:0:0:0:0:1, 0:0:0:0:0:ffff:7f00:1) e IPv4-translated (::ffff:0:x).
 //
 // v1.4.5 (19/10/2026):
 //  - [SERIES] Cuando la petición incluye &s=<season>&e=<episode> (series), el
@@ -86,7 +100,7 @@ const MAX_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
-const USER_AGENT = "HispaSubs/1.4.5";
+const USER_AGENT = "HispaSubs/1.4.6";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 
@@ -134,25 +148,57 @@ async function assertPublicHost(hostname, viaRedirect = false) {
   }
 }
 
+// BlockList nativa de Node: normaliza cualquier representación IPv4/IPv6
+// (incluidas las formas expandidas 0:0:0:0:0:0:0:1, 0:0:0:0:0:ffff:7f00:1
+// y ::ffff:0:7f00:1) antes de comparar contra las subredes reservadas.
+const RESERVED_BLOCKS = new net.BlockList();
+for (const [addr, prefix] of [
+  ["0.0.0.0", 8],
+  ["10.0.0.0", 8],
+  ["100.64.0.0", 10],
+  ["127.0.0.0", 8],
+  ["169.254.0.0", 16],
+  ["172.16.0.0", 12],
+  ["192.0.0.0", 24],
+  ["192.168.0.0", 16],
+  ["198.18.0.0", 15],
+  ["224.0.0.0", 4],
+  ["240.0.0.0", 4],
+]) {
+  RESERVED_BLOCKS.addSubnet(addr, prefix, "ipv4");
+}
+for (const [addr, prefix] of [
+  ["::", 128],
+  ["::1", 128],
+  ["::ffff:0:0", 96],     // IPv4-mapped (cualquier forma expandida/hex)
+  ["::ffff:0:0:0", 96],   // IPv4-translated (RFC 2765)
+  ["64:ff9b::", 96],      // NAT64
+  ["64:ff9b:1::", 48],    // NAT64 local-use
+  ["100::", 64],          // Discard-Only (RFC 6666)
+  ["2001:db8::", 32],     // Documentación
+  ["2002::", 16],         // 6to4
+  ["fc00::", 7],          // ULA (fc00::/7 cubre fc y fd)
+  ["fe80::", 10],         // Link-local (fe80..febf)
+  ["ff00::", 8],          // Multicast
+]) {
+  RESERVED_BLOCKS.addSubnet(addr, prefix, "ipv6");
+}
+
 function isPublicIP(ip) {
-  if (net.isIPv4(ip)) return isPublicIPv4(ip);
-  // IPv6: loopback, ULA, link-local, multicast, NAT64, 6to4, doc e IPv4 embebida
-  const h = ip.toLowerCase().replace(/^\[|\]$/g, "");
-  if (h === "::1" || h === "::") return false;
-  if (h.startsWith("fe8") || h.startsWith("fe9") || h.startsWith("fea") || h.startsWith("feb")) return false;
-  if (h.startsWith("fc") || h.startsWith("fd")) return false;
-  if (h.startsWith("ff")) return false; // multicast ff00::/8
-  if (h.startsWith("64:ff9b:") || h.startsWith("2002:") || h.startsWith("2001:db8:")) return false;
-  // IPv4 embebida decimal: ::ffff:127.0.0.1 (mapped) y ::127.0.0.1 (compatible)
-  const v4 = h.match(/^::(?:ffff:)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  const clean = String(ip || "").toLowerCase().replace(/^\[|\]$/g, "");
+  if (net.isIPv4(clean)) return isPublicIPv4(clean);
+  if (!net.isIPv6(clean)) return false;
+  // IPv4 embebida decimal: ::ffff:8.8.8.8 (mapped) y ::8.8.8.8 (compatible)
+  const v4 = clean.match(/^(?:(?:0+:){0,5}(?:ffff:)?|::(?:ffff:)?)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
   if (v4) return isPublicIPv4(v4[1]);
-  // IPv4 embebida hex (WHATWG URL normaliza ::ffff:127.0.0.1 a ::ffff:7f00:1)
-  const v4Hex = h.match(/^::(?:ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  // IPv4 embebida hex: ::ffff:7f00:1 o 0:0:0:0:0:ffff:7f00:1 o ::7f00:1
+  const v4Hex = clean.match(/^(?:(?:0+:){0,5}(?:ffff:)?|::(?:ffff:)?)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
   if (v4Hex) {
     const hi = parseInt(v4Hex[1], 16);
     const lo = parseInt(v4Hex[2], 16);
     return isPublicIPv4(`${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`);
   }
+  if (RESERVED_BLOCKS.check(clean, "ipv6")) return false;
   return true;
 }
 
@@ -394,24 +440,54 @@ export default async function handler(req, res) {
       candidates.push({ entry, name, declared: declared || 0 });
     }
 
-    // En series (&s=<season>&e=<episode>), priorizamos las entradas cuyo
-    // nombre coincida con el episodio pedido (S01E03 / 1x03, con bordes
-    // numéricos para no confundir E3 con E30). Si ninguna entrada coincide (o
-    // es película), desempatamos como siempre: .srt primero y el más grande.
+    // En series (&s=<season>&e=<episode>):
+    //  - Nivel 2 (exacto): S01E03 / 1x03 (temporada + episodio).
+    //  - Nivel 1 (solo ep): E03 / Ep 03 / Cap 03 (sin otro marcador SxxExx
+    //    de otra temporada en el mismo nombre).
+    //  - Si ninguna entrada del zip coincide con el episodio pedido, se
+    //    descartan las entradas que tengan un marcador explícito de OTRO
+    //    episodio (SxxExx / 1x02 / Ep 05): así un pack de E01-E05 cuando se
+    //    pide E07 responde 404 en vez de servir E01 por error. Las entradas
+    //    neutras sin marcador de episodio ("subtitulo.srt") sí se conservan.
     const rawS = req.query && req.query.s ? String(req.query.s).trim() : "";
     const rawE = req.query && req.query.e ? String(req.query.e).trim() : "";
-    const epRegex =
-      /^\d+$/.test(rawS) && /^\d+$/.test(rawE)
-        ? new RegExp(
-            `(?:(?<![0-9a-z])s0*${Number(rawS)}[._\\s-]*e0*${Number(rawE)}|(?<![0-9])0*${Number(rawS)}x0*${Number(rawE)})(?![0-9])`,
-            "i"
-          )
-        : null;
+    const hasSE = /^\d+$/.test(rawS) && /^\d+$/.test(rawE);
+    const sNum = hasSE ? Number(rawS) : 0;
+    const eNum = hasSE ? Number(rawE) : 0;
+    const epExactRe = hasSE
+      ? new RegExp(
+          `(?:(?<![0-9a-z])s0*${sNum}[._\\s-]*e0*${eNum}|(?<![0-9])0*${sNum}x0*${eNum})(?![0-9])`,
+          "i"
+        )
+      : null;
+    const epLooseRe = hasSE
+      ? new RegExp(`(?<![0-9a-z])(?:ep(?:isodio)?|cap(?:[ií]tulo)?|e)[._\\s-]*0*${eNum}(?![0-9a-z])`, "i")
+      : null;
+    const anySeTokenRe = /(?:(?<![0-9a-z])s\d+[._\s-]*e\d+|(?<![0-9])\d+x\d+|(?<![0-9a-z])(?:ep(?:isodio)?|cap(?:[ií]tulo)?)[._\s-]*\d+)(?![0-9])/i;
 
-    candidates.sort((a, b) => {
-      if (epRegex) {
-        const epMatch = (x) => (epRegex.test(x.name) ? 1 : 0);
-        const diff = epMatch(b) - epMatch(a);
+    const epRank = (name) => {
+      if (!hasSE) return 0;
+      if (epExactRe.test(name)) return 2;
+      if (!anySeTokenRe.test(name) && epLooseRe.test(name)) return 1;
+      if (epLooseRe.test(name) && !/(?<![0-9a-z])s\d+[._\s-]*e\d+|(?<![0-9])\d+x\d+/i.test(name)) return 1;
+      return 0;
+    };
+
+    let filteredCandidates = candidates;
+    if (hasSE) {
+      const anyMatch = candidates.some((c) => epRank(c.name) > 0);
+      if (anyMatch) {
+        filteredCandidates = candidates.filter((c) => epRank(c.name) > 0);
+      } else {
+        // Ninguna entrada casa con el episodio pedido: descartamos las que
+        // llevan token explícito de OTRO episodio para no servir otro capítulo.
+        filteredCandidates = candidates.filter((c) => !anySeTokenRe.test(c.name));
+      }
+    }
+
+    filteredCandidates.sort((a, b) => {
+      if (hasSE) {
+        const diff = epRank(b.name) - epRank(a.name);
         if (diff !== 0) return diff;
       }
       const score = (x) => (x.name.toLowerCase().endsWith(".srt") ? 2 : 1);
@@ -423,7 +499,7 @@ export default async function handler(req, res) {
     // (binario, vacío, enorme), seguimos con la siguiente candidata.
     let chosen = null;
     let totalUncompressed = 0;
-    for (const cand of candidates) {
+    for (const cand of filteredCandidates) {
       if (totalUncompressed >= MAX_BYTES_TOTAL) break;
       let data;
       try {

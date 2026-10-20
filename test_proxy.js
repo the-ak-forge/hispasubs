@@ -102,12 +102,13 @@ for (const ip of ["127.0.0.1", "10.0.0.1", "172.16.5.5", "192.168.1.1", "169.254
 check("IPv4 8.8.8.8 es pública", isPublicIP("8.8.8.8") === true);
 check("IPv4 172.32.5.5 es pública (fuera de 172.16/12)", isPublicIP("172.32.5.5") === true);
 check("IPv4 100.128.0.1 es pública (fuera de CGNAT 100.64/10)", isPublicIP("100.128.0.1") === true);
-for (const ip of ["::1", "::", "fe80::1", "fc00::1", "fd12::1", "ff02::1", "::ffff:127.0.0.1", "::10.0.0.1", "::ffff:7f00:1", "::ffff:a00:1", "::ffff:c0a8:101", "64:ff9b::10.0.0.1", "2002:7f00:1::", "2001:db8::1"]) {
+for (const ip of ["::1", "::", "fe80::1", "fc00::1", "fd12::1", "ff02::1", "::ffff:127.0.0.1", "::10.0.0.1", "::ffff:7f00:1", "::ffff:a00:1", "::ffff:c0a8:101", "64:ff9b::10.0.0.1", "2002:7f00:1::", "2001:db8::1", "0:0:0:0:0:0:0:1", "0:0:0:0:0:ffff:7f00:1", "::ffff:0:7f00:1"]) {
   check(`IPv6 ${ip} es privada`, isPublicIP(ip) === false);
 }
 check("IPv6 2001:4860:4860::8888 es pública", isPublicIP("2001:4860:4860::8888") === true);
 check("IPv6 ::ffff:8.8.8.8 (mapped) es pública", isPublicIP("::ffff:8.8.8.8") === true);
 check("IPv6 ::ffff:808:808 (mapped hex 8.8.8.8) es pública", isPublicIP("::ffff:808:808") === true);
+check("IPv6 0:0:0:0:0:ffff:808:808 (expanded hex 8.8.8.8) es pública", isPublicIP("0:0:0:0:0:ffff:808:808") === true);
 
 // ===========================================================================
 // 2. Rutas y errores de usuario
@@ -259,12 +260,31 @@ section("5. Extracción del zip");
     res1x.statusCode === 200 && String(res1x.body).includes("formato 1x02 correcto"),
     String(res1x.body).slice(0, 80));
 
-  // Si ningún nombre del zip coincide con el episodio, cae al comportamiento
-  // normal (el .srt más grande).
+  // v1.4.6: Si el pack tiene otros episodios explícitos (S01E03, S01E10,
+  // S01E30) y se pide &s=1&e=99 (que NO está en el zip), devuelve 404 en vez
+  // de servir el episodio equivocado más grande.
   fetchImpl = () => new Response(seasonPack, { status: 200 });
-  const resFallback = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/pack.zip") + "&s=1&e=99");
-  check("v1.4.5 H-01: si ningún archivo coincide con &s/&e, sirve el .srt más grande",
-    resFallback.statusCode === 200 && String(resFallback.body).startsWith("f"));
+  const resMissingEp = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/pack.zip") + "&s=1&e=99");
+  check("v1.4.6: pack con otros episodios pero sin el pedido (&s=1&e=99) -> 404 (no sirve otro cap)",
+    resMissingEp.statusCode === 404, `status=${resMissingEp.statusCode}`);
+
+  // Pero si el zip trae archivos con nombres neutros (sin token SxxExx/1x02),
+  // sigue sirviendo el .srt más grande como fallback legítimo.
+  const neutralZip = buildZip([["subtitulo_es.srt", "neutro valido\n"]]);
+  fetchImpl = () => new Response(neutralZip, { status: 200 });
+  const resNeutral = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/neutral.zip") + "&s=1&e=99");
+  check("v1.4.6: zip con nombre neutro sin SxxExx sigue sirviendo el .srt con &s/&e",
+    resNeutral.statusCode === 200 && String(resNeutral.body).includes("neutro valido"));
+
+  // Y soporta nombres con solo episodio (Show - E03.srt / Ep 03 / Cap 03).
+  const epOnlyPack = buildZip([
+    ["Anime - E12.srt", "x".repeat(4000)],
+    ["Anime - Ep 03.srt", "anime episodio 3 ok\n"],
+  ]);
+  fetchImpl = () => new Response(epOnlyPack, { status: 200 });
+  const resEpOnly = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/anime.zip") + "&s=1&e=3");
+  check("v1.4.6: soporta nombres 'Ep 03' / 'E03' sin temporada",
+    resEpOnly.statusCode === 200 && String(resEpOnly.body).includes("anime episodio 3 ok"));
 }
 {
   const zip = buildZip([["a.vtt", "WEBVTT\n"], ["b.srt", "1\n00:00:01,000 --> 00:00:02,000\nx\n"], ["c_small.srt", "peque\n"], ["d_big.srt", "g".repeat(5000)]]);

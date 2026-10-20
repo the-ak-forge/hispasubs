@@ -1,6 +1,22 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.5
+// HispaSubs — Cloudflare Worker v1.4.6
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.6 (19/10/2026) — auditoría de la 1.4.5 y contraste con logs de prod:
+//  - [CPU/RED] Descarga de candidatos en DOS oleadas por fuente (5 + 3):
+//    primero se descargan hasta ANALYSIS_BUDGET_PER_SOURCE (5) por fuente;
+//    solo si una fuente queda con <5 limpias (por spam o fallo) y aún tiene
+//    reserva, se lanza la 2ª tanda con las hasta 3 restantes. En el caso
+//    común ahorra ~37 % de CPU y descargas, evita el cuello de 6 conexiones
+//    simultáneas del runtime y reduce los HTTP 429 de subs5.strem.io.
+//  - [TTL] SubDL 401/403 (clave revocada/inválida o cuota agotada) ya no
+//    rechaza la promesa ni degrada el TTL a 60 s: devuelve [] como con
+//    status:false para que las pistas de OS-V3 se cacheen 2 h. Y si una fuente
+//    tenía candidatos pero todos fueron spam (0 limpias), el resultado vacío
+//    no se cachea 2 h si el título quedó en 0 pistas.
+//  - [TRUNCADO] fetchSubtitle ya no aborta con error cuando el origen declara
+//    Content-Length > 1 MB: readCapped ya corta el stream en 1 MB y cancela
+//    el resto, igual que cuando no viene Content-Length.
 //
 // v1.4.5 (19/10/2026) — auditoría de la 1.4.4 (6 mejoras aplicadas):
 //  - [UTF-8] Un SRT UTF-8 de >1 MB cortado por readCapped a mitad de un
@@ -296,8 +312,9 @@ const fetchSubtitle = async (url, ms = 2000) => {
       signal: controller.signal,
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const declared = Number(res.headers.get("content-length") || 0);
-    if (declared > MAX_ANALYZE_BYTES) throw new Error("subtítulo demasiado grande");
+    // Si el subtítulo supera 1 MB (con o sin Content-Length), readCapped lee
+    // únicamente el primer megabyte y cancela el stream: basta para clasificar
+    // el léxico y evaluar la cabecera anti-spam sin rechazar el archivo.
     const buf = await readCapped(res, MAX_ANALYZE_BYTES);
     const truncated = buf.length >= MAX_ANALYZE_BYTES;
     // BOM primero: un SRT UTF-16 decodificado a ciegas como UTF-8/windows-1252
@@ -502,7 +519,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.5",
+  version: "1.4.6",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -629,17 +646,17 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
     }
     return out;
   } catch (e) {
-    // 403 en SubDL casi siempre es clave rechazada/caducada o cuota
-    // agotada, no un fallo de red: se dice explícitamente para no tener que
-    // adivinarlo ante reports de "no veo subs de SubDL".
-    const extra = e.message.includes("403")
+    // 401/403 en SubDL es clave rechazada/caducada o cuota agotada del
+    // usuario, no una caída transitoria del proveedor: igual que con
+    // status:false, se devuelve [] en vez de rechazar la promesa, para que
+    // las pistas válidas de OS-V3 se cacheen 2 h y no se golpee SubDL cada
+    // 60 s con una clave muerta.
+    const isAuthOrQuota = /\bHTTP 40[13]\b/.test(e.message);
+    const extra = isAuthOrQuota
       ? "(clave rechazada o cuota agotada: se omite SubDL en este título)"
       : "";
     console.error("[SubDL]", e.message, extra);
-    // Igual que OS-V3: se propaga para que allSettled marque la fuente como
-    // rechazada y el TTL baje a 60 s. Los casos "sin resultados" (sin clave,
-    // id inválido, status:false) ya retornan [] ANTES de este catch: no son
-    // fallos transitorios y no deben degradar la caché.
+    if (isAuthOrQuota) return [];
     throw e;
   }
 };
@@ -1066,28 +1083,60 @@ export default {
           return empty;
         }
 
-        // Política estricta: SOLO se publican pistas verificadas. Se DESCARGAN
-        // hasta ANALYSIS_FETCH_PER_SOURCE candidatos por fuente (sobrepaso) y
-        // se SIRVEN los primeros ANALYSIS_BUDGET_PER_SOURCE limpios. Antes el
-        // presupuesto se gastaba antes de filtrar: si los 5 primeros eran
-        // spam, el título quedaba vacío aunque detrás hubiera limpias.
+        // Política estricta: SOLO se publican pistas verificadas.
+        // v1.4.6 — Descarga en DOS oleadas por fuente (5 + 3):
+        //  - 1ª oleada: hasta ANALYSIS_BUDGET_PER_SOURCE (5) por fuente. Si
+        //    las 5 están limpias (el caso más común), no se descargan las 3 de
+        //    sobrepaso: ~37 % menos CPU y red, sin saturar el límite de 6
+        //    conexiones simultáneas de Cloudflare ni provocar 429 en OS-V3.
+        //  - 2ª oleada: solo para las fuentes que tras la 1ª oleada quedaron
+        //    con <5 limpias y aún tienen candidatos en la reserva (hasta
+        //    ANALYSIS_FETCH_PER_SOURCE = 8 en total por fuente).
         const pBase = proxyBase(env);
         const spamMode = env && env.SPAM_FILTER === "log" ? "log" : "drop";
         const epSuffix =
           season && episode && /^\d+$/.test(season) && /^\d+$/.test(episode)
             ? `&s=${season}&e=${episode}`
             : "";
-        const fetchBudget = { "OS-V3": ANALYSIS_FETCH_PER_SOURCE, "SubDL": ANALYSIS_FETCH_PER_SOURCE };
-        const analyzed = await Promise.all(
-          deduped.map((sub) => {
-            if (fetchBudget[sub.source] > 0) {
-              fetchBudget[sub.source] -= 1;
-              return classifySubtitle(sub, pBase, spamMode, epSuffix);
-            }
-            // Más allá del sobrepaso: ni se descarga.
-            return null;
+        const analyzed = new Array(deduped.length).fill(null);
+        const wave1Idx = [];
+        const wave2BySource = { "OS-V3": [], "SubDL": [] };
+        const seenPerSource = { "OS-V3": 0, "SubDL": 0 };
+        for (let i = 0; i < deduped.length; i++) {
+          const src = deduped[i].source;
+          seenPerSource[src] = (seenPerSource[src] || 0) + 1;
+          if (seenPerSource[src] <= ANALYSIS_BUDGET_PER_SOURCE) {
+            wave1Idx.push(i);
+          } else if (seenPerSource[src] <= ANALYSIS_FETCH_PER_SOURCE) {
+            wave2BySource[src].push(i);
+          }
+        }
+
+        await Promise.all(
+          wave1Idx.map(async (i) => {
+            analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix);
           })
         );
+
+        const cleanWave1 = { "OS-V3": 0, "SubDL": 0 };
+        for (const i of wave1Idx) {
+          const s = analyzed[i];
+          if (s && !s[FAILED]) cleanWave1[deduped[i].source] += 1;
+        }
+
+        const wave2Idx = [];
+        for (const src of ["OS-V3", "SubDL"]) {
+          if (cleanWave1[src] < ANALYSIS_BUDGET_PER_SOURCE && wave2BySource[src].length > 0) {
+            wave2Idx.push(...wave2BySource[src]);
+          }
+        }
+        if (wave2Idx.length > 0) {
+          await Promise.all(
+            wave2Idx.map(async (i) => {
+              analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix);
+            })
+          );
+        }
 
         // Los fallos de descarga (FAILED) NO se sirven: no pasaron por el
         // filtro anti-spam, así que no son pistas verificadas. Solo cuentan
@@ -1108,19 +1157,17 @@ export default {
           subtitles.push(s);
         }
 
-        // TTL según fiabilidad (v1.4.5, por fuente): una fuente se considera
-        // degradada si rechazó entera (`sourceFailed`) o si tuvo >=1 fallo de
-        // descarga Y no alcanzó su cupo de ANALYSIS_BUDGET_PER_SOURCE pistas
-        // limpias. Así: (a) un catálogo pequeño legítimo (3 subs y 0 fallos)
-        // se cachea 2 h; (b) si 1 de los 8 candidatos falló pero los otros
-        // llenaron las 5 limpias, el fallo quedó absorbido por el sobrepaso y
-        // se cachea 2 h; (c) si el fallo dejó la fuente incompleta (<5), baja
-        // a 60 s para reintentar pronto. Los descartes por spam NO son fallos.
+        // TTL según fiabilidad (v1.4.5/1.4.6, por fuente): una fuente se
+        // considera degradada si rechazó entera (`sourceFailed`), si tuvo >=1
+        // fallo de descarga Y no alcanzó su cupo de ANALYSIS_BUDGET_PER_SOURCE
+        // pistas limpias, o si la respuesta final quedó completamente vacía
+        // (`subtitles.length === 0`, p.ej. cuando todos los candidatos eran
+        // spam: caché negativa de 60 s en vez de 2 h vacía).
         const anyDegradedSource = Object.keys(failed).some(
           (src) => failed[src] > 0 && kept[src] < ANALYSIS_BUDGET_PER_SOURCE
         );
         const sourceFailed = osSubs.status === "rejected" || sdlSubs.status === "rejected";
-        const ttl = anyDegradedSource || sourceFailed ? 60 : 7200;
+        const ttl = anyDegradedSource || sourceFailed || subtitles.length === 0 ? 60 : 7200;
         if (ttl !== 7200) {
           console.log(`[subtitles] respuesta degradada (fallo de clasificación o fuente): TTL ${ttl}s`);
         }
