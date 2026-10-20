@@ -1,6 +1,31 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.6
+// HispaSubs — Cloudflare Worker v1.4.7
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.7 (20/10/2026) — auditoría externa de la 1.4.6:
+//  - [LATENCIA] Presupuesto temporal compartido entre las 2 oleadas
+//    (CLASSIFY_BUDGET_MS = 6000 ms, WAVE2_MAX_W1_MS = 4000 ms): la 2ª oleada
+//    solo se lanza si la 1ª terminó en <= 4 s, y su timeout se acota al
+//    presupuesto restante. Evita que descargas colgadas en ambas tandas
+//    dupliquen el peor caso a 12-16,5 s y mantiene el techo real en 10,5 s.
+//  - [TTL/404] Un HTTP 404 al descargar un candidato (enlace muerto o pack de
+//    temporada en el proxy que no contiene el episodio pedido) se descarta
+//    como `null` sin marcar FAILED: es una ausencia permanente, no un fallo
+//    transitorio de red, así que no degrada el TTL a 60 s si hay pistas
+//    válidas (pero sí activa la 2ª oleada para rellenar el cupo).
+//  - [LÉXICO] Cobertura regional ampliada en DICT_LAT (voseo y modismos
+//    rioplatenses, chilenos y colombianos/andinos: boludo, pelotudo, pibe,
+//    quilombo, tenés/querés/podés/sabés/decís/vení/mirá, weón/huevón, cachai,
+//    fome, pololo, parce/parcero, chimba, chamo) y DICT_ES (os, mogollón,
+//    currar, flipar). `jod*` pasa a DICT_ES_WEAK (0,25) por su uso en LatAm,
+//    y se excluyen con negative lookahead las colocaciones no dialectales
+//    ("móvil del crimen", "carro de la compra/combate", "conduce a nada/la
+//    ruina") sin degradar el peso de coche/carro/móvil/conducir en cine formal.
+//  - [OBS/PRIVACIDAD] spamVerdict devuelve el fragmento exacto (`match`) para
+//    diagnóstico en logs. Se añade una línea de resumen con tiempos por oleada
+//    al final de `/subtitles` y se desactiva `[observability.traces]` en
+//    wrangler.toml (el span `cache_put` registraba la URL con config sin
+//    redactar y duplicaba el consumo de eventos).
 //
 // v1.4.6 (19/10/2026) — auditoría de la 1.4.5 y contraste con logs de prod:
 //  - [CPU/RED] Descarga de candidatos en DOS oleadas por fuente (5 + 3):
@@ -183,9 +208,9 @@
 // como Latino—. Cuentan 0,25 en vez de 1 para que una palabra suelta no
 // decida la clasificación; solo pesan cuando aparecen muchas veces.
 const WEAK_WEIGHT = 0.25;
-const DICT_ES = /(?<![\p{L}\p{N}_])(?:vosotros|ordenador(?:es)?|coche[s]?|gilipollas|hostias?|chaval(?:es)?|foll(?:ar|a|an|en|ó|o|ado|ando)|jod(?:e|es|en|emos|er|a|as|an|ía|ías|íamos|ían|ió|ieron|iendo|ido|ida|idos|idas)|guay|m[oó]vil(?:es)?|patata[s]?|zumo[s]?|aparqu[\p{L}]*|aparc[\p{L}]*|condu(?:cir|zco|zca|zcan|ces|ce|cen|jiste|jeron|jo|cía|cías|cíamos|cían|ciendo|cido)|enfad[\p{L}]*|nevera[s]?|jol[ií]n|mol(?:a|an)|ten[eé]is|sois|est[aá]is)(?![\p{L}\p{N}_])/giu;
-const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?|auto(?:s)?|pendej[\p{L}]*|ching(?:ar|a|as|an|o|ó|aron|aba|aban|ado|ada|ando|ón|ones|ue|ues|uen|ué|adera)|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion(?:ar|a|as|an|ó|é|aste|aron|aba|abas|ábamos|aban|ado|ada|ando|amiento)|manej[\p{L}]*|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|carajo|[oó]rale|chido|bacano)(?![\p{L}\p{N}_])/giu;
-const DICT_ES_WEAK = /(?<![\p{L}\p{N}_])vale(?![\p{L}\p{N}_])/giu;
+const DICT_ES = /(?<![\p{L}\p{N}_])(?:vosotros|os|ordenador(?:es)?|coche[s]?|gilipollas|hostias?|chaval(?:es)?|foll(?:ar|a|an|en|ó|o|ado|ando)|guay|m[oó]vil(?:es)?(?!\s+del\s+(?:crimen|asesinato|delito|robo|ataque)|\s+perpetuo)|patata[s]?|zumo[s]?|aparqu[\p{L}]*|aparc[\p{L}]*|condu(?:cir|zco|zca|zcan|ces|ce|cen|jiste|jeron|jo|cía|cías|cíamos|cían|ciendo|cido)(?!\s+a\s+(?:nada|eso|esto|ninguna\s+parte|la\s+ruina|un\s+desastre|una?\s+conclusi[oó]n))|enfad[\p{L}]*|nevera[s]?|jol[ií]n|mol(?:a|an)|ten[eé]is|sois|est[aá]is|mogoll[oó]n|curr(?:ar|o|as|a|amos|áis|an|ando|ado|ante[s]?)|flip(?:ar|o|as|a|amos|áis|an|é|ó|ando|ado|ante[s]?))(?![\p{L}\p{N}_])/giu;
+const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?(?!\s+de\s+(?:(?:la\s+)?compra|combate)|\s+blindado)|auto(?:s)?|pendej[\p{L}]*|ching(?:ar|a|as|an|o|ó|aron|aba|aban|ado|ada|ando|ón|ones|ue|ues|uen|ué|adera)|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion(?:ar|a|as|an|ó|é|aste|aron|aba|abas|ábamos|aban|ado|ada|ando|amiento)|manej[\p{L}]*|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|carajo|[oó]rale|chido|bacano|bolud[\p{L}]*|pelotud[\p{L}]*|pibe[s]?|quilombo[s]?|tenés|querés|podés|sabés|decís|vení|mirá|we[oó]n(?:es|a|as)?|huev[oó]n(?:es|a|as)?|cachai|fome[s]?|polol[oa][s]?|parce(?:ro|ra|ros|ras)?|chimba[s]?|chamo[s]?)(?![\p{L}\p{N}_])/giu;
+const DICT_ES_WEAK = /(?<![\p{L}\p{N}_])(?:vale|jod(?:e|es|en|emos|er|a|as|an|ía|ías|íamos|ían|ió|ieron|iendo|ido|ida|idos|idas))(?![\p{L}\p{N}_])/giu;
 const DICT_LAT_WEAK = /(?<![\p{L}\p{N}_])(?:papa[s]?|neta[s]?|ustedes)(?![\p{L}\p{N}_])/giu;
 
 // Túnel Node.js en Vercel como motor de extracción de zips.
@@ -519,7 +544,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.6",
+  version: "1.4.7",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -763,13 +788,14 @@ const SPAM_STRONG_EDGE = /(?<![\p{L}\p{N}_])(?:(?:casino|bingo|poker|ruleta|trag
 // ("no.Me importa", "todo.Es posible"). `mx`/`yts` cubren el watermark YTS.
 const SPAM_WEAK_LINE = /(?<![\p{L}\p{N}_])(?:(?:https?:\/\/|www\.)[^\s<>"']+|(?:[a-z0-9][a-z0-9-]{0,62}\.)+(?:com|net|org|es|mx|tv|info|xyz|top|link|site|online|app|club|cc|io|biz|name|live|vip|bet)(?![\p{L}\p{N}_])|(?:opensubtitles|subdivx|tusubtitulo|argenteam|subtitulamos|elrincondelsub|podnapisi|subs4free|yts)(?![\p{L}\p{N}_])|(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])|(?:canal|grupo)\s+de\s+telegram(?![\p{L}\p{N}_])|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/iu;
 
-// Veredicto puro (exportado para tests). Devuelve { discard, reason }.
+// Veredicto puro (exportado para tests). Devuelve { discard, reason, match }.
 // Si `truncated` es true (el archivo superó MAX_ANALYZE_BYTES y se cortó a
 // mitad), solo se extrae la cabeza: las últimas líneas del buffer truncado
 // son diálogo de mitad de película, no el pie del subtítulo.
 const spamVerdict = (text, truncated = false) => {
   // Marca/URL inequívoca: cualquier parte del subtítulo.
-  if (SPAM_STRONG.test(text)) return { discard: true, reason: "fuerte" };
+  const mStrong = SPAM_STRONG.exec(text);
+  if (mStrong) return { discard: true, reason: "fuerte", match: mStrong[0].slice(0, 60) };
 
   // Bordes sin partir el archivo entero (v1.4.4): .split(/\r?\n/) sobre un
   // SRT de 1 MB asignaba un array de miles de strings por candidato (0,8 ms
@@ -809,15 +835,24 @@ const spamVerdict = (text, truncated = false) => {
     for (const [s, e] of tail) addLine(s, e);
   }
 
-  if (SPAM_STRONG_EDGE.test(edgeLines.join("\n"))) return { discard: true, reason: "fuerte" };
+  const mEdge = SPAM_STRONG_EDGE.exec(edgeLines.join("\n"));
+  if (mEdge) return { discard: true, reason: "fuerte", match: mEdge[0].slice(0, 60) };
 
-  let weakLines = 0;
+  const weakMatches = [];
   for (const line of edgeLines) {
-    if (SPAM_WEAK_LINE.test(line) && ++weakLines >= 2) {
-      return { discard: true, reason: `${weakLines} líneas débiles` };
+    const mWeak = SPAM_WEAK_LINE.exec(line);
+    if (mWeak) {
+      weakMatches.push(mWeak[0].slice(0, 40));
+      if (weakMatches.length >= 2) {
+        return {
+          discard: true,
+          reason: `${weakMatches.length} líneas débiles`,
+          match: weakMatches.join(" + "),
+        };
+      }
     }
   }
-  return { discard: false, reason: "" };
+  return { discard: false, reason: "", match: "" };
 };
 
 // Presupuesto de SIRVIDAS por fuente: el tope de la respuesta sigue siendo
@@ -827,7 +862,21 @@ const spamVerdict = (text, truncated = false) => {
 const ANALYSIS_BUDGET_PER_SOURCE = 5;
 const ANALYSIS_FETCH_PER_SOURCE = 8;
 
-const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER, spamMode = "drop", epSuffix = "") => {
+// Presupuesto temporal compartido entre las 2 oleadas de clasificación
+// (6000 ms, igual al peor caso de una sola oleada con .zip en v1.4.5). La 2ª
+// oleada solo se lanza si la 1ª terminó en <= WAVE2_MAX_W1_MS (4000 ms), y su
+// timeout por candidato se acota al presupuesto restante. Así el peor caso
+// global (fuentes 4,5 s + clasificación 6 s = 10,5 s) nunca se duplica.
+const CLASSIFY_BUDGET_MS = 6000;
+const WAVE2_MAX_W1_MS = 4000;
+
+const classifySubtitle = async (
+  sub,
+  pBase = VERCEL_UNZIPPER,
+  spamMode = "drop",
+  epSuffix = "",
+  maxTimeoutMs = 0
+) => {
   // Guard ANTES de cualquier acceso a sub.url (evita el crash en cascada
   // de Promise.all del 1.0.0).
   if (!sub || !isHttpUrl(sub.url)) return null;
@@ -841,8 +890,11 @@ const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER, spamMode = "drop",
   const finalUrl = isZip ? `${pBase}${encodeURIComponent(sub.url)}${epSuffix}` : sub.url;
 
   try {
-    // El proxy tarda más (descarga + descomprime): timeout amplio para zips.
-    const { text, truncated } = await fetchSubtitle(finalUrl, isZip ? 6000 : 2000);
+    // El proxy tarda más (descarga + descomprime): timeout amplio para zips,
+    // acotado al presupuesto restante cuando se invoca desde la 2ª oleada.
+    const defaultTimeout = isZip ? 6000 : 2000;
+    const timeoutMs = maxTimeoutMs > 0 ? Math.min(defaultTimeout, maxTimeoutMs) : defaultTimeout;
+    const { text, truncated } = await fetchSubtitle(finalUrl, timeoutMs);
 
     // Validación del CONTENIDO antes de etiquetar. "🌎 Neutro" significaba
     // "vocabulario equilibrado", pero con HTML de error, binario (un zip sin
@@ -865,10 +917,11 @@ const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER, spamMode = "drop",
     // pero la pista se sirve: sirve para medir en producción qué se perdería.
     const spam = spamVerdict(text, truncated);
     if (spam.discard) {
+      const detail = spam.match ? `: "${spam.match}"` : "";
       if (spamMode === "log") {
-        console.log(`[classify] SPAM_FILTER=log: se habría descartado (${spam.reason}) [${sub.source}]`);
+        console.log(`[classify] SPAM_FILTER=log: se habría descartado (${spam.reason}${detail}) [${sub.source}]`);
       } else {
-        console.log(`[classify] descartado por spam (${spam.reason}) [${sub.source}]`);
+        console.log(`[classify] descartado por spam (${spam.reason}${detail}) [${sub.source}]`);
         return null;
       }
     }
@@ -884,7 +937,12 @@ const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER, spamMode = "drop",
     return { id: sub.id, url: finalUrl, lang: LANG_ISO_ES, label: `${scored.flag} (${sub.source})` };
   } catch (error) {
     console.error("[classify]", sub.source, error.message);
-    // Timeout / red caída: fallo transitorio → TTL corto para reintentar pronto.
+    // 404 (enlace muerto o pack de temporada en el proxy sin el episodio
+    // pedido) es una ausencia permanente, no un fallo transitorio de red: se
+    // descarta como `null` sin marcar FAILED para no degradar el TTL a 60 s
+    // cuando hay pistas válidas (y permitiendo que la 2ª oleada rellene).
+    if (/\bHTTP 404\b/.test(error.message)) return null;
+    // Timeout / red caída / 429 / 5xx: fallo transitorio → TTL corto para reintentar pronto.
     return unclassified(sub, finalUrl, true);
   }
 };
@@ -892,7 +950,7 @@ const classifySubtitle = async (sub, pBase = VERCEL_UNZIPPER, spamMode = "drop",
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES };
+export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1028,6 +1086,7 @@ export default {
           });
         }
 
+        const tStart = Date.now();
         const [osSubs, sdlSubs] = await Promise.allSettled([
           getOpenSubtitlesV3(type, fullId),
           getSubDL(imdbId, season, episode, config.subdlKey, type),
@@ -1112,11 +1171,13 @@ export default {
           }
         }
 
+        const tWave1 = Date.now();
         await Promise.all(
           wave1Idx.map(async (i) => {
             analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix);
           })
         );
+        const w1Ms = Date.now() - tWave1;
 
         const cleanWave1 = { "OS-V3": 0, "SubDL": 0 };
         for (const i of wave1Idx) {
@@ -1130,12 +1191,20 @@ export default {
             wave2Idx.push(...wave2BySource[src]);
           }
         }
-        if (wave2Idx.length > 0) {
+        let w2Ms = 0;
+        let wave2Ran = false;
+        const remainingMs = CLASSIFY_BUDGET_MS - w1Ms;
+        if (wave2Idx.length > 0 && w1Ms <= WAVE2_MAX_W1_MS && remainingMs >= 1000) {
+          wave2Ran = true;
+          const tWave2 = Date.now();
           await Promise.all(
             wave2Idx.map(async (i) => {
-              analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix);
+              analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, remainingMs);
             })
           );
+          w2Ms = Date.now() - tWave2;
+        } else if (wave2Idx.length > 0) {
+          console.log(`[subtitles] 2ª oleada omitida por presupuesto de tiempo (w1=${w1Ms}ms)`);
         }
 
         // Los fallos de descarga (FAILED) NO se sirven: no pasaron por el
@@ -1171,6 +1240,12 @@ export default {
         if (ttl !== 7200) {
           console.log(`[subtitles] respuesta degradada (fallo de clasificación o fuente): TTL ${ttl}s`);
         }
+        console.log(
+          `[subtitles] resumen ${type}/${fullId}: total=${Date.now() - tStart}ms w1=${w1Ms}ms w2=${w2Ms}ms ` +
+            `descargas=${wave1Idx.length + (wave2Ran ? wave2Idx.length : 0)} ` +
+            `servidas=${subtitles.length} (OS-V3=${kept["OS-V3"]},SubDL=${kept["SubDL"]}) ` +
+            `fallos=${failed["OS-V3"] + failed["SubDL"]} ttl=${ttl}s`
+        );
         const response = jsonResponse({ subtitles }, ttl);
         cachePut(ctx, cacheReq || request, response);
         return response;

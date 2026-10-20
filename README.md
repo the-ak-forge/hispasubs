@@ -35,7 +35,7 @@ El complemento analiza el texto de los subtítulos, detecta expresiones, pronomb
 
 - Privacidad y rendimiento
   - Ejecuta la lógica en Edge con baja latencia.
-  - No almacena datos ni credenciales del usuario: tu clave de SubDL vive en tu configuración de Stremio, no en servidores propios. *Nota de transparencia:* como en cualquier addon que use esta API, la clave viaja en la petición a SubDL (en la propia URL de instalación, según el protocolo de configuración de Stremio, y como parámetro `api_key`); no queda registrada en ningún servidor propio, pero cualquiera que intercepte esa conexión podría leerla.
+  - No almacena datos ni credenciales del usuario: tu clave de SubDL vive en tu configuración de Stremio, no en una base de datos propia. *Nota de transparencia:* como en cualquier addon que use esta API, la clave viaja en la URL de instalación (según el protocolo de configuración de Stremio) y en la petición saliente a SubDL (`api_key`); los registros de diagnóstico de Cloudflare del operador pueden conservar esa URL de forma efímera hasta 3 días (solo visibles para quien administra la cuenta), y cualquiera que intercepte la conexión podría leerla.
 
 ---
 

@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.6
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.7
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -16,6 +16,15 @@
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
+//
+// v1.4.7 (20/10/2026):
+//  - [SERIES] epExactRe soporta nombres multiepisodio (p. ej. S01E03E04,
+//    S01E03-E04, 1x03x04) tanto al pedir el primer episodio como los
+//    siguientes del archivo doble.
+//  - [SSRF] RESERVED_BLOCKS añade ::/96 (IPv4-compatible deprecada, cubre las
+//    formas expandidas de 6 grupos de ceros como 0:0:0:0:0:0:7f00:1 y
+//    0:0:0:0:0:0:a.b.c.d), fec0::/10 (site-local deprecada) y 2001::/32
+//    (Teredo).
 //
 // v1.4.6 (19/10/2026):
 //  - [SERIES] En packs de temporada (&s=<season>&e=<episode>), si ninguna
@@ -100,7 +109,7 @@ const MAX_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
-const USER_AGENT = "HispaSubs/1.4.6";
+const USER_AGENT = "HispaSubs/1.4.7";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 
@@ -170,15 +179,18 @@ for (const [addr, prefix] of [
 for (const [addr, prefix] of [
   ["::", 128],
   ["::1", 128],
+  ["::", 96],             // IPv4-compatible deprecada (0:0:0:0:0:0:7f00:1, ::a.b.c.d)
   ["::ffff:0:0", 96],     // IPv4-mapped (cualquier forma expandida/hex)
   ["::ffff:0:0:0", 96],   // IPv4-translated (RFC 2765)
   ["64:ff9b::", 96],      // NAT64
   ["64:ff9b:1::", 48],    // NAT64 local-use
   ["100::", 64],          // Discard-Only (RFC 6666)
+  ["2001::", 32],         // Teredo (RFC 4380)
   ["2001:db8::", 32],     // Documentación
   ["2002::", 16],         // 6to4
   ["fc00::", 7],          // ULA (fc00::/7 cubre fc y fd)
   ["fe80::", 10],         // Link-local (fe80..febf)
+  ["fec0::", 10],         // Site-local deprecada (RFC 3879)
   ["ff00::", 8],          // Multicast
 ]) {
   RESERVED_BLOCKS.addSubnet(addr, prefix, "ipv6");
@@ -188,11 +200,13 @@ function isPublicIP(ip) {
   const clean = String(ip || "").toLowerCase().replace(/^\[|\]$/g, "");
   if (net.isIPv4(clean)) return isPublicIPv4(clean);
   if (!net.isIPv6(clean)) return false;
-  // IPv4 embebida decimal: ::ffff:8.8.8.8 (mapped) y ::8.8.8.8 (compatible)
-  const v4 = clean.match(/^(?:(?:0+:){0,5}(?:ffff:)?|::(?:ffff:)?)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  // IPv4-mapped decimal: ::ffff:8.8.8.8 o 0:0:0:0:0:ffff:8.8.8.8 (la gama
+  // IPv4-compatible ::/96 sin ffff: está deprecada por RFC 4291 y la bloquea
+  // RESERVED_BLOCKS abajo).
+  const v4 = clean.match(/^(?:(?:0+:){0,5}ffff:|::ffff:)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
   if (v4) return isPublicIPv4(v4[1]);
-  // IPv4 embebida hex: ::ffff:7f00:1 o 0:0:0:0:0:ffff:7f00:1 o ::7f00:1
-  const v4Hex = clean.match(/^(?:(?:0+:){0,5}(?:ffff:)?|::(?:ffff:)?)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  // IPv4-mapped hex: ::ffff:7f00:1 o 0:0:0:0:0:ffff:7f00:1
+  const v4Hex = clean.match(/^(?:(?:0+:){0,5}ffff:|::ffff:)([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
   if (v4Hex) {
     const hi = parseInt(v4Hex[1], 16);
     const lo = parseInt(v4Hex[2], 16);
@@ -456,7 +470,7 @@ export default async function handler(req, res) {
     const eNum = hasSE ? Number(rawE) : 0;
     const epExactRe = hasSE
       ? new RegExp(
-          `(?:(?<![0-9a-z])s0*${sNum}[._\\s-]*e0*${eNum}|(?<![0-9])0*${sNum}x0*${eNum})(?![0-9])`,
+          `(?:(?<![0-9a-z])s0*${sNum}(?:[._\\s-]*e\\d+)*[._\\s-]*e0*${eNum}|(?<![0-9])0*${sNum}(?:[._\\s-]*x\\d+)*x0*${eNum})(?![0-9])`,
           "i"
         )
       : null;

@@ -102,7 +102,7 @@ for (const ip of ["127.0.0.1", "10.0.0.1", "172.16.5.5", "192.168.1.1", "169.254
 check("IPv4 8.8.8.8 es pública", isPublicIP("8.8.8.8") === true);
 check("IPv4 172.32.5.5 es pública (fuera de 172.16/12)", isPublicIP("172.32.5.5") === true);
 check("IPv4 100.128.0.1 es pública (fuera de CGNAT 100.64/10)", isPublicIP("100.128.0.1") === true);
-for (const ip of ["::1", "::", "fe80::1", "fc00::1", "fd12::1", "ff02::1", "::ffff:127.0.0.1", "::10.0.0.1", "::ffff:7f00:1", "::ffff:a00:1", "::ffff:c0a8:101", "64:ff9b::10.0.0.1", "2002:7f00:1::", "2001:db8::1", "0:0:0:0:0:0:0:1", "0:0:0:0:0:ffff:7f00:1", "::ffff:0:7f00:1"]) {
+for (const ip of ["::1", "::", "fe80::1", "fec0::1", "fc00::1", "fd12::1", "ff02::1", "2001::1", "::ffff:127.0.0.1", "::10.0.0.1", "::ffff:7f00:1", "::ffff:a00:1", "::ffff:c0a8:101", "64:ff9b::10.0.0.1", "2002:7f00:1::", "2001:db8::1", "0:0:0:0:0:0:0:1", "0:0:0:0:0:0:7f00:1", "0:0:0:0:0:0:127.0.0.1", "0:0:0:0:0:0:10.0.0.1", "0:0:0:0:0:ffff:7f00:1", "::ffff:0:7f00:1"]) {
   check(`IPv6 ${ip} es privada`, isPublicIP(ip) === false);
 }
 check("IPv6 2001:4860:4860::8888 es pública", isPublicIP("2001:4860:4860::8888") === true);
@@ -285,6 +285,23 @@ section("5. Extracción del zip");
   const resEpOnly = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/anime.zip") + "&s=1&e=3");
   check("v1.4.6: soporta nombres 'Ep 03' / 'E03' sin temporada",
     resEpOnly.statusCode === 200 && String(resEpOnly.body).includes("anime episodio 3 ok"));
+
+  // v1.4.7: Nombres multiepisodio (S01E03E04 / S01E03-E04) casan tanto con e=3 como con e=4.
+  const multiEpPack = buildZip([
+    ["Show.S01E01.srt", "ep 1\n"],
+    ["Show.S01E03E04.srt", "doble episodio 3 y 4 ok\n"],
+    ["Show.S01E05-E06.srt", "doble episodio 5 y 6 ConGuion ok\n"],
+  ]);
+  fetchImpl = () => new Response(multiEpPack, { status: 200 });
+  const resMulti3 = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/multi.zip") + "&s=1&e=3");
+  const resMulti4 = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/multi.zip") + "&s=1&e=4");
+  const resMulti6 = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/multi.zip") + "&s=1&e=6");
+  check("v1.4.7: S01E03E04 casa al pedir e=3",
+    resMulti3.statusCode === 200 && String(resMulti3.body).includes("doble episodio 3 y 4 ok"));
+  check("v1.4.7: S01E03E04 casa también al pedir e=4 (segundo episodio del par)",
+    resMulti4.statusCode === 200 && String(resMulti4.body).includes("doble episodio 3 y 4 ok"));
+  check("v1.4.7: S01E05-E06 casa al pedir e=6",
+    resMulti6.statusCode === 200 && String(resMulti6.body).includes("doble episodio 5 y 6 ConGuion ok"));
 }
 {
   const zip = buildZip([["a.vtt", "WEBVTT\n"], ["b.srt", "1\n00:00:01,000 --> 00:00:02,000\nx\n"], ["c_small.srt", "peque\n"], ["d_big.srt", "g".repeat(5000)]]);

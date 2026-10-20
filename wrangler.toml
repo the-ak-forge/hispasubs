@@ -36,9 +36,11 @@ namespace_id = "1001"
 
 # Observabilidad (Workers Logs + Workers Traces) — requiere redespliegue para
 # aplicarse. Logs: invocación + console.log/error en el dashboard (Workers &
-# Pages -> hispasubs -> Observability). Traces: spans automáticos de cada
-# subrequest saliente (API de OpenSubtitles/SubDL y descargas vía proxy) sin
-# tocar código — útiles para medir duración/latencia por fuente.
+# Pages -> hispasubs -> Observability). Traces se deja desactivado: el span
+# automático `cache_put` registraba `source.cache.request.url` con el segmento
+# base64url de configuración sin redactar y duplicaba el consumo de cuota;
+# `invocation_logs = true` + el log resumen de `/subtitles` ya conservan
+# `cpu_time_ms`, `wall_time_ms` y la latencia detallada por oleada.
 # Presupuesto Free: 200k eventos de log/día (retención 3 días); las rutas
 # /logo.svg y /favicon.ico son assets y NO generan invocaciones. Ojo: desde
 # el 1/12/2026 Workers Logs/Traces pasan a la precios de Cloudflare
@@ -50,9 +52,9 @@ invocation_logs = true
 persist = true
 
 [observability.traces]
-enabled = true
+enabled = false
 head_sampling_rate = 1
-persist = true
+persist = false
 
 # Variables opcionales (descomentar para cambiar los valores por defecto):
 #

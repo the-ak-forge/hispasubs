@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES } from "./worker.js";
+import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -380,7 +380,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.6", m10.version === "1.4.6", m10.version);
+  check("manifest version 1.4.7", m10.version === "1.4.7", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1168,6 +1168,129 @@ try {
       `len=${allSpam.length} cc=${res.headers.get("cache-control")}`);
   } finally {
     globalThis.fetch = origFetch17;
+  }
+}
+
+// 19) v1.4.7: auditoría externa de 1.4.6 (presupuesto de tiempo en 2ª oleada,
+// HTTP 404 sin degradar TTL, snippet en spamVerdict, cobertura regional y
+// negative lookaheads en diccionarios).
+{
+  check("v1.4.7: presupuesto de clasificación compartido 6000 ms (tope 1ª oleada 4000 ms)",
+    CLASSIFY_BUDGET_MS === 6000 && WAVE2_MAX_W1_MS === 4000,
+    `${CLASSIFY_BUDGET_MS}/${WAVE2_MAX_W1_MS}`);
+
+  // --- 19a: spamVerdict devuelve el fragmento (match) que disparó la regla ---
+  const svStrong = spamVerdict("1\n00:00:01,000 --> 00:00:02,000\nEntra en bet365 hoy\n");
+  check("v1.4.7 spamVerdict fuerte incluye match ('bet365')",
+    svStrong.discard === true && svStrong.match.toLowerCase().includes("bet365"),
+    JSON.stringify(svStrong));
+
+  const svEdge = spamVerdict("1\n00:00:01,000 --> 00:00:02,000\nSíguenos en Telegram para más\n");
+  check("v1.4.7 spamVerdict borde incluye match ('Síguenos en Telegram')",
+    svEdge.discard === true && /s[ií]guenos en telegram/i.test(svEdge.match),
+    JSON.stringify(svEdge));
+
+  const svWeak = spamVerdict("Traducido por Argenteam\nwww.opensubtitles.org");
+  check("v1.4.7 spamVerdict débil incluye ambos matches unidos por ' + '",
+    svWeak.discard === true && svWeak.match.includes("Traducido por") && svWeak.match.includes("opensubtitles"),
+    JSON.stringify(svWeak));
+
+  // --- 19b: Diccionarios regionales ampliados y negative lookaheads ---
+  check("v1.4.7 léxico Rioplatense (boludo/pibe/tenés/mirá) -> Latino",
+    scoreText("Che boludo, mirá al pibe, ¿tenés idea del quilombo?")?.flag === "🇲🇽 Latino",
+    JSON.stringify(scoreText("Che boludo, mirá al pibe, ¿tenés idea del quilombo?")));
+  check("v1.4.7 léxico Chileno (weón/cachai/fome/polola) -> Latino",
+    scoreText("Oye weón cachai que la fiesta estuvo fome con mi polola")?.flag === "🇲🇽 Latino",
+    JSON.stringify(scoreText("Oye weón cachai que la fiesta estuvo fome con mi polola")));
+  check("v1.4.7 léxico Colombiano/Caribe (parcero/chimba/chamo) -> Latino",
+    scoreText("Qué chimba parcero, hablá con el chamo")?.flag === "🇲🇽 Latino",
+    JSON.stringify(scoreText("Qué chimba parcero, hablá con el chamo")));
+  check("v1.4.7 léxico España (os/currar/flipar/mogollón) -> Castellano",
+    scoreText("Os digo que flipo mogollón cuando toca currar")?.flag === "🇪🇸 Castellano",
+    JSON.stringify(scoreText("Os digo que flipo mogollón cuando toca currar")));
+  check("v1.4.7 'sabes' y 'mira' (llanas sin tilde) NO disparan voseo rioplatense",
+    scoreText("Tú sabes que él mira por la ventana") === null,
+    JSON.stringify(scoreText("Tú sabes que él mira por la ventana")));
+  check("v1.4.7 'joder' pasa a débil (0,25): por sí solo no clasifica un título como ES",
+    scoreText("no me jodas, joder, qué jodienda joder") === null,
+    JSON.stringify(scoreText("no me jodas, joder, qué jodienda joder")));
+  check("v1.4.7 lookahead: 'móvil del crimen / móvil del asesinato' NO puntúa como teléfono móvil ES",
+    scoreText("El móvil del crimen y el móvil del asesinato y el móvil del delito") === null,
+    JSON.stringify(scoreText("El móvil del crimen y el móvil del asesinato y el móvil del delito")));
+  check("v1.4.7 lookahead: 'carro de la compra / carro de combate' NO puntúa como automóvil LAT",
+    scoreText("Lleva el carro de la compra y el carro de combate y el carro blindado") === null,
+    JSON.stringify(scoreText("Lleva el carro de la compra y el carro de combate y el carro blindado")));
+  check("v1.4.7 lookahead: 'conduce a nada / conduce a la ruina' NO puntúa como conducir ES",
+    scoreText("Esto conduce a nada, conduce a la ruina y conduce a un desastre") === null,
+    JSON.stringify(scoreText("Esto conduce a nada, conduce a la ruina y conduce a un desastre")));
+  check("v1.4.7 cine formal sin jerga sigue clasificando por sustantivos/verbos cotidianos",
+    scoreText("El coche está aparcado, llámame al móvil cuando termines de conducir")?.flag === "🇪🇸 Castellano" &&
+      scoreText("El carro está estacionado, llámame al celular cuando termines de manejar")?.flag === "🇲🇽 Latino");
+
+  // --- 19c: HTTP 404 (pack sin episodio o enlace muerto) NO degrada el TTL a 60s
+  // cuando hay pistas válidas, pero sí activa la 2ª oleada para rellenar ---
+  let wave2CalledOn404 = false;
+  const origFetch18 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        subtitles: [
+          { id: "dead1", url: "https://subs5.strem.io/dead404.srt", lang: "spa" },
+          { id: "ok1", url: "https://subs5.strem.io/ok1.srt", lang: "spa" },
+          { id: "ok2", url: "https://subs5.strem.io/ok2.srt", lang: "spa" },
+          { id: "ok3", url: "https://subs5.strem.io/ok3.srt", lang: "spa" },
+          { id: "ok4", url: "https://subs5.strem.io/ok4.srt", lang: "spa" },
+          { id: "w2_6", url: "https://subs5.strem.io/w2_6.srt", lang: "spa" },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("dead404.srt")) return Promise.resolve(new Response("Not found", { status: 404 }));
+    if (u.includes("w2_6.srt")) {
+      wave2CalledOn404 = true;
+      return Promise.resolve(textResp(TXT_CAST));
+    }
+    if (u.includes("subs5.strem.io/ok")) return Promise.resolve(textResp(TXT_CAST));
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get("/subtitles/movie/tt7770030.json");
+    const s404 = (await res.json()).subtitles || [];
+    check("v1.4.7 HTTP 404 en 1ª oleada activa 2ª oleada para rellenar las 5 limpias",
+      wave2CalledOn404 && s404.length === 5,
+      `wave2=${wave2CalledOn404} len=${s404.length}`);
+  } finally {
+    globalThis.fetch = origFetch18;
+  }
+
+  // Y con <5 candidatos totales (p.ej. 1 pack 404 + 2 válidos), el 404 NO baja
+  // el TTL a 60s (es ausencia permanente, no caída transitoria).
+  const origFetch19 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        subtitles: [
+          { id: "dead1", url: "https://subs5.strem.io/dead404.srt", lang: "spa" },
+          { id: "ok1", url: "https://subs5.strem.io/ok1.srt", lang: "spa" },
+          { id: "ok2", url: "https://subs5.strem.io/ok2.srt", lang: "spa" },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("dead404.srt")) return Promise.resolve(new Response("Not found", { status: 404 }));
+    if (u.includes("subs5.strem.io/ok")) return Promise.resolve(textResp(TXT_CAST));
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get("/subtitles/movie/tt7770031.json");
+    const s404Partial = (await res.json()).subtitles || [];
+    check("v1.4.7 HTTP 404 con catálogo corto (1×404 + 2 válidas) -> sirve 2 con TTL 7200s (no 60s)",
+      s404Partial.length === 2 && res.headers.get("cache-control") === "public, max-age=7200",
+      `len=${s404Partial.length} cc=${res.headers.get("cache-control")}`);
+  } finally {
+    globalThis.fetch = origFetch19;
   }
 }
 
