@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.8
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.9
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -16,6 +16,13 @@
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
+//
+// v1.4.9 (20/10/2026):
+//  - [ReDoS] Eliminados los `0*` redundantes antes de `(\d+)` en SE_HEAD
+//    (Number() ya normaliza ceros a la izquierda): evita el backtracking
+//    cuadrático O(n²) ante nombres de 65.000 ceros (~16 s -> ~60 ms).
+//  - [SERIES] EP_NEXT acota el segundo episodio a `\d{1,2}` para no confundir
+//    códecs/resoluciones (`.x264`, `.x265`, `-720p`) con episodios >= 100.
 //
 // v1.4.8 (20/10/2026):
 //  - [CÓDIGOS HTTP] El proxy distingue sus descartes de contenido de un 404
@@ -120,7 +127,7 @@ const MAX_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
-const USER_AGENT = "HispaSubs/1.4.8";
+const USER_AGENT = "HispaSubs/1.4.9";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 
@@ -482,9 +489,9 @@ export default async function handler(req, res) {
     const eNum = hasSE ? Number(rawE) : 0;
     // Matcher lineal O(n) en dos pasos (SE_HEAD + EP_NEXT sticky /iy): cubre
     // S01E03, 1x03 y multiepisodios (S01E03E04, S01E03-E04, S01E03-04,
-    // S01E03+E04, 1x03x04) sin backtracking exponencial en cadenas de dígitos.
-    const SE_HEAD = /(?<![0-9a-z])s0*(\d+)[._\s-]*e0*(\d+)(?![0-9])|(?<![0-9])0*(\d+)x0*(\d+)(?![0-9])/gi;
-    const EP_NEXT = /(?:[-+][ex]?|[._\s]*[ex])0*(\d{1,3})(?![0-9])/iy;
+    // S01E03+E04, 1x03x04) sin backtracking en cadenas de ceros/dígitos.
+    const SE_HEAD = /(?<![0-9a-z])s(\d+)[._\s-]*e(\d+)(?![0-9])|(?<![0-9])(\d+)x(\d+)(?![0-9])/gi;
+    const EP_NEXT = /(?:[-+][ex]?|[._\s]*[ex])0*(\d{1,2})(?![0-9])/iy;
     const hasExactEp = (name) => {
       SE_HEAD.lastIndex = 0;
       for (let m; (m = SE_HEAD.exec(name)); ) {

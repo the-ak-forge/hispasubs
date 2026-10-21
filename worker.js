@@ -1,6 +1,20 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.8
+// HispaSubs — Cloudflare Worker v1.4.9
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.9 (20/10/2026) — auditoría externa de la 1.4.8:
+//  - [PORTUGUÉS] La guarda de portugués exige tanto ≥10 apariciones de `ã`/`õ`
+//    (solo minúsculas, sin contar `Ã` de mojibake UTF-8) como una densidad
+//    ≥0,2 % (`tildes * 500 >= text.length`), para que un subtítulo español de
+//    84 KB con nombres propios como "João" o "São Paulo" no caiga en 📄.
+//  - [LOGS / CUOTA] Las puntuaciones léxicas (`es`, `lat`, `s` y el motivo de
+//    📄: `portugués`, `sin léxico` o `solo términos débiles`) viajan en un
+//    Symbol (`SCORE`) y se imprimen en la única línea de `[subtitles] resumen`,
+//    evitando multiplicar por 6 el consumo del límite diario de 200k eventos.
+//  - [LÉXICO] Lookahead de `manej*` ampliado a `del?` ("manejo del presupuesto").
+//  - [PROXY] Eliminados los `0*` redundantes en `SE_HEAD` (evita O(n²) con
+//    65.000 ceros) y acotado `EP_NEXT` a `\d{1,2}` (no confunde `.x264`/`.x265`
+//    o `-720p` con episodios >= 100).
 //
 // v1.4.8 (20/10/2026) — auditoría externa de la 1.4.7:
 //  - [TTL / PROXY 410/422] Se distingue entre descarte de contenido y caída de
@@ -228,15 +242,16 @@
 // decida la clasificación; solo pesan cuando aparecen muchas veces.
 const WEAK_WEIGHT = 0.25;
 const DICT_ES = /(?<![\p{L}\p{N}_])(?:vosotros|ordenador(?:es)?|coche[s]?|gilipollas|hostias?|chaval(?:es)?|foll(?:ar|a|an|en|ó|o|ado|ando)|guay|m[oó]vil(?:es)?(?!\s+del\s+(?:crimen|asesinato|delito|robo|ataque)|\s+perpetuo)|patata[s]?|zumo[s]?|aparqu[\p{L}]*|aparc[\p{L}]*|condu(?:cir|zco|zca|zcan|ces|ce|cen|jiste|jeron|jo|cía|cías|cíamos|cían|ciendo|cido)(?!\s+a\s+(?:nada|eso|esto|ninguna\s+parte|la\s+ruina|un\s+desastre|una?\s+conclusi[oó]n))|enfad[\p{L}]*|nevera[s]?|jol[ií]n|mol(?:a|an)|ten[eé]is|sois|est[aá]is|mogoll[oó]n|curr(?:ar|o|as|a|amos|áis|an|ando|ado|ante[s]?)|flip(?:ar|o|as|a|amos|áis|an|é|ó|ando|ado|ante[s]?))(?![\p{L}\p{N}_])/giu;
-const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?(?!\s+de\s+(?:(?:la\s+)?compra|combate)|\s+blindado)|auto(?:s)?|pendej[\p{L}]*|ching(?:ar|a|as|an|o|ó|aron|aba|aban|ado|ada|ando|ón|ones|ue|ues|uen|ué|adera)|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion(?:ar|a|as|an|ó|é|aste|aron|aba|abas|ábamos|aban|ado|ada|ando|amiento)|manej[\p{L}]*(?!\s+de(?![\p{L}\p{N}_]))|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|carajo|[oó]rale|chido|bacano|bolud[\p{L}]*|pelotud[\p{L}]*|pibe[s]?|quilombo[s]?|tenés|querés|podés|sabés|decís|vení|mirá|we[oó]n(?:es|a|as)?|huev[oó]n(?:es|a|as)?|cachai|polol[oa][s]?|parce(?:ro|ra|ros|ras)?|chimba[s]?|chamo[s]?)(?![\p{L}\p{N}_])/giu;
+const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?(?!\s+de\s+(?:(?:la\s+)?compra|combate)|\s+blindado)|auto(?:s)?|pendej[\p{L}]*|ching(?:ar|a|as|an|o|ó|aron|aba|aban|ado|ada|ando|ón|ones|ue|ues|uen|ué|adera)|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion(?:ar|a|as|an|ó|é|aste|aron|aba|abas|ábamos|aban|ado|ada|ando|amiento)|manej[\p{L}]*(?!\s+del?(?![\p{L}\p{N}_]))|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|carajo|[oó]rale|chido|bacano|bolud[\p{L}]*|pelotud[\p{L}]*|pibe[s]?|quilombo[s]?|tenés|querés|podés|sabés|decís|vení|mirá|we[oó]n(?:es|a|as)?|huev[oó]n(?:es|a|as)?|cachai|polol[oa][s]?|parce(?:ro|ra|ros|ras)?|chimba[s]?|chamo[s]?)(?![\p{L}\p{N}_])/giu;
 const DICT_ES_WEAK = /(?<![\p{L}\p{N}_])(?:vale|jod(?:e|es|en|emos|er|a|as|an|ía|ías|íamos|ían|ió|ieron|iendo|ido|ida|idos|idas))(?![\p{L}\p{N}_])/giu;
 // Sin flag `i`: "os" / "Os" (inicio de frase) suman 0,25 para España, pero
 // "OS" en mayúsculas (Operating System) no casa nunca.
 const DICT_ES_WEAK_CS = /(?<![\p{L}\p{N}_])[oO]s(?![\p{L}\p{N}_])/gu;
 const DICT_LAT_WEAK = /(?<![\p{L}\p{N}_])(?:papa[s]?|neta[s]?|ustedes|fome[s]?)(?![\p{L}\p{N}_])/giu;
 // Guarda contra archivos en portugués mal etiquetados como español (donde
-// "carro", "celular" o "estacionamento" darían falso positivo Latino).
-const PT_TILDE_RE = /[ãõ]/giu;
+// "carro", "celular" o "estacionamento" darían falso positivo Latino). Sin
+// flag `i` para que "Ã" de mojibake UTF-8 no cuente como tilde portuguesa.
+const PT_TILDE_RE = /[ãõ]/gu;
 
 // Túnel Node.js en Vercel como motor de extracción de zips.
 // IMPORTANTE: el proxy DEBE llevar allowlist de hosts (ver api/proxy.js),
@@ -569,7 +584,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.8",
+  version: "1.4.9",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -725,6 +740,7 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
 // sirven: se descartan en vez de publicarse sin verificar.)
 const FAILED = Symbol.for("hispasubs.failed");
 const DISCARDED_404 = Symbol.for("hispasubs.discarded404");
+const SCORE = Symbol.for("hispasubs.score");
 const unclassified = (sub, finalUrl, failed = false) => ({
   id: sub.id,
   url: finalUrl,
@@ -737,10 +753,15 @@ const unclassified = (sub, finalUrl, failed = false) => ({
 // contra un corpus etiquetado (fronteras Unicode, conjugaciones y términos
 // ambiguos). Devuelve null cuando NO hay datos suficientes para afirmar nada
 // (📄 "sin clasificar"); nunca decide por defecto.
-const scoreText = (text) => {
-  // Guarda contra portugués mal etiquetado como español: en español no se usan
-  // "ã"/"õ"; con ≥10 apariciones es portugués y no debe salir 🇲🇽 por "carro"/"celular".
-  if ((text.match(PT_TILDE_RE) || []).length >= 10) return null;
+const scoreText = (text, diag = {}) => {
+  // Guarda contra portugués mal etiquetado como español: ≥10 "ã"/"õ" Y ≥0,2 %
+  // de los caracteres (un nombre como "João"/"São Paulo" no debe tumbar un
+  // subtítulo español entero).
+  const tildes = (text.match(PT_TILDE_RE) || []).length;
+  if (tildes >= 10 && tildes * 500 >= text.length) {
+    diag.reason = "portugués";
+    return null;
+  }
 
   // Los términos ambiguos (WEAK) valen 0,25: "No vale la pena", "el Papa",
   // "ganancia neta" o un "ustedes" formal de España ya no deciden solos.
@@ -754,7 +775,13 @@ const scoreText = (text) => {
   const latMatches = strongLat + score(DICT_LAT_WEAK, WEAK_WEIGHT);
   const strongTotal = strongEs + strongLat;
   const total = esMatches + latMatches;
-  if (total === 0) return null;
+  diag.es = esMatches;
+  diag.lat = latMatches;
+  diag.strong = strongTotal;
+  if (total === 0) {
+    diag.reason = "sin léxico";
+    return null;
+  }
 
   // Margen proporcional: con 3 apariciones de "coche" ya no decides un
   // subtítulo entero; hace falta cierta ventaja relativa.
@@ -763,7 +790,10 @@ const scoreText = (text) => {
   // Sin NINGÚN término fuerte no hay veredicto: los ambiguos (peso 0,25) solo
   // matizan. Evita que una acumulación de "ustedes" (o "vale"/"papa") decida
   // un dialecto por aritmética; en ese caso es 📄 "sin clasificar".
-  if (strongTotal === 0) return null;
+  if (strongTotal === 0) {
+    diag.reason = "solo términos débiles";
+    return null;
+  }
 
   let flag = "🌎 Neutro";
   if (esMatches > latMatches + margin) flag = "🇪🇸 Castellano";
@@ -956,18 +986,27 @@ const classifySubtitle = async (
       }
     }
 
-    const scored = scoreText(text);
+    const diag = {};
+    const scored = scoreText(text, diag);
+    const brief = (flag) =>
+      `${flag} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0}${
+        diag.reason ? ` (${diag.reason})` : ""
+      }`;
     if (!scored) {
-      // Ni una sola palabra del léxico (o descartado por guarda de portugués):
+      // Ni una sola palabra del léxico (o solo débiles / guarda de portugués):
       // el texto llegó y se analizó sin error → no es fallo transitorio → TTL normal.
-      console.log(`[classify] ${sub.source} -> 📄 sin clasificar (es=0 lat=0 strong=0)`);
-      return unclassified(sub, finalUrl);
+      const u = unclassified(sub, finalUrl);
+      u[SCORE] = brief("📄");
+      return u;
     }
 
-    console.log(
-      `[classify] ${sub.source} -> ${scored.flag} (es=${scored.esMatches} lat=${scored.latMatches} strong=${scored.strongTotal})`
-    );
-    return { id: sub.id, url: finalUrl, lang: LANG_ISO_ES, label: `${scored.flag} (${sub.source})` };
+    return {
+      id: sub.id,
+      url: finalUrl,
+      lang: LANG_ISO_ES,
+      label: `${scored.flag} (${sub.source})`,
+      [SCORE]: brief(scored.flag),
+    };
   } catch (error) {
     console.error("[classify]", sub.source, error.message);
     // Descarte permanente sin penalizar el TTL:
@@ -1252,6 +1291,7 @@ export default {
         const kept = { "OS-V3": 0, "SubDL": 0 };
         const failed = { "OS-V3": 0, "SubDL": 0 };
         let descartes404 = 0;
+        const scoreLog = [];
         const subtitles = [];
         for (let i = 0; i < analyzed.length; i++) {
           const s = analyzed[i];
@@ -1268,6 +1308,7 @@ export default {
           if (kept[source] >= ANALYSIS_BUDGET_PER_SOURCE) continue;
           kept[source] += 1;
           subtitles.push(s);
+          if (s[SCORE]) scoreLog.push(`${source}:${s[SCORE]}`);
         }
 
         // TTL según fiabilidad (v1.4.5/1.4.6, por fuente): una fuente se
@@ -1288,7 +1329,8 @@ export default {
           `[subtitles] resumen ${type}/${fullId}: total=${Date.now() - tStart}ms w1=${w1Ms}ms w2=${w2Ms}ms ` +
             `descargas=${wave1Idx.length + (wave2Ran ? wave2Idx.length : 0)} ` +
             `servidas=${subtitles.length} (OS-V3=${kept["OS-V3"]},SubDL=${kept["SubDL"]}) ` +
-            `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} ttl=${ttl}s`
+            `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} ttl=${ttl}s` +
+            (scoreLog.length ? ` | ${scoreLog.join(" | ")}` : "")
         );
         const response = jsonResponse({ subtitles }, ttl);
         cachePut(ctx, cacheReq || request, response);

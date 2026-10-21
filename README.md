@@ -67,7 +67,7 @@ HispaSubs inspecciona el contenido textual de cada subtítulo e identifica patro
 | 🇪🇸 Castellano | Analizado. Vocabulario y giros de España. |
 | 🇲🇽 Latino | Analizado. Vocabulario latinoamericano. |
 | 🌎 Neutro | Analizado. Sin inclinación regional marcada (solo si hubo coincidencias léxicas reales). |
-| 📄 Español (sin clasificar) | El texto se analizó (y pasó el filtro anti-spam), pero no dio un veredicto léxico fiable: contenido válido sin ninguna palabra del léxico. Las descargas que fallan (red, rate limit, HTML de error) no se muestran. |
+| 📄 Español (sin clasificar) | El texto se analizó (y pasó el filtro anti-spam), pero no dio un veredicto léxico fiable: contenido sin términos fuertes del léxico (0 coincidencias o solo términos ambiguos débiles) o texto en portugués mal etiquetado. Las descargas que fallan (red, rate limit, HTML de error) no se muestran. |
 
 Esto permite distinguir entre versiones del español con matices regionales sin depender de metadatos ambiguos o genéricos.
 
@@ -135,7 +135,7 @@ Para evitar abusos, ambos componentes aplican un límite de peticiones por IP (l
 ## 🛠️ Solución de problemas
 
 ### Veo subtítulos con la etiqueta 📄 “Español (sin clasificar)”
-El análisis consume recursos, así que por título se **descargan hasta 8 candidatos por fuente** (OpenSubtitles y SubDL) y se muestran **como máximo 5 limpios por fuente**: lo que no se puede verificar se descarta, y lo que falla al descargar (rate limit del proveedor, red, HTML de error) no se muestra como pista. La etiqueta 📄 aparece cuando el análisis **sí** se completó sobre un texto válido pero no encontró ninguna palabra del léxico — en ese caso no se afirma “🌎 Neutro” porque no hay datos reales que lo respalden. Los subtítulos con publicidad incrustada (casas de apuestas, canales de Telegram/WhatsApp, CTAs de app/web…) se descartan automáticamente; una simple línea de crédito (“Traducido por X”) no basta para eliminarlos. Una clave de SubDL amplía el catálogo disponible.
+El análisis consume recursos, así que por título se **descargan hasta 8 candidatos por fuente** (OpenSubtitles y SubDL) y se muestran **como máximo 5 limpios por fuente**: lo que no se puede verificar se descarta, y lo que falla al descargar (rate limit del proveedor, red, HTML de error) no se muestra como pista. La etiqueta 📄 aparece cuando el análisis **sí** se completó sobre un texto válido pero no encontró términos fuertes suficientes para decidir (0 coincidencias, solo términos débiles ambiguos o archivo en portugués mal etiquetado) — en ese caso no se afirma “🌎 Neutro” porque no hay datos reales que lo respalden. Los subtítulos con publicidad incrustada (casas de apuestas, canales de Telegram/WhatsApp, CTAs de app/web…) se descartan automáticamente; una simple línea de crédito (“Traducido por X”) no basta para eliminarlos. Una clave de SubDL amplía el catálogo disponible.
 
 ### No veo subtítulos de SubDL
 Comprueba que tu clave es válida probándola directamente:

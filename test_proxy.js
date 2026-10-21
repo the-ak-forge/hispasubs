@@ -319,6 +319,28 @@ section("5. Extracción del zip");
   const dtHostile = Date.now() - tHostile;
   check("v1.4.8 Anti-ReDoS: matcher multiepisodio lineal (<50 ms con 100 dígitos)",
     resHostile.statusCode === 422 && dtHostile < 50, `dt=${dtHostile}ms status=${resHostile.statusCode}`);
+
+  // v1.4.9 Anti-ReDoS con 65.000 ceros seguidos ('s' + 65k ceros): antes 0*(\d+)
+  // en SE_HEAD era cuadrático O(n²) y tardaba ~16 s; ahora sin 0* tarda <200 ms.
+  const zerosZip = buildZip([[`s${"0".repeat(65000)}.srt`, "ceros\n"]]);
+  fetchImpl = () => new Response(zerosZip, { status: 200 });
+  const tZeros = Date.now();
+  const resZeros = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/z.zip") + "&s=1&e=1");
+  const dtZeros = Date.now() - tZeros;
+  check("v1.4.9 Anti-ReDoS: nombre con 65.000 ceros tarda <200 ms (sin O(n²) en SE_HEAD)",
+    resZeros.statusCode === 200 && dtZeros < 200, `dt=${dtZeros}ms status=${resZeros.statusCode}`);
+
+  // v1.4.9: EP_NEXT (\d{1,2}) no confunde códecs/resoluciones (.x264, -720p) con episodios >=100.
+  const codecZip = buildZip([
+    ["Show.S01E03.x264.srt", "ep 3 x264\n"],
+    ["Show.S01E04-720p.srt", "ep 4 720p\n"],
+  ]);
+  fetchImpl = () => new Response(codecZip, { status: 200 });
+  const resCodec264 = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/c.zip") + "&s=1&e=264");
+  const resCodec720 = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/c.zip") + "&s=1&e=720");
+  check("v1.4.9: S01E03.x264 y S01E04-720p NO casan al pedir e=264 ni e=720 (-> 422)",
+    resCodec264.statusCode === 422 && resCodec720.statusCode === 422,
+    `264=${resCodec264.statusCode} 720=${resCodec720.statusCode}`);
 }
 {
   const zip = buildZip([["a.vtt", "WEBVTT\n"], ["b.srt", "1\n00:00:01,000 --> 00:00:02,000\nx\n"], ["c_small.srt", "peque\n"], ["d_big.srt", "g".repeat(5000)]]);

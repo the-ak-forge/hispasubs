@@ -380,7 +380,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.8", m10.version === "1.4.8", m10.version);
+  check("manifest version 1.4.9", m10.version === "1.4.9", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1368,6 +1368,30 @@ try {
   } finally {
     globalThis.fetch = origFetch20;
   }
+
+  // --- 21: v1.4.9 (densidad de portugués ≥0,2 %, diag.reason y 'manejo del') ---
+  const esWithJoao = "Hola João en São Paulo. ".repeat(12) + "En España conducimos el coche, el ordenador y el móvil. ".repeat(36) + "x".repeat(80000);
+  const diagEsJoao = {};
+  const scoredEsJoao = scoreText(esWithJoao, diagEsJoao);
+  check("v1.4.9: subtítulo español de 84 KB con 24 'ã' ('João/São Paulo', <0,2%) NO cae en portugués -> 🇪🇸 Castellano",
+    scoredEsJoao?.flag === "🇪🇸 Castellano",
+    JSON.stringify({ scoredEsJoao, diagEsJoao }));
+
+  const diagPt = {};
+  scoreText(ptSub, diagPt);
+  const diagWeak = {};
+  scoreText("vale vale ustedes", diagWeak);
+  const diagEmpty = {};
+  scoreText("hola mundo sin modismos", diagEmpty);
+  check("v1.4.9: diag.reason distingue 'portugués', 'solo términos débiles' y 'sin léxico'",
+    diagPt.reason === "portugués" &&
+      diagWeak.reason === "solo términos débiles" && diagWeak.es === 0.5 && diagWeak.lat === 0.25 &&
+      diagEmpty.reason === "sin léxico",
+    JSON.stringify({ diagPt, diagWeak, diagEmpty }));
+
+  check("v1.4.9: 'manejo del presupuesto / manejo del estrés' NO puntúa como conducir LAT",
+    scoreText("El manejo del presupuesto, el manejo del estrés y el manejo del tiempo") === null,
+    JSON.stringify(scoreText("El manejo del presupuesto, el manejo del estrés y el manejo del tiempo")));
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);
