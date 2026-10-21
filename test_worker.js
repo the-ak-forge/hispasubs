@@ -190,8 +190,8 @@ globalThis.fetch = (input, init) => {
     return Promise.resolve(new Response(JSON.stringify({
       status: true,
       subtitles: [
-        { url: "/subtitle/111-222.zip", release_name: "Rel.ZIP" },
-        { url: "https://dl.subdl.com/subtitle/333-444.srt", release_name: "Rel.ABS" },
+        { url: "/subtitle/111-222.zip?api_key=secretKey123", release_name: "Rel.ZIP" },
+        { url: "https://dl.subdl.com/subtitle/333-444.srt?api_key=secretKey456", release_name: "Rel.ABS" },
         { url: "javascript:alert(1)", release_name: "Maliciosa" },
         { release_name: "Sin url" },
       ],
@@ -224,15 +224,17 @@ try {
   const srtEntry = entries.find((e) => e.url === "https://dl.subdl.com/subtitle/333-444.srt");
   const osEntries = entries.filter((e) => e.url.includes("subs5.strem.io"));
 
-  check("SubDL zip relativa -> proxy, lang 'spa' y label Latino",
-    zipEntry?.lang === "spa" && zipEntry?.label === "🇲🇽 Latino (SubDL)",
+  check("SubDL zip relativa -> proxy, lang 'spa', label Latino y SIN api_key en URL",
+    zipEntry?.lang === "spa" && zipEntry?.label === "🇲🇽 Latino (SubDL)" &&
+    !zipEntry?.url.includes("secretKey123") && !zipEntry?.url.includes("api_key"),
     JSON.stringify(zipEntry).slice(0, 160));
 
   // Lote 2: lista SIN fallos de clasificación -> TTL completo de 2 h.
   check("lista limpia (sin fallos) -> Cache-Control 7200",
     res.headers.get("cache-control") === "public, max-age=7200", res.headers.get("cache-control"));
-  check("SubDL url absoluta -> lang 'spa' y label Castellano",
-    srtEntry?.lang === "spa" && srtEntry?.label === "🇪🇸 Castellano (SubDL)",
+  check("SubDL url absoluta -> lang 'spa', label Castellano y SIN api_key en URL",
+    srtEntry?.lang === "spa" && srtEntry?.label === "🇪🇸 Castellano (SubDL)" &&
+    !srtEntry?.url.includes("secretKey456") && !srtEntry?.url.includes("api_key"),
     JSON.stringify(srtEntry).slice(0, 160));
   check("urls javascript/sin url descartadas", entries.length === 7, `entradas=${entries.length}`);
   check("OS-V3: sub no-española (cze) filtrada", osEntries.length === 5, `os=${osEntries.length}`);
@@ -380,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.10", m10.version === "1.4.10", m10.version);
+  check("manifest version 1.4.11", m10.version === "1.4.11", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando

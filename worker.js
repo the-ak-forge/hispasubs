@@ -1,6 +1,16 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.10
+// HispaSubs — Cloudflare Worker v1.4.11
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.11 (21/10/2026):
+//  - [PRIVACIDAD / CUOTA] SubDL devuelve URLs con `?api_key=...`, pero su CDN
+//    público (dl.subdl.com) no la exige y tiene un cupo diario de 50 descargas/clave
+//    que al agotarse responde HTTP 429 (mapeado a 502 en proxy). Se elimina
+//    `api_key` de las URLs de SubDL: evita quemar la cuota, protege la clave
+//    en logs y Stremio, y hace que la caché del Edge de Vercel sea compartida
+//    (Edge HIT).
+//  - [PROXY] El proxy sanitiza `api_key` en URLs de entrada y registra el código
+//    HTTP del origen en caso de error para diagnóstico inmediato.
 //
 // v1.4.10 (20/10/2026) — auditoría externa de la 1.4.9:
 //  - [PORTUGUÉS] Guarda ampliada a portugués en MAYÚSCULAS (`/[ãõÕ]|Ã(?=[A-Z])/gu`),
@@ -594,7 +604,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.10",
+  version: "1.4.11",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -698,12 +708,27 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
         // descartaba TODAS las entradas de SubDL en silencio. Orden correcto:
         // 1) absolutizar, 2) validar el resultado.
         const raw = sub.url.trim();
-        const dlUrl = raw.startsWith("http")
+        let dlUrl = raw.startsWith("http")
           ? raw
           : raw.startsWith("/") // relativa tipo /subtitle/123.zip (doc oficial)
             ? `https://dl.subdl.com${raw}`
             : null; // cualquier otra cosa (javascript:, datos, basura) se descarta
         if (!dlUrl || !isHttpUrl(dlUrl)) return null; // SSRF: solo http(s)
+        // SubDL adjunta `?api_key=...` a la URL de descarga, pero su CDN público
+        // (dl.subdl.com) no la exige y tiene un cupo diario de 50 descargas/clave
+        // que al agotarse responde HTTP 429 -> 502 en el proxy. Al eliminarla:
+        //  1. Evitamos exponer la api_key en URLs de Stremio y en logs de Vercel.
+        //  2. La URL es canónica -> la caché Edge de Vercel/Cloudflare es compartida.
+        //  3. Se evitan los falsos 502 por agotamiento de cuota diaria de SubDL.
+        try {
+          const parsed = new URL(dlUrl);
+          if (parsed.searchParams.has("api_key")) {
+            parsed.searchParams.delete("api_key");
+            dlUrl = parsed.toString();
+          }
+        } catch {
+          // Si URL falla el parseo, se deja dlUrl tal cual
+        }
         return {
           // file_id como fallback: índice determinista, nunca Math.random().
           id: sub.file_id ? `sdl_${sub.file_id}` : `sdl_${hashStr(dlUrl)}_${i}`,

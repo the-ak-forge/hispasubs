@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.10
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.11
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -16,6 +16,14 @@
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
+//
+// v1.4.11 (21/10/2026):
+//  - [PRIVACIDAD / CACHÉ] Sanitización de `api_key` en `target`: si la URL
+//    apuntaba a dl.subdl.com con `api_key=...`, se elimina el parámetro. Esto
+//    evita quemar la cuota de 50 descargas/día de SubDL (que devolvía 429),
+//    protege la clave del usuario en logs y unifica la caché del Edge.
+//  - [OBSERVABILIDAD] Log explícito de `upstream.status` y ruta cuando el
+//    origen responde con error (!upstream.ok).
 //
 // v1.4.10 (20/10/2026):
 //  - [ReDoS] Tope de 8 episodios encadenados por cabecera en el bucle EP_NEXT:
@@ -132,7 +140,7 @@ const MAX_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
-const USER_AGENT = "HispaSubs/1.4.10";
+const USER_AGENT = "HispaSubs/1.4.11";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 
@@ -387,6 +395,13 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "URL inválida" });
     }
 
+    // Defensa en profundidad: eliminar api_key de consultas a dl.subdl.com
+    // (o a cualquier host de la allowlist) para evitar exponer credenciales en
+    // logs, quemar la cuota de 50 descargas/día de SubDL y unificar la caché Edge.
+    if (target.searchParams.has("api_key")) {
+      target.searchParams.delete("api_key");
+    }
+
     // Límite de peticiones por IP: solo aquí, porque solo aquí se descarga.
     const retryAfter = rateLimit(clientIp(req));
     if (retryAfter) {
@@ -428,6 +443,7 @@ export default async function handler(req, res) {
           continue;
         }
         if (!upstream.ok) {
+          console.error(`[proxy] origen respondió ${upstream.status} para ${target.hostname}${target.pathname}`);
           const code = upstream.status === 404 || upstream.status === 410 ? 410 : 502;
           return res.status(code).json({ error: `Origen respondió ${upstream.status}` });
         }

@@ -592,6 +592,17 @@ section("5c. v1.4.1: readCapped, .sub UTF-16 y zipUrl duplicado");
   check("el fetch va al host del primer valor (allowlist)", String(fetchLog.at(-1)?.url || "").includes("dl.subdl.com"),
     String(fetchLog.at(-1)?.url));
 }
+{
+  // v1.4.11: target sanitiza api_key antes de fetch (evita 429 de SubDL y fugas en logs)
+  fetchLog.length = 0;
+  const zip = buildZip([["sub.srt", "1\n00:00:01,000 --> 00:00:02,000\nok\n"]]);
+  fetchImpl = () => new Response(zip, { status: 200 });
+  const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip?api_key=mySecretKey"));
+  const lastFetch = fetchLog.at(-1)?.url || "";
+  check("v1.4.11: el proxy elimina api_key de la URL antes de llamar al origen",
+    res.statusCode === 200 && !lastFetch.includes("api_key") && lastFetch === "https://dl.subdl.com/sub.zip",
+    `status=${res.statusCode} url=${lastFetch}`);
+}
 section("6. Rate limit por IP");
 process.env.RATE_LIMIT_PER_MIN = "3";
 {
