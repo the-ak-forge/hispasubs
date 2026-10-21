@@ -35,7 +35,8 @@ El complemento analiza el texto de los subtítulos, detecta expresiones, pronomb
 
 - Privacidad y rendimiento
   - Ejecuta la lógica en Edge con baja latencia.
-  - No almacena datos ni credenciales del usuario: tu clave de SubDL vive en tu configuración de Stremio, no en una base de datos propia. *Nota de transparencia:* como en cualquier addon que use esta API, la clave viaja en la URL de instalación (según el protocolo de configuración de Stremio) y en la petición saliente a SubDL (`api_key`); los registros de diagnóstico de Cloudflare del operador pueden conservar esa URL de forma efímera hasta 3 días (solo visibles para quien administra la cuenta), y cualquiera que intercepte la conexión podría leerla.
+  - Caché unificada en el Edge: las URLs de descarga de subtítulos son canónicas entre usuarios, permitiendo que las extracciones de `.zip` se almacenen en caché durante 24 horas y se sirvan al instante (<30 ms).
+  - No almacena datos ni credenciales del usuario: tu clave de SubDL vive en tu configuración de Stremio, no en una base de datos propia. *Nota de transparencia:* la clave solo se utiliza internamente en el Worker para consultar la API de metadatos de SubDL (`api.subdl.com`). Se elimina por completo de los enlaces de descarga de los subtítulos, por lo que **nunca se envía al proxy de Vercel, no queda registrada en sus logs ni se expone a los reproductores de Stremio**, evitando además agotar la cuota de descargas diarias de SubDL. Como en cualquier addon con configuración, la clave viaja en la URL de instalación de Stremio; los registros de diagnóstico efímeros de Cloudflare pueden conservarla hasta 3 días (solo visibles para el administrador).
 
 ---
 
@@ -67,7 +68,7 @@ HispaSubs inspecciona el contenido textual de cada subtítulo e identifica patro
 | 🇪🇸 Castellano | Analizado. Vocabulario y giros de España. |
 | 🇲🇽 Latino | Analizado. Vocabulario latinoamericano. |
 | 🌎 Neutro | Analizado. Sin inclinación regional marcada (solo si hubo coincidencias léxicas reales). |
-| 📄 Español (sin clasificar) | El texto se analizó (y pasó el filtro anti-spam), pero no dio un veredicto léxico fiable: contenido sin términos fuertes del léxico (0 coincidencias o solo términos ambiguos débiles) o texto en portugués mal etiquetado. Las descargas que fallan (red, rate limit, HTML de error) no se muestran. |
+| 📄 Español (sin clasificar) | El texto se analizó (y pasó el filtro anti-spam), pero no dio un veredicto léxico fiable: contenido sin términos fuertes del léxico (0 coincidencias o solo términos ambiguos débiles) o texto en portugués mal etiquetado (detectado por densidad de tildes nasales, tanto en minúsculas como en mayúsculas de TV, sin confundir con mojibake UTF-8). Las descargas que fallan (red, rate limit, HTML de error) no se muestran. |
 
 Esto permite distinguir entre versiones del español con matices regionales sin depender de metadatos ambiguos o genéricos.
 
@@ -81,7 +82,8 @@ Esto permite distinguir entre versiones del español con matices regionales sin 
 
 - **Proxy en Vercel (Node.js + `adm-zip`)** — `api/proxy.js` (+ `vercel.json`)
   - Descarga los `.zip` de SubDL y extrae el `.srt` en memoria RAM, sin tocar disco. Máximo 4 MB (límite de respuesta de Vercel).
-  - Solo acepta `https`, únicamente los hosts de la allowlist (`dl.subdl.com` y los CDN de OpenSubtitles), solo puerto 443, y valida cada salto de redirección contra IPs privadas (SSRF).
+  - Matcher multiepisodio lineal $O(n)$ con protección anti-ReDoS: localiza con precisión el archivo del episodio pedido dentro de packs complejos (`S01E03-04`, `S01E03+E04`, `1x03x04`). Devuelve `422` si el zip no contiene el episodio pedido o carece de subtítulos válidos, y `410` si el archivo ya no existe en el origen.
+  - Solo acepta `https`, únicamente los hosts de la allowlist (`dl.subdl.com` y los CDN de OpenSubtitles), solo puerto 443, y valida cada salto de redirección contra IPs privadas (SSRF). Sanitiza credenciales de URLs de entrada para proteger la privacidad y maximizar la tasa de aciertos de caché en el Edge.
   - Sirve el subtítulo ya limpio al reproductor **y** canaliza el archivo al Worker para su clasificación.
   - Limita las peticiones por IP (`RATE_LIMIT_PER_MIN`; `0` lo desactiva).
 
@@ -140,7 +142,7 @@ El análisis consume recursos, así que por título se **descargan hasta 8 candi
 ### No veo subtítulos de SubDL
 Comprueba que tu clave es válida probándola directamente:
 `https://api.subdl.com/api/v1/subtitles?api_key=TU_CLAVE&imdb_id=tt1375666&type=movie&languages=ES`
-Si responde `"status": false`, regenera la clave en [tu panel de SubDL](https://subdl.com/panel/api) y reinstala el complemento desde la página de configuración.
+Si responde `"status": false`, regenera la clave en [tu panel de SubDL](https://subdl.com/panel/api) y reinstala el complemento desde la página de configuración. *Nota sobre la cuota:* Tu clave solo se utiliza para consultar el catálogo de subtítulos; al descargar y extraer los archivos, HispaSubs no envía la clave al CDN de SubDL para no consumir tu límite diario de descargas.
 
 ### La app móvil (Android/iOS) no muestra ningún resultado
 La app móvil agrupa los subtítulos por **código de idioma**, así que el complemento envía `lang` como código ISO válido (`spa`) y la etiqueta visible va en `label`. Si aun así no ves ninguna entrada, reinstala el complemento desde la [página de configuración](https://hispasubs.ak-forge.workers.dev) y reinicia la app. Nota: en Android TV hay un bug conocido de Stremio (versiones 1.11.x) en el que los subtítulos de addons aparecen pero no se muestran al elegirlos; se arregla reiniciando la app.
