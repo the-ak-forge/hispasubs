@@ -1,6 +1,15 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.9
+// HispaSubs — Cloudflare Worker v1.4.10
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.10 (20/10/2026) — auditoría externa de la 1.4.9:
+//  - [PORTUGUÉS] Guarda ampliada a portugués en MAYÚSCULAS (`/[ãõÕ]|Ã(?=[A-Z])/gu`),
+//    cubriendo subtítulos de TV en mayúsculas ("NÃO", "AÇÕES") sin que el "Ã"
+//    de mojibake UTF-8 ("Ã¡", "Ã©") cuente erróneamente como tilde portuguesa.
+//  - [LOGS] Los descartes limpios permanentes (404/410 en directa, 410/422 en
+//    proxy) ya no escriben `console.error("[classify]", ...)` en Cloudflare.
+//  - [PROXY] Tope de 8 episodios encadenados por cabecera para garantizar O(n)
+//    en el matcher multiepisodio ante nombres patológicos.
 //
 // v1.4.9 (20/10/2026) — auditoría externa de la 1.4.8:
 //  - [PORTUGUÉS] La guarda de portugués exige tanto ≥10 apariciones de `ã`/`õ`
@@ -250,8 +259,9 @@ const DICT_ES_WEAK_CS = /(?<![\p{L}\p{N}_])[oO]s(?![\p{L}\p{N}_])/gu;
 const DICT_LAT_WEAK = /(?<![\p{L}\p{N}_])(?:papa[s]?|neta[s]?|ustedes|fome[s]?)(?![\p{L}\p{N}_])/giu;
 // Guarda contra archivos en portugués mal etiquetados como español (donde
 // "carro", "celular" o "estacionamento" darían falso positivo Latino). Sin
-// flag `i` para que "Ã" de mojibake UTF-8 no cuente como tilde portuguesa.
-const PT_TILDE_RE = /[ãõ]/gu;
+// flag `i` para que "Ã" de mojibake UTF-8 no cuente como tilde portuguesa,
+// pero soportando portugués en MAYÚSCULAS ("NÃO", "AÇÕES") con "Ã(?=[A-Z])".
+const PT_TILDE_RE = /[ãõÕ]|Ã(?=[A-Z])/gu;
 
 // Túnel Node.js en Vercel como motor de extracción de zips.
 // IMPORTANTE: el proxy DEBE llevar allowlist de hosts (ver api/proxy.js),
@@ -584,7 +594,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.9",
+  version: "1.4.10",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1008,7 +1018,6 @@ const classifySubtitle = async (
       [SCORE]: brief(scored.flag),
     };
   } catch (error) {
-    console.error("[classify]", sub.source, error.message);
     // Descarte permanente sin penalizar el TTL:
     //  - En URL directa (!isZip): HTTP 404 o 410 (enlace muerto en el CDN).
     //  - En URL del proxy (isZip): HTTP 410 (origen 404/410 mapeado por el
@@ -1020,6 +1029,7 @@ const classifySubtitle = async (
       ? /\bHTTP 4(?:10|22)\b/.test(error.message)
       : /\bHTTP 4(?:04|10)\b/.test(error.message);
     if (isPermanentDiscard) return { [DISCARDED_404]: true };
+    console.error("[classify]", sub.source, error.message);
     // Timeout / red caída / 429 / 5xx / 404 de proxy: fallo transitorio → TTL corto.
     return unclassified(sub, finalUrl, true);
   }

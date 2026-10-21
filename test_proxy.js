@@ -330,6 +330,17 @@ section("5. Extracción del zip");
   check("v1.4.9 Anti-ReDoS: nombre con 65.000 ceros tarda <200 ms (sin O(n²) en SE_HEAD)",
     resZeros.statusCode === 200 && dtZeros < 200, `dt=${dtZeros}ms status=${resZeros.statusCode}`);
 
+  // v1.4.10: cadena "1x1x1x…" de 65.000 caracteres. Cada cabecera NxM re-recorría
+  // toda la cadena EP_NEXT hasta el final (O(n²), ~25 s por nombre); con el tope
+  // de 8 episodios encadenados por cabecera es lineal.
+  const chainZip = buildZip([[`1${"x1".repeat(32490)}.srt`, "cadena\n"]]);
+  fetchImpl = () => new Response(chainZip, { status: 200 });
+  const tChain = Date.now();
+  const resChain = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/y.zip") + "&s=1&e=3");
+  const dtChain = Date.now() - tChain;
+  check("v1.4.10 Anti-ReDoS: nombre «1x1x1x…» de 65.000 car. tarda <200 ms",
+    dtChain < 200, `dt=${dtChain}ms status=${resChain.statusCode}`);
+
   // v1.4.9: EP_NEXT (\d{1,2}) no confunde códecs/resoluciones (.x264, -720p) con episodios >=100.
   const codecZip = buildZip([
     ["Show.S01E03.x264.srt", "ep 3 x264\n"],

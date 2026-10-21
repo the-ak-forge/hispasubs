@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.9
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.10
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -16,6 +16,11 @@
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
+//
+// v1.4.10 (20/10/2026):
+//  - [ReDoS] Tope de 8 episodios encadenados por cabecera en el bucle EP_NEXT:
+//    elimina la complejidad O(n²) ante nombres patológicos como "1x1x1x1…" de
+//    65.000 caracteres, reduciendo el tiempo de escaneo de ~25 s a <150 ms.
 //
 // v1.4.9 (20/10/2026):
 //  - [ReDoS] Eliminados los `0*` redundantes antes de `(\d+)` en SE_HEAD
@@ -127,7 +132,7 @@ const MAX_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
-const USER_AGENT = "HispaSubs/1.4.9";
+const USER_AGENT = "HispaSubs/1.4.10";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 
@@ -500,7 +505,9 @@ export default async function handler(req, res) {
         if (s !== sNum) continue;
         if (e === eNum) return true;
         EP_NEXT.lastIndex = SE_HEAD.lastIndex;
-        for (let n; (n = EP_NEXT.exec(name)); ) {
+        // Tope de 8 episodios encadenados por cabecera: sin él, "1x1x1x1…" o
+        // "1x1-1x1-…" re-recorren toda la cadena desde cada cabecera (O(n²)).
+        for (let k = 0, n; k < 8 && (n = EP_NEXT.exec(name)); k++) {
           if (Number(n[1]) === eNum) return true;
         }
       }

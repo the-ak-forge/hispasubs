@@ -380,7 +380,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.9", m10.version === "1.4.9", m10.version);
+  check("manifest version 1.4.10", m10.version === "1.4.10", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1383,6 +1383,17 @@ try {
   scoreText("vale vale ustedes", diagWeak);
   const diagEmpty = {};
   scoreText("hola mundo sin modismos", diagEmpty);
+  // Portugués en MAYÚSCULAS (subtítulos de TV): "NÃO"/"AÇÕES" cuentan; el "Ã" del
+  // mojibake UTF-8 ("Ã¡", "Ã©") no, porque nunca va seguido de una letra ASCII.
+  const ptCaps = "NÃO SEI, ENTÃO VOU AO CARRO PEGAR O CELULAR. ESTACIONAMENTO CHEIO, NÃO DÁ. ".repeat(60);
+  const dPtCaps = {};
+  const mojibake = Buffer.from("¿Qué estás haciendo? Vosotros no sabéis nada, tío. El ordenador está ahí. ".repeat(40), "utf8").toString("latin1");
+  const dMoji = {};
+  check("v1.4.10: portugués en MAYÚSCULAS -> null (guarda); mojibake UTF-8 NO cuenta como portugués",
+    scoreText(ptCaps, dPtCaps) === null && dPtCaps.reason === "portugués" &&
+      scoreText(mojibake, dMoji)?.flag === "🇪🇸 Castellano",
+    JSON.stringify({ dPtCaps, dMoji }));
+
   check("v1.4.9: diag.reason distingue 'portugués', 'solo términos débiles' y 'sin léxico'",
     diagPt.reason === "portugués" &&
       diagWeak.reason === "solo términos débiles" && diagWeak.es === 0.5 && diagWeak.lat === 0.25 &&
