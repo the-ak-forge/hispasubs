@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.11", m10.version === "1.4.11", m10.version);
+  check("manifest version 1.4.12", m10.version === "1.4.12", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1405,6 +1405,38 @@ try {
   check("v1.4.9: 'manejo del presupuesto / manejo del estrés' NO puntúa como conducir LAT",
     scoreText("El manejo del presupuesto, el manejo del estrés y el manejo del tiempo") === null,
     JSON.stringify(scoreText("El manejo del presupuesto, el manejo del estrés y el manejo del tiempo")));
+}
+
+// 22) v1.4.12: las URLs de descarga de dl.subdl.com son canónicas (origen + ruta): se
+// descarta TODA la consulta y el fragmento, sea cual sea el nombre del parámetro.
+{
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("api.subdl.com")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        status: true,
+        subtitles: [
+          { url: "/subtitle/901-901.zip?API_KEY=leakA", file_id: 901 },
+          { url: "/subtitle/902-902.zip?apikey=leakB&foo=1", file_id: 902 },
+          { url: "https://dl.subdl.com/subtitle/903-903.srt?token=leakC#api_key=leakD", file_id: 903 },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    return Promise.resolve(textResp(TXT_CAST));
+  };
+  try {
+    const resCanon = await get(`/${b64url({ subdlKey: "k" })}/subtitles/movie/tt7771101.json`);
+    const jCanon = await resCanon.json();
+    const bodyCanon = decodeURIComponent(JSON.stringify(jCanon));
+    check("v1.4.12: URLs de SubDL con API_KEY/apikey/token/fragmento salen sin ninguna clave",
+      (jCanon.subtitles || []).length === 3 && !/leak[A-D]/.test(bodyCanon), bodyCanon.slice(0, 220));
+  } finally {
+    globalThis.fetch = prevFetch;
+  }
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

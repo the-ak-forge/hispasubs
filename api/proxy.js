@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.11
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.12
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -16,6 +16,15 @@
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
+//
+// v1.4.12 (22/10/2026) — auditoría externa de la 1.4.11:
+//  - [CANONICAL] En dl.subdl.com se descarta TODA la consulta y el fragmento
+//    (target.search = ""; target.hash = ""), protegiendo contra cualquier
+//    variante de parámetro (api_key, API_KEY, apikey, token...).
+//  - [ReDoS] Límite MAX_ENTRY_NAME = 512 caracteres en nombres de archivo
+//    dentro del zip: defensa en profundidad O(1) contra ReDoS en todos los
+//    regexes de episodio.
+//  - [CACHE] Corrección técnica en comentarios sobre la unificación de caché.
 //
 // v1.4.11 (21/10/2026):
 //  - [PRIVACIDAD / CACHÉ] Sanitización de `api_key` en `target`: si la URL
@@ -140,7 +149,11 @@ const MAX_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
-const USER_AGENT = "HispaSubs/1.4.11";
+// Ningún subtítulo real tiene un nombre de más de 512 caracteres. El nombre lo controla
+// quien sube el zip, así que se ignoran las entradas con nombres más largos: defensa en
+// profundidad contra ReDoS en TODOS los regex de episodio (no solo SE_HEAD/EP_NEXT).
+const MAX_ENTRY_NAME = 512;
+const USER_AGENT = "HispaSubs/1.4.12";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 
@@ -395,10 +408,13 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "URL inválida" });
     }
 
-    // Defensa en profundidad: eliminar api_key de consultas a dl.subdl.com
-    // (o a cualquier host de la allowlist) para evitar exponer credenciales en
-    // logs, quemar la cuota de 50 descargas/día de SubDL y unificar la caché Edge.
-    if (target.searchParams.has("api_key")) {
+    // Defensa en profundidad: en dl.subdl.com se descarta toda la consulta
+    // y el fragmento para que la URL sea canónica (origen + ruta) sin importar
+    // cómo se llame el parámetro de clave (api_key, API_KEY, apikey, token…).
+    if (target.hostname === "dl.subdl.com") {
+      target.search = ""; // origen + ruta: ninguna consulta es necesaria (ni la clave, con ningún nombre)
+      target.hash = "";
+    } else if (target.searchParams.has("api_key")) {
       target.searchParams.delete("api_key");
     }
 
@@ -485,6 +501,7 @@ export default async function handler(req, res) {
       if (entry.isDirectory) continue;
       const name = entry.entryName || "";
       if (!ALLOWED_EXT.test(name)) continue;
+      if (name.length > MAX_ENTRY_NAME) continue;
       // Tamaño declarado ANTES de descomprimir: es el mismo que GetData()
       // produciría (bytes sin comprimir), así que ordenar por él equivale a
       // ordenar por data.length sin haber descomprimido nada, y además es

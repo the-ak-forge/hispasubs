@@ -35,8 +35,8 @@ El complemento analiza el texto de los subtítulos, detecta expresiones, pronomb
 
 - Privacidad y rendimiento
   - Ejecuta la lógica en Edge con baja latencia.
-  - Caché unificada en el Edge: las URLs de descarga de subtítulos son canónicas entre usuarios, permitiendo que las extracciones de `.zip` se almacenen en caché durante 24 horas y se sirvan al instante (<30 ms).
-  - No almacena datos ni credenciales del usuario: tu clave de SubDL vive en tu configuración de Stremio, no en una base de datos propia. *Nota de transparencia:* la clave solo se utiliza internamente en el Worker para consultar la API de metadatos de SubDL (`api.subdl.com`). Se elimina por completo de los enlaces de descarga de los subtítulos, por lo que **nunca se envía al proxy de Vercel, no queda registrada en sus logs ni se expone a los reproductores de Stremio**, evitando además agotar la cuota de descargas diarias de SubDL. Como en cualquier addon con configuración, la clave viaja en la URL de instalación de Stremio; los registros de diagnóstico efímeros de Cloudflare pueden conservarla hasta 3 días (solo visibles para el administrador).
+  - Caché unificada en el Edge: el Worker emite URLs de descarga canónicas (origen + ruta, sin consultas), permitiendo que Vercel y Cloudflare reutilicen las extracciones de `.zip` en caché durante 24 horas y las sirvan al instante (<30 ms en caso de acierto).
+  - No almacena datos ni credenciales del usuario: tu clave de SubDL vive en tu configuración de Stremio, no en una base de datos propia. *Nota de transparencia:* la clave solo se utiliza internamente en el Worker para consultar la API de metadatos de SubDL (`api.subdl.com`). Se descarta toda la consulta y fragmento de los enlaces de descarga de SubDL, por lo que **ninguna clave ni parámetro viaja al proxy de Vercel, no queda registrada en sus logs ni se expone a los reproductores de Stremio**. Como en cualquier addon con configuración, la clave viaja en la URL de instalación de Stremio; los registros de diagnóstico efímeros de Cloudflare pueden conservarla hasta 3 días (solo visibles para el administrador).
 
 ---
 
@@ -83,7 +83,7 @@ Esto permite distinguir entre versiones del español con matices regionales sin 
 - **Proxy en Vercel (Node.js + `adm-zip`)** — `api/proxy.js` (+ `vercel.json`)
   - Descarga los `.zip` de SubDL y extrae el `.srt` en memoria RAM, sin tocar disco. Máximo 4 MB (límite de respuesta de Vercel).
   - Matcher multiepisodio lineal $O(n)$ con protección anti-ReDoS: localiza con precisión el archivo del episodio pedido dentro de packs complejos (`S01E03-04`, `S01E03+E04`, `1x03x04`). Devuelve `422` si el zip no contiene el episodio pedido o carece de subtítulos válidos, y `410` si el archivo ya no existe en el origen.
-  - Solo acepta `https`, únicamente los hosts de la allowlist (`dl.subdl.com` y los CDN de OpenSubtitles), solo puerto 443, y valida cada salto de redirección contra IPs privadas (SSRF). Sanitiza credenciales de URLs de entrada para proteger la privacidad y maximizar la tasa de aciertos de caché en el Edge.
+  - Solo acepta `https`, únicamente los hosts de la allowlist (`dl.subdl.com` y los CDN de OpenSubtitles), solo puerto 443, y valida cada salto de redirección contra IPs privadas (SSRF). Límite defensivo de 512 caracteres en nombres dentro del zip contra ReDoS y descarte total de parámetros de consulta hacia `dl.subdl.com`.
   - Sirve el subtítulo ya limpio al reproductor **y** canaliza el archivo al Worker para su clasificación.
   - Limita las peticiones por IP (`RATE_LIMIT_PER_MIN`; `0` lo desactiva).
 

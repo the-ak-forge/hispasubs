@@ -1,6 +1,14 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.11
+// HispaSubs — Cloudflare Worker v1.4.12
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.12 (22/10/2026) — auditoría externa de la 1.4.11:
+//  - [CANONICAL] Las URLs de descarga de dl.subdl.com se normalizan a
+//    `origin + pathname`, descartando cualquier consulta o fragmento
+//    (api_key, API_KEY, apikey, token...). Esto garantiza 0 fugas de
+//    credenciales y URLs 100 % canónicas e independientes del proveedor.
+//  - [PROXY] Límite MAX_ENTRY_NAME = 512 en el proxy y descarte total de query
+//    para dl.subdl.com en el backend de extracción.
 //
 // v1.4.11 (21/10/2026):
 //  - [PRIVACIDAD / CUOTA] SubDL devuelve URLs con `?api_key=...`, pero su CDN
@@ -604,7 +612,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.11",
+  version: "1.4.12",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -722,7 +730,13 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
         //  3. Se evitan los falsos 502 por agotamiento de cuota diaria de SubDL.
         try {
           const parsed = new URL(dlUrl);
-          if (parsed.searchParams.has("api_key")) {
+          if (parsed.hostname === "dl.subdl.com") {
+            // Las URLs de descarga de SubDL son origen + ruta (/subtitle/<id>.zip):
+            // se descarta TODA la consulta y el fragmento, sea cual sea el nombre del
+            // parámetro (api_key, API_KEY, apikey, token…). Así la URL es canónica y
+            // no depende de que SubDL siga llamando "api_key" a la clave.
+            if (parsed.search || parsed.hash) dlUrl = parsed.origin + parsed.pathname;
+          } else if (parsed.searchParams.has("api_key")) {
             parsed.searchParams.delete("api_key");
             dlUrl = parsed.toString();
           }

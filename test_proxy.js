@@ -322,13 +322,25 @@ section("5. Extracción del zip");
 
   // v1.4.9 Anti-ReDoS con 65.000 ceros seguidos ('s' + 65k ceros): antes 0*(\d+)
   // en SE_HEAD era cuadrático O(n²) y tardaba ~16 s; ahora sin 0* tarda <200 ms.
-  const zerosZip = buildZip([[`s${"0".repeat(65000)}.srt`, "ceros\n"]]);
+  const zerosZip = buildZip([[`s${"0".repeat(65000)}.srt`, "ceros\n"], ["Show.S01E01.srt", "normal\n"]]);
   fetchImpl = () => new Response(zerosZip, { status: 200 });
   const tZeros = Date.now();
   const resZeros = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/z.zip") + "&s=1&e=1");
   const dtZeros = Date.now() - tZeros;
   check("v1.4.9 Anti-ReDoS: nombre con 65.000 ceros tarda <200 ms (sin O(n²) en SE_HEAD)",
-    resZeros.statusCode === 200 && dtZeros < 200, `dt=${dtZeros}ms status=${resZeros.statusCode}`);
+    resZeros.statusCode === 200 && String(resZeros.body).includes("normal") && dtZeros < 200,
+    `dt=${dtZeros}ms status=${resZeros.statusCode}`);
+
+  // v1.4.12: nombres de más de 512 caracteres se ignoran (frontera: 512 sí, 513 no).
+  const edgeZip = buildZip([
+    [`Show.S01E03${"x".repeat(512 - 15)}.srt`, "limite512\n"], // 512 exactos
+    [`Show.S01E03${"y".repeat(513 - 15)}.srt`, "limite513\n"], // 513
+  ]);
+  fetchImpl = () => new Response(edgeZip, { status: 200 });
+  const resEdge = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/e.zip") + "&s=1&e=3");
+  check("v1.4.12: nombre de 512 car. se sirve y el de 513 se ignora",
+    resEdge.statusCode === 200 && String(resEdge.body).includes("limite512") && !String(resEdge.body).includes("limite513"),
+    `status=${resEdge.statusCode}`);
 
   // v1.4.10: cadena "1x1x1x…" de 65.000 caracteres. Cada cabecera NxM re-recorría
   // toda la cadena EP_NEXT hasta el final (O(n²), ~25 s por nombre); con el tope
@@ -602,6 +614,13 @@ section("5c. v1.4.1: readCapped, .sub UTF-16 y zipUrl duplicado");
   check("v1.4.11: el proxy elimina api_key de la URL antes de llamar al origen",
     res.statusCode === 200 && !lastFetch.includes("api_key") && lastFetch === "https://dl.subdl.com/sub.zip",
     `status=${res.statusCode} url=${lastFetch}`);
+
+  // v1.4.12: en dl.subdl.com se descarta toda la consulta (cualquier nombre de parámetro).
+  fetchLog.length = 0;
+  const resQ = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip?API_KEY=mySecretKey&token=x&foo=1"));
+  const lastQ = fetchLog.at(-1)?.url || "";
+  check("v1.4.12: el proxy deja dl.subdl.com sin consulta (API_KEY/token/foo fuera)",
+    resQ.statusCode === 200 && lastQ === "https://dl.subdl.com/sub.zip", `status=${resQ.statusCode} url=${lastQ}`);
 }
 section("6. Rate limit por IP");
 process.env.RATE_LIMIT_PER_MIN = "3";
