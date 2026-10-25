@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES } from "./worker.js";
+import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.13", m10.version === "1.4.13", m10.version);
+  check("manifest version 1.4.14", m10.version === "1.4.14", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1439,39 +1439,48 @@ try {
   }
 }
 
-// 23) v1.4.13: Detección y etiquetado SDH + Deduplicación por contenido (hash determinista)
+// 23) v1.4.14: Endurecimiento SDH contra falsos positivos + Hash de 64 bits con muestreo de cola
 {
-  // --- A. Tests unitarios isSdh ---
+  // --- A. Tests unitarios isSdh (descriptores acústicos y anti-falsos-positivos) ---
   const normalDialog = "1\n00:00:10,000 --> 00:00:12,000\nHola Juan (hace tiempo que no te veo).\n\n2\n00:00:13,000 --> 00:00:15,000\nSí, desde el año (1998) en el hospital (Dr. Gómez).\n";
-  check("v1.4.13 isSdh: diálogo ordinario con paréntesis y fechas -> false",
-    isSdh(normalDialog) === false, `matches=${normalDialog.match(/\[|\]|\(|\)/g)?.length}`);
+  check("v1.4.14 isSdh: diálogo ordinario con paréntesis y fechas -> false",
+    isSdh(normalDialog) === false);
 
+  // Falso positivo 1: Etiquetas de hablante con dos puntos
+  const speakerTags = Array.from({ length: 15 }, (_, i) =>
+    `${i + 1}\n00:0${i}:00,000 --> 00:0${i}:02,000\n[JUAN ${i}]: ¿Dónde estás? (MARÍA ${i}): Aquí estoy.\n`
+  ).join("\n");
+  check("v1.4.14 isSdh anti-falsos-positivos: etiquetas de hablante [Nombre]: y preguntas -> false",
+    isSdh(speakerTags) === false);
+
+  // Falso positivo 2: Letras de canciones con notas musicales ♪ (musicales / animación)
+  const songLyrics = Array.from({ length: 15 }, (_, i) =>
+    `${i + 1}\n00:0${i}:00,000 --> 00:0${i}:02,000\n♪ Ayer te vi pasar caminando por la calle bajo el sol ♪\n`
+  ).join("\n");
+  check("v1.4.14 isSdh anti-falsos-positivos: transcripción de letra con ♪ sin descriptores -> false",
+    isSdh(songLyrics) === false);
+
+  // SDH genuino: descriptores acústicos entre corchetes o paréntesis
   const sdhSample = Array.from({ length: SDH_MIN_MATCHES }, (_, i) =>
     `${i + 1}\n00:0${i}:00,000 --> 00:0${i}:02,000\n[música misteriosa ${i}]\n`
   ).join("\n");
-  check("v1.4.13 isSdh: anotaciones de efectos/música entre corchetes >= umbral -> true",
+  check("v1.4.14 isSdh: anotaciones acústicas entre corchetes >= umbral -> true",
     isSdh(sdhSample) === true);
 
   const sdhParens = Array.from({ length: SDH_MIN_MATCHES }, (_, i) =>
     `${i + 1}\n00:0${i}:00,000 --> 00:0${i}:02,000\n(suspira hondo ${i})\n`
   ).join("\n");
-  check("v1.4.13 isSdh: descriptores de sonido entre paréntesis >= umbral -> true",
+  check("v1.4.14 isSdh: descriptores de sonido entre paréntesis >= umbral -> true",
     isSdh(sdhParens) === true);
 
-  const sdhMusicNotes = Array.from({ length: SDH_MIN_MATCHES }, (_, i) =>
-    `${i + 1}\n00:0${i}:00,000 --> 00:0${i}:02,000\n♪ canción de fondo ♪\n`
-  ).join("\n");
-  check("v1.4.13 isSdh: notas musicales >= umbral -> true",
-    isSdh(sdhMusicNotes) === true);
-
-  check("v1.4.13 isSdh: vacíos o falsy -> false",
+  check("v1.4.14 isSdh: vacíos o falsy -> false",
     isSdh("") === false && isSdh(null) === false && isSdh(undefined) === false);
 
   const t0Sdh = performance.now();
   const hostileSdh = "[[[[[[[[[[((((((((([[[[[[[a".repeat(3000);
   isSdh(hostileSdh);
   const dtSdh = performance.now() - t0Sdh;
-  check("v1.4.13 isSdh anti-ReDoS: texto hostil (80k car.) procesa en <50ms",
+  check("v1.4.14 isSdh anti-ReDoS: texto hostil (80k car.) procesa en <50ms",
     dtSdh < 50, `dt=${dtSdh.toFixed(2)}ms`);
 
   // --- B. Tests unitarios hashContent ---
@@ -1480,19 +1489,27 @@ try {
   const bomText = "\uFEFF1\n00:00:01,000 --> 00:00:04,000\nHola mundo\n";
   const diffTimeText = "1\n00:00:02,000 --> 00:00:05,000\nHola mundo\n";
 
-  check("v1.4.13 hashContent: CRLF vs LF produce idéntico hash",
+  check("v1.4.14 hashContent: CRLF vs LF produce idéntico hash",
     hashContent(crlfText) === hashContent(lfText),
     `crlf=${hashContent(crlfText)} lf=${hashContent(lfText)}`);
 
-  check("v1.4.13 hashContent: BOM UTF-8 se descarta y produce idéntico hash",
+  check("v1.4.14 hashContent: BOM UTF-8 se descarta y produce idéntico hash",
     hashContent(bomText) === hashContent(lfText),
     `bom=${hashContent(bomText)} lf=${hashContent(lfText)}`);
 
-  check("v1.4.13 hashContent: sincronización diferente (distinto timestamp) da distinto hash",
+  check("v1.4.14 hashContent: sincronización diferente (distinto timestamp) da distinto hash",
     hashContent(diffTimeText) !== hashContent(lfText),
     `diff=${hashContent(diffTimeText)} orig=${hashContent(lfText)}`);
 
-  check("v1.4.13 hashContent: texto vacío o no string produce cadena vacía",
+  // Muestreo de cola en archivos de más de 64 KB con mismo inicio de 64 KB
+  const prefix64k = "1\n00:00:01,000 --> 00:00:02,000\nDiálogo común.\n".repeat(1500);
+  const longFileA = prefix64k + "\nFinal alternativo A con resolución.";
+  const longFileB = prefix64k + "\nFinal alternativo B con desenlace.";
+  check("v1.4.14 hashContent: archivos largos con mismo inicio pero distinta cola -> hashes diferentes",
+    hashContent(longFileA) !== hashContent(longFileB),
+    `hashA=${hashContent(longFileA)} hashB=${hashContent(longFileB)}`);
+
+  check("v1.4.14 hashContent: texto vacío o no string produce cadena vacía",
     hashContent("") === "" && hashContent(null) === "");
 
   // --- C. Integración: Etiquetado SDH (clasificado y unclassified) ---
@@ -1520,11 +1537,11 @@ try {
     const castSdh = sdhSubs.find((e) => e.url.includes("sdh_cast.srt"));
     const unclSdh = sdhSubs.find((e) => e.url.includes("sdh_uncl.srt"));
 
-    check("v1.4.13 SDH clasificado -> etiqueta incluye (SDH)",
+    check("v1.4.14 SDH clasificado -> etiqueta incluye (SDH)",
       castSdh?.label === "🇪🇸 Castellano (SDH) (OS-V3)",
       `label=${castSdh?.label}`);
 
-    check("v1.4.13 SDH sin clasificar -> etiqueta incluye · SDH ·",
+    check("v1.4.14 SDH sin clasificar -> etiqueta incluye · SDH ·",
       unclSdh?.label === "📄 Español (sin clasificar · SDH · OS-V3)",
       `label=${unclSdh?.label}`);
   } finally {
@@ -1565,16 +1582,16 @@ try {
     const dedupSubs = (await res.json()).subtitles || [];
     const dedupUrls = dedupSubs.map((s) => s.url);
 
-    check("v1.4.13 dedup contenido: original se sirve y clon_duplicado se descarta",
+    check("v1.4.14 dedup contenido: original se sirve y clon_duplicado se descarta",
       dedupUrls.some((u) => u.includes("original.srt")) &&
       !dedupUrls.some((u) => u.includes("clon_duplicado.srt")),
       JSON.stringify(dedupUrls));
 
-    check("v1.4.13 dedup contenido: activa 2ª oleada para sustituir al duplicado y llenar cupo de 5",
+    check("v1.4.14 dedup contenido: activa 2ª oleada para sustituir al duplicado y llenar cupo de 5",
       wave2RanForDedup && dedupSubs.length === 5,
       `w2Ran=${wave2RanForDedup} len=${dedupSubs.length}`);
 
-    check("v1.4.13 dedup contenido: descarte limpio NO degrada TTL (mantiene 7200s)",
+    check("v1.4.14 dedup contenido: descarte limpio NO degrada TTL (mantiene 7200s)",
       res.headers.get("cache-control") === "public, max-age=7200",
       `cc=${res.headers.get("cache-control")}`);
   } finally {

@@ -1,6 +1,15 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.13
+// HispaSubs — Cloudflare Worker v1.4.14
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.14 (25/10/2026) — auditoría técnica de la 1.4.13:
+//  - [SDH] Endurecimiento contra falsos positivos: `isSdh` evalúa descriptores
+//    acústicos explícitos (efectos de sonido, ambiente, música) descartando
+//    etiquetas de hablante (`[Nombre]:`) y letras de canciones ordinarias (`♪`).
+//  - [HASH] Hash de 64 bits compuesto (`hashContent`) con prefijo de longitud
+//    exacta y muestreo de cabeza (48 KB) + cola (16 KB) para evitar colisiones
+//    entre archivos que comparten inicio pero difieren en el final o tamaño.
+//  - [DRY] Unificación de la lógica de deduplicación de oleadas en `dedupWave`.
 //
 // v1.4.13 (24/10/2026):
 //  - [SDH] Detección y etiquetado transparente de subtítulos para personas sordas
@@ -622,7 +631,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.13",
+  version: "1.4.14",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -804,32 +813,73 @@ const SCORE = Symbol.for("hispasubs.score");
 const CONTENT_HASH = Symbol.for("hispasubs.contentHash");
 
 // Detección de pistas SDH (Sordos e hipoacúsicos / Closed Captions).
-// Identifica descriptores de efectos de sonido, ambiente y música:
-//  - Corchetes con descripciones: [música], [risas], [disparos], etc.
-//  - Paréntesis con descripciones no numéricas: (suspira), (música suave), etc.
-//  - Símbolos y notas musicales: ♪, ♫.
+// Identifica descriptores acústicos inequívocos en español (efectos de sonido,
+// ambiente, música o acciones no verbales), descartando etiquetas de hablante
+// (`[JUAN]:`), preguntas/diálogo entre paréntesis (`(¿qué?)`) y transcripción
+// de letras cantadas (`♪`).
 // Detención temprana una vez alcanzado el umbral para no penalizar CPU.
-const SDH_MIN_MATCHES = 12;
-const SDH_RE = /\[[^\]\r\n]{2,60}\]|\((?![0-9\s]+\))[^\)\r\n]{2,60}\)|[♪♫]/g;
+const SDH_MIN_MATCHES = 10;
+const SDH_ACOUSTIC_RE =
+  /(?:m[uú]sica|sonido|disparo|pasos|puerta|grito|llanto|llora|suspira|suspiro|aplauso|motor|trueno|campana|tel[eé]fono|alarma|golpe|resoplido|risas?|r[ií]e|silbido|viento|ladra|ladrido|maullido|respiraci[oó]n|explosi[oó]n|murmullo|ruido|silencio|tararea|canta|jade[oa]|a\s+lo\s+lejos|en\s+off|suena|crujido|timbre|chillar|eco|ronquido|chasquido)/i;
+const SDH_BLOCK_RE = /\[([^\]\r\n]{2,60})\]|\((?![0-9\s]+\))([^)\r\n]{2,60})\)/g;
+
 const isSdh = (text, threshold = SDH_MIN_MATCHES) => {
   if (typeof text !== "string" || !text) return false;
-  const re = new RegExp(SDH_RE.source, "g");
-  let count = 0;
-  while (re.exec(text) !== null) {
-    count++;
-    if (count >= threshold) return true;
+  SDH_BLOCK_RE.lastIndex = 0;
+  let matches = 0;
+  let m;
+  while ((m = SDH_BLOCK_RE.exec(text)) !== null) {
+    const inner = (m[1] || m[2]).trim();
+    // Excluir etiquetas de hablante y preguntas/exclamaciones de diálogo
+    if (inner.includes(":") || inner.includes("?") || inner.includes("¿") || inner.includes("!") || inner.includes("¡")) continue;
+    // Descriptor acústico explícito
+    if (SDH_ACOUSTIC_RE.test(inner)) {
+      matches++;
+      if (matches >= threshold) return true;
+    }
   }
   return false;
 };
 
-// Hash determinista del contenido textual del subtítulo.
-// Normaliza \r\n -> \n, retira BOM si existe, y toma hasta 64 KB de muestra
-// para garantizar colisiones nulas entre traducciones y sincronizaciones
-// distintas sin pagar penalización de memoria ni CPU en archivos grandes.
+// Hash determinista de 64 bits del contenido textual del subtítulo.
+// Normaliza \r\n -> \n, retira BOM si existe, e incluye la longitud exacta
+// del texto normalizado junto a un muestreo de cabeza (48 KB) y cola (16 KB)
+// con dos multiplicadores primos tipo FNV/Murmur. Esto evita colisiones
+// entre archivos con igual inicio pero distinto final o tamaño.
 const hashContent = (text) => {
   if (typeof text !== "string" || !text) return "";
-  const sample = text.slice(0, 65536).replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").trim();
-  return hashStr(sample);
+  const normalized = text.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").trim();
+  const len = normalized.length;
+  const sample = len <= 65536
+    ? normalized
+    : normalized.slice(0, 49152) + "\n--TAIL--\n" + normalized.slice(-16384);
+  let h1 = 0x811c9dc5, h2 = 0x811c9dc5;
+  for (let i = 0; i < sample.length; i++) {
+    const c = sample.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193);
+    h2 = Math.imul(h2 ^ ((c << 5) | (c >>> 27)), 0x5bd1e995);
+  }
+  return `${len}:${(h1 >>> 0).toString(36)}-${(h2 >>> 0).toString(36)}`;
+};
+
+// Deduplicación determinista de una oleada: descarta pistas cuyo contenido
+// textual ya fue procesado en esta u oleadas previas.
+const dedupWave = (indices, analyzed, seenHashes) => {
+  let duplicates = 0;
+  for (const i of indices) {
+    const s = analyzed[i];
+    if (!s || s[FAILED] || s[DISCARDED_404]) continue;
+    const h = s[CONTENT_HASH];
+    if (h) {
+      if (seenHashes.has(h)) {
+        analyzed[i] = { [DISCARDED_DUPLICATE]: true };
+        duplicates += 1;
+      } else {
+        seenHashes.add(h);
+      }
+    }
+  }
+  return duplicates;
 };
 
 const unclassified = (sub, finalUrl, failed = false, sdh = false) => ({
@@ -1124,7 +1174,7 @@ const classifySubtitle = async (
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES };
+export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1356,20 +1406,7 @@ export default {
         // Deduplicación por contenido en 1ª oleada: se descartan pistas idénticas
         // (mismo hash de texto) para no saturar el cupo con clones de la misma traducción.
         const seenHashes = new Set();
-        let duplicadosContenido = 0;
-        for (const i of wave1Idx) {
-          const s = analyzed[i];
-          if (!s || s[FAILED] || s[DISCARDED_404]) continue;
-          const h = s[CONTENT_HASH];
-          if (h) {
-            if (seenHashes.has(h)) {
-              analyzed[i] = { [DISCARDED_DUPLICATE]: true };
-              duplicadosContenido += 1;
-            } else {
-              seenHashes.add(h);
-            }
-          }
-        }
+        let duplicadosContenido = dedupWave(wave1Idx, analyzed, seenHashes);
 
         const cleanWave1 = { "OS-V3": 0, "SubDL": 0 };
         for (const i of wave1Idx) {
@@ -1399,19 +1436,7 @@ export default {
           w2Ms = Date.now() - tWave2;
 
           // Deduplicación por contenido en 2ª oleada contra pistas ya vistas
-          for (const i of wave2Idx) {
-            const s = analyzed[i];
-            if (!s || s[FAILED] || s[DISCARDED_404]) continue;
-            const h = s[CONTENT_HASH];
-            if (h) {
-              if (seenHashes.has(h)) {
-                analyzed[i] = { [DISCARDED_DUPLICATE]: true };
-                duplicadosContenido += 1;
-              } else {
-                seenHashes.add(h);
-              }
-            }
-          }
+          duplicadosContenido += dedupWave(wave2Idx, analyzed, seenHashes);
         } else if (wave2Idx.length > 0) {
           console.log(`[subtitles] 2ª oleada omitida por presupuesto de tiempo (w1=${w1Ms}ms)`);
         }
