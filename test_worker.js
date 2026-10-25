@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.16", m10.version === "1.4.16", m10.version);
+  check("manifest version 1.4.17", m10.version === "1.4.17", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1741,6 +1741,105 @@ try {
   const resSub = await get("/subtitles/movie/tt1375666.json");
   check("v1.4.16 x-cache: respuesta de subtítulos incluye cabecera x-cache",
     resSub.headers.has("x-cache"), resSub.headers.get("x-cache"));
+}
+
+// 24) v1.4.17: catch con ámbito correcto y anti-envenenamiento de k_subdl
+{
+  const jsonR = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
+
+  // A. Un error inesperado dentro del try NO debe romper el catch (ReferenceError -> 500)
+  {
+    const prevC = mockGlobal("caches", {
+      default: { match: async () => ({ body: "x", status: 99 }), put: async () => {} },
+    });
+    const origErr = console.error;
+    console.error = () => {};
+    try {
+      let resErr, thrown = null;
+      try {
+        resErr = await worker.fetch(
+          new Request(`${base}/${b64url({ subdlKey: "clave_valida_123" })}/subtitles/movie/tt7780001.json`),
+          {}, { waitUntil: () => {} });
+      } catch (e) { thrown = e; }
+      const jErr = resErr ? await resErr.json() : null;
+      check("v1.4.17 catch: error inesperado devuelve 200 {subtitles:[]} (sin ReferenceError)",
+        !thrown && resErr.status === 200 && Array.isArray(jErr.subtitles) && jErr.subtitles.length === 0
+          && resErr.headers.get("cache-control") === "public, max-age=60",
+        thrown ? thrown.message : `status=${resErr?.status}`);
+    } finally {
+      console.error = origErr;
+      restoreGlobal("caches", prevC);
+    }
+  }
+
+  // B. SubDL no utilizable (status:false / 403) -> NO se cachea en k_subdl, sí en el público
+  for (const [label, subdlResp] of [
+    ["status:false", () => jsonR({ status: false, error: "invalid api key" })],
+    ["HTTP 403", () => new Response("forbidden", { status: 403 })],
+  ]) {
+    const puts = [];
+    const prevC = mockGlobal("caches", {
+      default: { match: async () => undefined, put: async (req) => { puts.push(req.url); } },
+    });
+    const prevF = globalThis.fetch;
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) {
+        return Promise.resolve(jsonR({ subtitles: [{ id: "p1", url: "https://subs5.strem.io/p1.srt", lang: "spa" }] }));
+      }
+      if (u.includes("api.subdl.com")) return Promise.resolve(subdlResp());
+      return Promise.resolve(textResp(TXT_CAST));
+    };
+    const origErr = console.error;
+    console.error = () => {};
+    try {
+      const waits = [];
+      const r = await worker.fetch(
+        new Request(`${base}/${b64url({ subdlKey: "clave_falsa_999" })}/subtitles/movie/tt7780002.json`),
+        {}, { waitUntil: (p) => waits.push(p) });
+      const j = await r.json();
+      await Promise.all(waits);
+      check(`v1.4.17 caché (${label}): sirve OS-V3 con TTL 7200s`,
+        j.subtitles.length === 1 && r.headers.get("cache-control") === "public, max-age=7200");
+      check(`v1.4.17 caché (${label}): nunca escribe en k_subdl (sin envenenamiento)`,
+        puts.length === 1 && !puts.some((u) => u.includes("k_subdl")), JSON.stringify(puts));
+      check(`v1.4.17 caché (${label}): la respuesta solo-OS-V3 va al namespace público`,
+        puts[0] === `${base}/subtitles/movie/tt7780002.json`, JSON.stringify(puts));
+    } finally {
+      console.error = origErr;
+      globalThis.fetch = prevF;
+      restoreGlobal("caches", prevC);
+    }
+  }
+
+  // C. SubDL sano con clave válida -> sí usa k_subdl
+  {
+    const puts = [];
+    const prevC = mockGlobal("caches", {
+      default: { match: async () => undefined, put: async (req) => { puts.push(req.url); } },
+    });
+    const prevF = globalThis.fetch;
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) return Promise.resolve(jsonR({ subtitles: [] }));
+      if (u.includes("api.subdl.com")) {
+        return Promise.resolve(jsonR({ status: true, subtitles: [{ url: "/subtitle/1-2.zip", file_id: 1 }] }));
+      }
+      return Promise.resolve(textResp(TXT_CAST));
+    };
+    try {
+      const waits = [];
+      await worker.fetch(
+        new Request(`${base}/${b64url({ subdlKey: "clave_valida_123" })}/subtitles/movie/tt7780003.json`),
+        {}, { waitUntil: (p) => waits.push(p) });
+      await Promise.all(waits);
+      check("v1.4.17 caché: SubDL sano con clave válida cachea en k_subdl",
+        puts.length === 1 && puts[0] === `${base}/k_subdl/subtitles/movie/tt7780003.json`, JSON.stringify(puts));
+    } finally {
+      globalThis.fetch = prevF;
+      restoreGlobal("caches", prevC);
+    }
+  }
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

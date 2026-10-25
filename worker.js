@@ -1,6 +1,16 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.16
+// HispaSubs — Cloudflare Worker v1.4.17
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.17 (25/10/2026) — auditoría técnica de la 1.4.16:
+//  - [FIX] `canonicalConfigStr` se declara fuera del `try` de /subtitles: el
+//    `catch` lo leía fuera de ámbito (ReferenceError -> 500 sin cuerpo en cualquier
+//    error inesperado en lugar de la caché negativa de 60 s).
+//  - [CACHE] Anti-envenenamiento real de `k_subdl`: si SubDL no es utilizable
+//    (clave rechazada 401/403, `status:false`, cuota agotada) `getSubDL` marca el
+//    resultado vacío con `unusable` y la respuesta (solo OS-V3) se cachea en el
+//    namespace público (""), nunca en `k_subdl`. Una clave falsa ya no puede
+//    dejar sin SubDL a los demás usuarios durante 2 h.
 //
 // v1.4.16 (25/10/2026) — auditoría técnica de la 1.4.15:
 //  - [CPU] Blindaje definitivo de CPU en plan Free (<5 ms): `scoreText` se acota
@@ -675,7 +685,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.16",
+  version: "1.4.17",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -743,6 +753,9 @@ const getOpenSubtitlesV3 = async (type, fullId) => {
 };
 
 // 2. SubDL
+// Resultado vacío marcado como "no utilizable" (clave rechazada, cuota agotada,
+// status:false): el router NO lo cachea en el namespace compartido `k_subdl`.
+const unusableSubDL = () => Object.assign([], { unusable: true });
 const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") => {
   // Sin clave no se consulta nada (pero se deja constancia en el log para
   // que "SubDL no aparece nunca" sea diagnosticable).
@@ -765,7 +778,7 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
     // Antes esto se tragaba en silencio; ahora queda en los logs.
     if (data.status === false || !Array.isArray(data.subtitles)) {
       console.error("[SubDL] respuesta sin subs:", data.error || "campo subtitles ausente", data.message || "");
-      return [];
+      return unusableSubDL();
     }
     if (data.subtitles.length === 0) {
       console.log(`[SubDL] 0 resultados para ${imdbId} (${subdlType}${season ? ` s${season}e${episode}` : ""})`);
@@ -833,7 +846,7 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
       ? "(clave rechazada o cuota agotada: se omite SubDL en este título)"
       : "";
     console.error("[SubDL]", e.message, extra);
-    if (isAuthOrQuota) return [];
+    if (isAuthOrQuota) return unusableSubDL();
     throw e;
   }
 };
@@ -1329,6 +1342,7 @@ export default {
       // Clave de caché canónica; se rellena al validar la ruta y se usa también
       // en el catch (si el error llega antes, se cae a la URL cruda).
       let cacheReq = null;
+      let canonicalConfigStr = "";
       try {
         const type = pathParts[actionIndex + 1];
         const rawId = (pathParts[actionIndex + 2] || "").replace(".json", "");
@@ -1366,7 +1380,7 @@ export default {
         // descargas. Se normaliza todo a la forma exacta de la ruta.
         // Además, si la config no aporta clave válida de SubDL, se normaliza a "" para
         // compartir la entrada global pública. Si aporta clave válida, se unifica en "k_subdl".
-        const canonicalConfigStr = getCanonicalConfigStr(config);
+        canonicalConfigStr = getCanonicalConfigStr(config);
         cacheReq = new Request(subtitleCacheUrl(url.origin, canonicalConfigStr, type, fullId));
         const cached = await cacheMatch(cacheReq);
         if (cached) {
@@ -1580,7 +1594,14 @@ export default {
         // no envenenamos la caché unificada de "k_subdl": solo cacheamos si SubDL fue exitoso
         // o si es la caché pública global de OS-V3.
         if (!canonicalConfigStr || sdlSubs.status === "fulfilled") {
-          cachePut(ctx, cacheReq || request, response);
+          // SubDL "no utilizable" (clave falsa/rechazada/cuota): la respuesta es
+          // solo OS-V3, idéntica a la pública -> va al namespace público.
+          const sdlUnusable = sdlSubs.status === "fulfilled" && sdlSubs.value?.unusable === true;
+          const putReq =
+            canonicalConfigStr && sdlUnusable
+              ? new Request(subtitleCacheUrl(url.origin, "", type, fullId))
+              : cacheReq || request;
+          cachePut(ctx, putReq, response);
         }
         return response;
       } catch (err) {
