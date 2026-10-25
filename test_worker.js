@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave } from "./worker.js";
+import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.15", m10.version === "1.4.15", m10.version);
+  check("manifest version 1.4.16", m10.version === "1.4.16", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1649,6 +1649,98 @@ try {
   const overflowCapped = await readCapped(overflowRes, MAX_ANALYZE_BYTES);
   check("v1.4.15 readCapped: tamaño > MAX_ANALYZE_BYTES tiene truncated=true",
     overflowCapped.truncated === true && overflowCapped.length === MAX_ANALYZE_BYTES);
+}
+
+// 25) v1.4.16: Blindaje de CPU en Free (<5 ms), calibración léxica sin falsos positivos, spam contextual y caché canónica
+{
+  // A. Calibración léxica: acumulación de términos débiles ("vale" x4) NO dispara Castellano
+  const scoreVale = scoreText("coche vale vale vale vale");
+  check("v1.4.16 léxico: 1 fuerte + 4 débiles ('coche vale x4') queda en Neutro (no sobrecorrige a Castellano)",
+    scoreVale?.flag === "🌎 Neutro", JSON.stringify(scoreVale));
+
+  const scoreVale3 = scoreText("coche vale vale vale");
+  check("v1.4.16 léxico: 1 fuerte + 3 débiles queda en Neutro",
+    scoreVale3?.flag === "🌎 Neutro", JSON.stringify(scoreVale3));
+
+  const scoreEsFuerte = scoreText("Llámame al móvil, nos vemos en el aparcamiento");
+  check("v1.4.16 léxico: 2 fuertes reales (móvil, aparcamiento) -> Castellano",
+    scoreEsFuerte?.flag === "🇪🇸 Castellano", JSON.stringify(scoreEsFuerte));
+
+  const scoreLatFuerte = scoreText("Prende el celular, estacioné el carro");
+  check("v1.4.16 léxico: 2 fuertes reales (celular, carro) -> Latino",
+    scoreLatFuerte?.flag === "🇲🇽 Latino", JSON.stringify(scoreLatFuerte));
+
+  // B. Anti-spam contextual: marcas numéricas con espacio ("888 casino") se detectan si hay contexto de apuestas
+  check("v1.4.16 spam contextual: 'entra a 888 casino online y gana' se descarta",
+    spamVerdict("entra a 888 casino online y gana").discard === true);
+  check("v1.4.16 spam contextual: 'bono de 100 en 777 casino' se descarta",
+    spamVerdict("bono de 100 en 777 casino").discard === true);
+  check("v1.4.16 spam contextual: '007 Casino Royale (2006)' se conserva intacto",
+    spamVerdict("007 Casino Royale (2006)").discard === false);
+  check("v1.4.16 spam contextual: 'más de 50 casinos en la ciudad' se conserva intacto",
+    spamVerdict("más de 50 casinos en la ciudad").discard === false);
+
+  // C. Normalización canónica de caché (getCanonicalConfigStr)
+  check("v1.4.16 cache: config vacía colapsa a ''",
+    getCanonicalConfigStr({}) === "");
+  check("v1.4.16 cache: config con subdlKey no string colapsa a ''",
+    getCanonicalConfigStr({ subdlKey: 12345678 }) === "" &&
+    getCanonicalConfigStr({ subdlKey: { foo: "bar" } }) === "");
+  check("v1.4.16 cache: config con subdlKey corta o vacía colapsa a ''",
+    getCanonicalConfigStr({ subdlKey: "   " }) === "" &&
+    getCanonicalConfigStr({ subdlKey: "short" }) === "");
+  check("v1.4.16 cache: dos claves de SubDL válidas comparten el namespace unificado 'k_subdl'",
+    getCanonicalConfigStr({ subdlKey: "key_88c_d5iw2o5i" }) === "k_subdl" &&
+    getCanonicalConfigStr({ subdlKey: "key_q1i_4aln61h4" }) === "k_subdl");
+
+  // D. readCapped con ReadableStream real (cobertura de streaming)
+  const streamExact = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(100));
+      controller.close();
+    }
+  }));
+  const cappedExactStream = await readCapped(streamExact, 100);
+  check("v1.4.16 readCapped stream: tamaño exacto al tope -> truncated=false",
+    cappedExactStream.truncated === false && cappedExactStream.length === 100);
+
+  const streamOverSingle = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(150));
+      controller.close();
+    }
+  }));
+  const cappedOverSingle = await readCapped(streamOverSingle, 100);
+  check("v1.4.16 readCapped stream: chunk único excedido -> truncated=true y longitud cortada",
+    cappedOverSingle.truncated === true && cappedOverSingle.length === 100);
+
+  const streamOverMulti = new Response(new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(60));
+      controller.enqueue(new Uint8Array(60));
+      controller.close();
+    }
+  }));
+  const cappedOverMulti = await readCapped(streamOverMulti, 100);
+  check("v1.4.16 readCapped stream: chunks múltiples excedidos -> truncated=true y longitud cortada",
+    cappedOverMulti.truncated === true && cappedOverMulti.length === 100);
+
+  // E. hashContent en archivos grandes: rápido y consistente CRLF vs LF
+  const bigCRLF = "1\r\n00:00:01,000 --> 00:00:02,000\r\nDiálogo de prueba.\r\n\r\n".repeat(2500); // ~150KB
+  const bigLF = "1\n00:00:01,000 --> 00:00:02,000\nDiálogo de prueba.\n\n".repeat(2500);
+  const t0Hash = performance.now();
+  const hashCRLF = hashContent(bigCRLF);
+  const hashLF = hashContent(bigLF);
+  const dtHash = performance.now() - t0Hash;
+  check("v1.4.16 hashContent: archivo 150KB CRLF vs LF produce hash idéntico",
+    hashCRLF === hashLF, `hashCRLF=${hashCRLF} hashLF=${hashLF}`);
+  check("v1.4.16 hashContent: hashing de 2x 150KB toma <10ms en total",
+    dtHash < 10, `dt=${dtHash.toFixed(2)}ms`);
+
+  // F. Cabecera x-cache en respuesta de subtítulos
+  const resSub = await get("/subtitles/movie/tt1375666.json");
+  check("v1.4.16 x-cache: respuesta de subtítulos incluye cabecera x-cache",
+    resSub.headers.has("x-cache"), resSub.headers.get("x-cache"));
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

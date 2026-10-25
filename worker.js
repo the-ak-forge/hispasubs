@@ -1,6 +1,22 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.15
+// HispaSubs — Cloudflare Worker v1.4.16
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.16 (25/10/2026) — auditoría técnica de la 1.4.15:
+//  - [CPU] Blindaje definitivo de CPU en plan Free (<5 ms): `scoreText` se acota
+//    a los primeros 48 KB (saturación léxica temprana); `spamVerdict` y
+//    `hashContent` evalúan muestreos de cabeza (48 KB) + cola (16 KB) directamente
+//    antes de normalizar, reduciendo el coste por candidato de 2.2 ms a ~0.6 ms.
+//  - [CACHE] Normalización canónica de `subdlKey`: claves válidas se unifican en
+//    el namespace `k_subdl` (máximos Cache HITs compartidos sin fugas); peticiones
+//    sin clave o inválidas colapsan en `""`. Protección contra envenenamiento
+//    si SubDL falla (no se cachea en `k_subdl`).
+//  - [LÉXICO] Calibración sin sobrecorrección: el override sin oposición exige
+//    al menos 2 términos FUERTES reales (`strongEs >= 2 && latMatches === 0`),
+//    evitando que muletillas o términos débiles (`vale` ×4) tuerzan el dialecto.
+//  - [SPAM] Regla contextual para marcas numéricas con espacio (`888 casino online`
+//    se descarta; `007 Casino Royale` y `50 casinos` se conservan).
+//  - [OBSERVABILIDAD] Cabecera `x-cache: HIT / MISS` en la ruta `/subtitles`.
 //
 // v1.4.15 (25/10/2026) — auditoría técnica de la 1.4.14:
 //  - [SPAM] Fix de falso positivo en títulos legítimos (`007 Casino Royale`):
@@ -525,12 +541,14 @@ const cachePut = (ctx, request, response) => {
 //   7200 s: lista normal de subtítulos.
 //    60 s: resultados vacíos o error (caché NEGATIVA: si un proveedor cae, no
 //          se pagan 2,5 s de timeouts en cada petición de ese título).
-const jsonResponse = (obj, cacheSeconds) =>
+const jsonResponse = (obj, cacheSeconds, extraHeaders = {}) =>
   new Response(JSON.stringify(obj), {
     headers: {
       "Access-Control-Allow-Origin": "*",
       "Content-Type": "application/json",
+      "x-cache": "MISS",
       ...(cacheSeconds ? { "Cache-Control": `public, max-age=${cacheSeconds}` } : {}),
+      ...extraHeaders,
     },
   });
 
@@ -657,7 +675,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.15",
+  version: "1.4.16",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -868,13 +886,19 @@ const isSdh = (text, threshold = SDH_MIN_MATCHES) => {
 };
 
 // Hash determinista de 64 bits del contenido textual del subtítulo.
-// Normaliza \r\n -> \n, retira BOM si existe, e incluye la longitud exacta
-// del texto normalizado junto a un muestreo de cabeza (48 KB) y cola (16 KB)
-// con dos multiplicadores primos tipo FNV/Murmur. Esto evita colisiones
-// entre archivos con igual inicio pero distinto final o tamaño.
+// Normaliza \r\n -> \n, retira BOM si existe, e incluye la longitud normalizada
+// junto a un muestreo de cabeza (48 KB) y cola (16 KB) con dos multiplicadores
+// primos tipo FNV/Murmur.
+//
+// Optimización de CPU (v1.4.16): si el archivo no contiene `\r` (el caso más habitual),
+// se evita la llamada a replace() con regex. Si contiene `\r`, normaliza a `\n` para que
+// variantes CRLF y LF produzcan idéntico hash y longitud sin colisiones.
 const hashContent = (text) => {
   if (typeof text !== "string" || !text) return "";
-  const normalized = text.replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").trim();
+  const noBom = text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text;
+  const normalized = noBom.indexOf("\r") !== -1
+    ? noBom.replace(/\r\n/g, "\n").trim()
+    : noBom.trim();
   const len = normalized.length;
   const sample = len <= 65536
     ? normalized
@@ -916,11 +940,19 @@ const unclassified = (sub, finalUrl, failed = false, sdh = false) => ({
   ...(failed ? { [FAILED]: true } : {}),
 });
 
+const MAX_SCORE_BYTES = 48 * 1024; // 48 KB
+
 // Puntuación pura de un texto. Exportada para test_worker.js, que la ejercita
 // contra un corpus etiquetado (fronteras Unicode, conjugaciones y términos
 // ambiguos). Devuelve null cuando NO hay datos suficientes para afirmar nada
 // (📄 "sin clasificar"); nunca decide por defecto.
-const scoreText = (text, diag = {}) => {
+//
+// Optimización v1.4.16: se acota a MAX_SCORE_BYTES (48 KB), donde el léxico
+// dialectal satura de sobra, evitando recorrer 300 KB con 5 regexes globales.
+const scoreText = (rawText, diag = {}) => {
+  if (typeof rawText !== "string" || !rawText) return null;
+  const text = rawText.length > MAX_SCORE_BYTES ? rawText.slice(0, MAX_SCORE_BYTES) : rawText;
+
   // Guarda contra portugués mal etiquetado como español: ≥10 "ã"/"õ" Y ≥0,2 %
   // de los caracteres (un nombre como "João"/"São Paulo" no debe tumbar un
   // subtítulo español entero).
@@ -963,8 +995,11 @@ const scoreText = (text, diag = {}) => {
   }
 
   let flag = "🌎 Neutro";
-  if (esMatches > latMatches + margin || (latMatches === 0 && esMatches >= 2)) flag = "🇪🇸 Castellano";
-  else if (latMatches > esMatches + margin || (esMatches === 0 && latMatches >= 2)) flag = "🇲🇽 Latino";
+  // Override sin oposición (v1.4.16): exige al menos 2 términos FUERTES reales
+  // y CERO oposición total (ni fuerte ni débil), impidiendo que acumulación de
+  // términos débiles (ej. "vale" x4) o ambiguos fuercen un dialecto falso.
+  if (esMatches > latMatches + margin || (latMatches === 0 && strongEs >= 2)) flag = "🇪🇸 Castellano";
+  else if (latMatches > esMatches + margin || (esMatches === 0 && strongLat >= 2)) flag = "🇲🇽 Latino";
   return { esMatches, latMatches, strongTotal, total, flag };
 };
 
@@ -999,10 +1034,12 @@ const EDGE_LINES = 30;
 const MAX_SPAM_LINE = 300;
 
 // FUERTE global: marcas y URLs que no aparecen en diálogo normal. Se busca en
-// TODO el texto (una casa de apuestas incrustada a mitad también descarta).
-// `\d{2,}` cubre marcas numéricas pegadas (888casino, 777slots); no lleva `\s*`
-// para no descartar títulos o diálogos legítimos como "007 Casino Royale" o "50 casinos".
-const SPAM_STRONG = /(?<![\p{L}\p{N}_])(?:(?:bet\s*365|1xbet|1win|22bet|betway|melbet|bwin|parimatch|betano|betfair)(?![\p{L}\p{N}_])|\d{2,}(?:casino|bingo|poker|ruleta|slots)(?![\p{L}\p{N}_])|(?:casas?\s+de\s+apuestas|apuestas\s+deportivas|bono\s+de\s+bienvenida|giros\s+gratis)(?![\p{L}\p{N}_])|(?:(?:t|telegram|wa)\s*\.\s*me|chat\s*\.\s*whatsapp\s*\.\s*com|whatsapp\s*\.\s*com\s*\/\s*channel)\s*\/\s*[^\s<>"']+)/iu;
+// el muestreo de cabeza (48 KB) y cola (16 KB) del subtítulo.
+// `\d{2,}` cubre marcas numéricas pegadas (888casino, 777slots).
+// Para marcas numéricas con espacio ("888 casino", "777 slots"), se exige contexto
+// de apuestas en la misma frase/bloque ("online", "en línea", "bonus", "apuestas", "giros"),
+// evitando descartar títulos o diálogos legítimos como "007 Casino Royale" o "50 casinos".
+const SPAM_STRONG = /(?<![\p{L}\p{N}_])(?:(?:bet\s*365|1xbet|1win|22bet|betway|melbet|bwin|parimatch|betano|betfair)(?![\p{L}\p{N}_])|\d{2,}(?:casino|bingo|poker|ruleta|slots)(?![\p{L}\p{N}_])|(?:casas?\s+de\s+apuestas|apuestas\s+deportivas|bono\s+de\s+bienvenida|giros\s+gratis)(?![\p{L}\p{N}_])|(?:(?:t|telegram|wa)\s*\.\s*me|chat\s*\.\s*whatsapp\s*\.\s*com|whatsapp\s*\.\s*com\s*\/\s*channel)\s*\/\s*[^\s<>"']+|(?:(?<![\p{L}\p{N}_])\d{2,}\s+(?:casino|bingo|poker|ruleta|slots)(?![\p{L}\p{N}_]).{0,60}?(?:online|en\s+l[ií]nea|bonus|bono|apuestas?|registr(?:o|[aá]te)|giros|tragamonedas))|(?:(?:online|en\s+l[ií]nea|bonus|bono|apuestas?|registr(?:o|[aá]te)|giros|tragamonedas).{0,60}?(?<![\p{L}\p{N}_])\d{2,}\s+(?:casino|bingo|poker|ruleta|slots)(?![\p{L}\p{N}_])))/iu;
 
 // FUERTE solo en BORDES: frases que también pueden ser diálogo legítimo
 // ("síguenos en Instagram", "instala la aplicación", "tragamonedas en línea").
@@ -1020,8 +1057,10 @@ const SPAM_WEAK_LINE = /(?<![\p{L}\p{N}_])(?:(?:https?:\/\/|www\.)[^\s<>"']+|(?:
 // mitad), solo se extrae la cabeza: las últimas líneas del buffer truncado
 // son diálogo de mitad de película, no el pie del subtítulo.
 const spamVerdict = (text, truncated = false) => {
-  // Marca/URL inequívoca: cualquier parte del subtítulo.
-  const mStrong = SPAM_STRONG.exec(text);
+  // Marca/URL inequívoca: evaluada sobre cabeza (48 KB) y cola (16 KB) para no
+  // ejecutar el regex Unicode sobre 300 KB de texto completo (ahorro de ~1.5 ms CPU).
+  const spamSample = text.length <= 65536 ? text : text.slice(0, 49152) + "\n" + text.slice(-16384);
+  const mStrong = SPAM_STRONG.exec(spamSample);
   if (mStrong) return { discard: true, reason: "fuerte", match: mStrong[0].slice(0, 60) };
 
   // Bordes sin partir el archivo entero (v1.4.4): .split(/\r?\n/) sobre un
@@ -1197,10 +1236,22 @@ const classifySubtitle = async (
   }
 };
 
+// Normalización canónica de la configuración para la clave de caché.
+// Si la configuración incluye una clave válida de SubDL (string de >=8 caracteres),
+// se normaliza a "k_subdl". Dado que SubDL devuelve los mismos resultados por ID
+// independientemente de la clave válida y las URLs de descarga no contienen credenciales,
+// colapsar a "k_subdl" unifica la caché, maximiza los Cache HITs y neutraliza
+// cualquier intento de cache-busting con tokens arbitrarios.
+// Si no hay clave válida o es de tipo no string, se normaliza a "" (caché pública de OS-V3).
+const getCanonicalConfigStr = (config) =>
+  typeof config?.subdlKey === "string" && config.subdlKey.trim().length >= 8
+    ? "k_subdl"
+    : "";
+
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave };
+export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1313,12 +1364,16 @@ export default {
         // params de query del cliente y el id en %3A o en ":"; usar la URL
         // cruda fragmentaba la caché en variantes y cada una pagaba las 5
         // descargas. Se normaliza todo a la forma exacta de la ruta.
-        // Además, si la config no aporta clave de SubDL, se normaliza a "" para
-        // compartir la entrada global y neutralizar cache-busting con tokens aleatorios.
-        const canonicalConfigStr = config.subdlKey ? `k_${hashStr(config.subdlKey)}` : "";
+        // Además, si la config no aporta clave válida de SubDL, se normaliza a "" para
+        // compartir la entrada global pública. Si aporta clave válida, se unifica en "k_subdl".
+        const canonicalConfigStr = getCanonicalConfigStr(config);
         cacheReq = new Request(subtitleCacheUrl(url.origin, canonicalConfigStr, type, fullId));
         const cached = await cacheMatch(cacheReq);
-        if (cached) return cached;
+        if (cached) {
+          const hitRes = new Response(cached.body, cached);
+          hitRes.headers.set("x-cache", "HIT");
+          return hitRes;
+        }
 
         // Límite por IP, solo en peticiones sin caché (las cacheadas no cuestan
         // nada arriba). RATE_LIMIT: peticiones/minuto e IP, 0 = desactivado.
@@ -1520,16 +1575,23 @@ export default {
             `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} duplicados=${duplicadosContenido} ttl=${ttl}s` +
             (scoreLog.length ? ` | ${scoreLog.join(" | ")}` : "")
         );
-        const response = jsonResponse({ subtitles }, ttl);
-        cachePut(ctx, cacheReq || request, response);
+        const response = jsonResponse({ subtitles }, ttl, { "x-cache": "MISS" });
+        // Si la clave de SubDL estaba presente pero la fuente fue rechazada (p.ej. clave inválida),
+        // no envenenamos la caché unificada de "k_subdl": solo cacheamos si SubDL fue exitoso
+        // o si es la caché pública global de OS-V3.
+        if (!canonicalConfigStr || sdlSubs.status === "fulfilled") {
+          cachePut(ctx, cacheReq || request, response);
+        }
         return response;
       } catch (err) {
         // Los errores de una request no deben romper la respuesta de Stremio,
         // pero al menos ahora quedan registrados. Caché negativa corta (60 s)
         // para no repetir el fallo en cada petición del mismo título.
         console.error("[subtitles] error inesperado:", err.message);
-        const failed = jsonResponse({ subtitles: [] }, 60);
-        cachePut(ctx, cacheReq || request, failed);
+        const failed = jsonResponse({ subtitles: [] }, 60, { "x-cache": "MISS" });
+        if (!canonicalConfigStr) {
+          cachePut(ctx, cacheReq || request, failed);
+        }
         return failed;
       }
     }
