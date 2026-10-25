@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.14", m10.version === "1.4.14", m10.version);
+  check("manifest version 1.4.15", m10.version === "1.4.15", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1597,6 +1597,58 @@ try {
   } finally {
     globalThis.fetch = origFetch22;
   }
+}
+
+// 24) v1.4.15: Fix falso positivo spam Casino Royale, CPU 300KB, calibración léxica y SDH con exclamación
+{
+  // A. Anti-spam: títulos y diálogos con casinos legítimos NO se descartan
+  check("v1.4.15 spam: '007 Casino Royale (2006)' conservado (no es spam)",
+    spamVerdict("007 Casino Royale (2006)").discard === false);
+  check("v1.4.15 spam: 'Ocean\\'s Eleven (2001)' conservado",
+    spamVerdict("Ocean's Eleven (2001)").discard === false);
+  check("v1.4.15 spam: 'más de 50 casinos en la ciudad' conservado",
+    spamVerdict("más de 50 casinos en la ciudad").discard === false);
+  check("v1.4.15 spam: marca de apuestas '888casino' pegada sí se descarta",
+    spamVerdict("entra a 888casino online").discard === true);
+  check("v1.4.15 spam: marca de apuestas '777slots' pegada sí se descarta",
+    spamVerdict("juega en 777slots y gana").discard === true);
+
+  // B. Calibración léxica de margin: ventajas netas (>=2 vs 0) no caen en falso Neutro
+  const scoreEsNeto = scoreText("Llámame al móvil, nos vemos en el aparcamiento");
+  check("v1.4.15 léxico: es=2, lat=0 -> Castellano (no falso Neutro)",
+    scoreEsNeto?.flag === "🇪🇸 Castellano", JSON.stringify(scoreEsNeto));
+
+  const scoreLatNeto = scoreText("Prende el celular, estacioné en la banqueta");
+  check("v1.4.15 léxico: lat=2, es=0 -> Latino (no falso Neutro)",
+    scoreLatNeto?.flag === "🇲🇽 Latino", JSON.stringify(scoreLatNeto));
+
+  const scoreMixto = scoreText("coche carro coche carro");
+  check("v1.4.15 léxico: es=2, lat=2 equilibrado -> Neutro",
+    scoreMixto?.flag === "🌎 Neutro", JSON.stringify(scoreMixto));
+
+  // C. SDH: descriptores acústicos con signos de exclamación son válidos
+  const sdhExclamaciones = Array.from({ length: SDH_MIN_MATCHES }, (_, i) =>
+    `${i + 1}\n00:0${i}:00,000 --> 00:0${i}:02,000\n[¡DISPAROS! ${i}]\n`
+  ).join("\n");
+  check("v1.4.15 isSdh: descriptores con [¡DISPAROS!] cuentan para SDH",
+    isSdh(sdhExclamaciones) === true);
+
+  // D. CPU & readCapped: tamaño exacto a MAX_ANALYZE_BYTES no es truncated
+  const exactRes = {
+    body: null,
+    arrayBuffer: async () => new Uint8Array(MAX_ANALYZE_BYTES).buffer,
+  };
+  const exactCapped = await readCapped(exactRes, MAX_ANALYZE_BYTES);
+  check("v1.4.15 readCapped: tamaño exacto a MAX_ANALYZE_BYTES tiene truncated=false",
+    exactCapped.truncated === false);
+
+  const overflowRes = {
+    body: null,
+    arrayBuffer: async () => new Uint8Array(MAX_ANALYZE_BYTES + 10).buffer,
+  };
+  const overflowCapped = await readCapped(overflowRes, MAX_ANALYZE_BYTES);
+  check("v1.4.15 readCapped: tamaño > MAX_ANALYZE_BYTES tiene truncated=true",
+    overflowCapped.truncated === true && overflowCapped.length === MAX_ANALYZE_BYTES);
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

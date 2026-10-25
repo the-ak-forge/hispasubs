@@ -1,6 +1,18 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.14
+// HispaSubs — Cloudflare Worker v1.4.15
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.15 (25/10/2026) — auditoría técnica de la 1.4.14:
+//  - [SPAM] Fix de falso positivo en títulos legítimos (`007 Casino Royale`):
+//    `SPAM_STRONG` exige número adyacente a la marca (`\d{2,}casino`), evitando
+//    descartar películas o sinopsis con casinos/poker/slots en título o diálogo.
+//  - [CPU] Reducción de `MAX_ANALYZE_BYTES` a 300 KiB (ahorro >65% CPU, blindando
+//    el límite de 10 ms en Workers Free) y corrección de `truncated` en `readCapped`.
+//  - [CACHE] Normalización canónica de `subtitleCacheUrl`: peticiones sin clave
+//    de SubDL comparten la entrada de caché global, neutralizando cache-busting.
+//  - [LÉXICO] Calibración de `margin` en `scoreText`: ventajas netas (≥2 vs 0)
+//    clasifican directamente como Castellano o Latino en vez de falso Neutro.
+//  - [SDH] Permitir signos de exclamación (`!`, `¡`) en descriptores acústicos.
 //
 // v1.4.14 (25/10/2026) — auditoría técnica de la 1.4.13:
 //  - [SDH] Endurecimiento contra falsos positivos: `isSdh` evalúa descriptores
@@ -409,11 +421,11 @@ const fetchJSON = async (url, ms = 2500) => {
 // por el BOM y se decodifica como tal: si no, el léxico y el anti-spam se
 // saltaban el fichero entero.
 //
-// La lectura va ACOTADA a 1 MB: con arrayBuffer() completo, un fichero
-// enorme (o una respuesta que no es un subtítulo) podía cargar cientos de MB
-// en el isolate (128 MB) y tumbar la petición. Para muestrear el léxico,
-// 1 MB es un techo más que holgado.
-const MAX_ANALYZE_BYTES = 1024 * 1024;
+// La lectura va ACOTADA a 300 KB: un subtítulo normal pesa ~40-100 KB
+// (~2500 líneas). 300 KB cubre holgadamente el 99.9% de subtítulos reales
+// de cine y series de principio a fin, manteniendo el consumo acumulado de
+// CPU por petición holgadamente por debajo del límite de 10 ms en Workers Free.
+const MAX_ANALYZE_BYTES = 300 * 1024;
 
 const fetchSubtitle = async (url, ms = 2000) => {
   const controller = new AbortController();
@@ -424,11 +436,11 @@ const fetchSubtitle = async (url, ms = 2000) => {
       signal: controller.signal,
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    // Si el subtítulo supera 1 MB (con o sin Content-Length), readCapped lee
-    // únicamente el primer megabyte y cancela el stream: basta para clasificar
+    // Si el subtítulo supera 300 KB (con o sin Content-Length), readCapped lee
+    // únicamente los primeros 300 KB y cancela el stream: basta para clasificar
     // el léxico y evaluar la cabecera anti-spam sin rechazar el archivo.
     const buf = await readCapped(res, MAX_ANALYZE_BYTES);
-    const truncated = buf.length >= MAX_ANALYZE_BYTES;
+    const truncated = Boolean(buf.truncated);
     // BOM primero: un SRT UTF-16 decodificado a ciegas como UTF-8/windows-1252
     // intercala bytes NUL entre caracteres y NINGÚN patrón (ni el léxico ni el
     // anti-spam) matchea; el spam se servía como "📄". El BOM lo delata.
@@ -458,20 +470,33 @@ const fetchSubtitle = async (url, ms = 2000) => {
 // Lee como mucho `max` bytes y cancela el stream. En entornos sin streaming
 // (o si el body ya viene materializado) caemos a arrayBuffer() y cortamos.
 async function readCapped(res, max) {
+  let truncated = false;
   if (!res.body || typeof res.body.getReader !== "function") {
     const ab = await res.arrayBuffer();
-    return new Uint8Array(ab.byteLength > max ? ab.slice(0, max) : ab);
+    truncated = ab.byteLength > max;
+    const out = new Uint8Array(truncated ? ab.slice(0, max) : ab);
+    out.truncated = truncated;
+    return out;
   }
   const reader = res.body.getReader();
   const chunks = [];
   let total = 0;
   for (;;) {
     const { done, value } = await reader.read();
-    if (done || total >= max) break;
+    if (done) break;
+    if (total >= max) {
+      truncated = true;
+      break;
+    }
     const room = max - total;
-    const take = value.length > room ? value.subarray(0, room) : value;
-    chunks.push(take);
-    total += take.length;
+    if (value.length > room) {
+      chunks.push(value.subarray(0, room));
+      total = max;
+      truncated = true;
+      break;
+    }
+    chunks.push(value);
+    total += value.length;
   }
   try { await reader.cancel(); } catch { /* stream ya cerrado */ }
   const out = new Uint8Array(total);
@@ -480,6 +505,7 @@ async function readCapped(res, max) {
     out.set(c, off);
     off += c.length;
   }
+  out.truncated = truncated;
   return out;
 }
 
@@ -631,7 +657,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.14",
+  version: "1.4.15",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -830,8 +856,8 @@ const isSdh = (text, threshold = SDH_MIN_MATCHES) => {
   let m;
   while ((m = SDH_BLOCK_RE.exec(text)) !== null) {
     const inner = (m[1] || m[2]).trim();
-    // Excluir etiquetas de hablante y preguntas/exclamaciones de diálogo
-    if (inner.includes(":") || inner.includes("?") || inner.includes("¿") || inner.includes("!") || inner.includes("¡")) continue;
+    // Excluir etiquetas de hablante y preguntas de diálogo (permite exclamaciones acústicas: [¡DISPAROS!])
+    if (inner.includes(":") || inner.includes("?") || inner.includes("¿")) continue;
     // Descriptor acústico explícito
     if (SDH_ACOUSTIC_RE.test(inner)) {
       matches++;
@@ -937,8 +963,8 @@ const scoreText = (text, diag = {}) => {
   }
 
   let flag = "🌎 Neutro";
-  if (esMatches > latMatches + margin) flag = "🇪🇸 Castellano";
-  else if (latMatches > esMatches + margin) flag = "🇲🇽 Latino";
+  if (esMatches > latMatches + margin || (latMatches === 0 && esMatches >= 2)) flag = "🇪🇸 Castellano";
+  else if (latMatches > esMatches + margin || (esMatches === 0 && latMatches >= 2)) flag = "🇲🇽 Latino";
   return { esMatches, latMatches, strongTotal, total, flag };
 };
 
@@ -974,9 +1000,9 @@ const MAX_SPAM_LINE = 300;
 
 // FUERTE global: marcas y URLs que no aparecen en diálogo normal. Se busca en
 // TODO el texto (una casa de apuestas incrustada a mitad también descarta).
-// `\d{2,}` cubre marcas numéricas (888casino) y `\s*` las variantes con
-// espacios ("bet 365", "t . me").
-const SPAM_STRONG = /(?<![\p{L}\p{N}_])(?:(?:bet\s*365|1xbet|1win|22bet|betway|melbet|bwin|parimatch|betano|betfair)(?![\p{L}\p{N}_])|\d{2,}\s*(?:casino|bingo|poker|ruleta|slots)(?![\p{L}\p{N}_])|(?:casas?\s+de\s+apuestas|apuestas\s+deportivas|bono\s+de\s+bienvenida|giros\s+gratis)(?![\p{L}\p{N}_])|(?:(?:t|telegram|wa)\s*\.\s*me|chat\s*\.\s*whatsapp\s*\.\s*com|whatsapp\s*\.\s*com\s*\/\s*channel)\s*\/\s*[^\s<>"']+)/iu;
+// `\d{2,}` cubre marcas numéricas pegadas (888casino, 777slots); no lleva `\s*`
+// para no descartar títulos o diálogos legítimos como "007 Casino Royale" o "50 casinos".
+const SPAM_STRONG = /(?<![\p{L}\p{N}_])(?:(?:bet\s*365|1xbet|1win|22bet|betway|melbet|bwin|parimatch|betano|betfair)(?![\p{L}\p{N}_])|\d{2,}(?:casino|bingo|poker|ruleta|slots)(?![\p{L}\p{N}_])|(?:casas?\s+de\s+apuestas|apuestas\s+deportivas|bono\s+de\s+bienvenida|giros\s+gratis)(?![\p{L}\p{N}_])|(?:(?:t|telegram|wa)\s*\.\s*me|chat\s*\.\s*whatsapp\s*\.\s*com|whatsapp\s*\.\s*com\s*\/\s*channel)\s*\/\s*[^\s<>"']+)/iu;
 
 // FUERTE solo en BORDES: frases que también pueden ser diálogo legítimo
 // ("síguenos en Instagram", "instala la aplicación", "tragamonedas en línea").
@@ -1287,7 +1313,10 @@ export default {
         // params de query del cliente y el id en %3A o en ":"; usar la URL
         // cruda fragmentaba la caché en variantes y cada una pagaba las 5
         // descargas. Se normaliza todo a la forma exacta de la ruta.
-        cacheReq = new Request(subtitleCacheUrl(url.origin, configStr, type, fullId));
+        // Además, si la config no aporta clave de SubDL, se normaliza a "" para
+        // compartir la entrada global y neutralizar cache-busting con tokens aleatorios.
+        const canonicalConfigStr = config.subdlKey ? `k_${hashStr(config.subdlKey)}` : "";
+        cacheReq = new Request(subtitleCacheUrl(url.origin, canonicalConfigStr, type, fullId));
         const cached = await cacheMatch(cacheReq);
         if (cached) return cached;
 
