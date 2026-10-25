@@ -1,6 +1,16 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.12
+// HispaSubs — Cloudflare Worker v1.4.13
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.13 (24/10/2026):
+//  - [SDH] Detección y etiquetado transparente de subtítulos para personas sordas
+//    e hipoacúsicas (Closed Captions): añade `(SDH)` a las variantes dialectales
+//    (ej. `🇪🇸 Castellano (SDH) (OS-V3)`) y `· SDH ·` a las sin clasificar
+//    mediante detección lineal O(n) con detención temprana (`isSdh`).
+//  - [DEDUP] Deduplicación por identidad textual (`hashContent`, muestra 64 KB
+//    normalizada): descarta clones idénticos del mismo archivo entre fuentes y
+//    activa automáticamente la 2ª oleada para completar el cupo de 5 limpias
+//    sin penalizar el TTL de caché.
 //
 // v1.4.12 (22/10/2026) — auditoría externa de la 1.4.11:
 //  - [CANONICAL] Las URLs de descarga de dl.subdl.com se normalizan a
@@ -612,7 +622,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.12",
+  version: "1.4.13",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -789,12 +799,44 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
 // sirven: se descartan en vez de publicarse sin verificar.)
 const FAILED = Symbol.for("hispasubs.failed");
 const DISCARDED_404 = Symbol.for("hispasubs.discarded404");
+const DISCARDED_DUPLICATE = Symbol.for("hispasubs.discardedDuplicate");
 const SCORE = Symbol.for("hispasubs.score");
-const unclassified = (sub, finalUrl, failed = false) => ({
+const CONTENT_HASH = Symbol.for("hispasubs.contentHash");
+
+// Detección de pistas SDH (Sordos e hipoacúsicos / Closed Captions).
+// Identifica descriptores de efectos de sonido, ambiente y música:
+//  - Corchetes con descripciones: [música], [risas], [disparos], etc.
+//  - Paréntesis con descripciones no numéricas: (suspira), (música suave), etc.
+//  - Símbolos y notas musicales: ♪, ♫.
+// Detención temprana una vez alcanzado el umbral para no penalizar CPU.
+const SDH_MIN_MATCHES = 12;
+const SDH_RE = /\[[^\]\r\n]{2,60}\]|\((?![0-9\s]+\))[^\)\r\n]{2,60}\)|[♪♫]/g;
+const isSdh = (text, threshold = SDH_MIN_MATCHES) => {
+  if (typeof text !== "string" || !text) return false;
+  const re = new RegExp(SDH_RE.source, "g");
+  let count = 0;
+  while (re.exec(text) !== null) {
+    count++;
+    if (count >= threshold) return true;
+  }
+  return false;
+};
+
+// Hash determinista del contenido textual del subtítulo.
+// Normaliza \r\n -> \n, retira BOM si existe, y toma hasta 64 KB de muestra
+// para garantizar colisiones nulas entre traducciones y sincronizaciones
+// distintas sin pagar penalización de memoria ni CPU en archivos grandes.
+const hashContent = (text) => {
+  if (typeof text !== "string" || !text) return "";
+  const sample = text.slice(0, 65536).replace(/^\uFEFF/, "").replace(/\r\n/g, "\n").trim();
+  return hashStr(sample);
+};
+
+const unclassified = (sub, finalUrl, failed = false, sdh = false) => ({
   id: sub.id,
   url: finalUrl,
   lang: LANG_ISO_ES,
-  label: `📄 Español (sin clasificar · ${sub.source})`,
+  label: `📄 Español (sin clasificar${sdh ? " · SDH" : ""} · ${sub.source})`,
   ...(failed ? { [FAILED]: true } : {}),
 });
 
@@ -1035,17 +1077,21 @@ const classifySubtitle = async (
       }
     }
 
+    const sdh = isSdh(text);
+    const sdhTag = sdh ? " (SDH)" : "";
+
     const diag = {};
     const scored = scoreText(text, diag);
     const brief = (flag) =>
-      `${flag} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0}${
+      `${flag}${sdh ? " SDH" : ""} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0}${
         diag.reason ? ` (${diag.reason})` : ""
       }`;
     if (!scored) {
       // Ni una sola palabra del léxico (o solo débiles / guarda de portugués):
       // el texto llegó y se analizó sin error → no es fallo transitorio → TTL normal.
-      const u = unclassified(sub, finalUrl);
+      const u = unclassified(sub, finalUrl, false, sdh);
       u[SCORE] = brief("📄");
+      u[CONTENT_HASH] = hashContent(text);
       return u;
     }
 
@@ -1053,8 +1099,9 @@ const classifySubtitle = async (
       id: sub.id,
       url: finalUrl,
       lang: LANG_ISO_ES,
-      label: `${scored.flag} (${sub.source})`,
+      label: `${scored.flag}${sdhTag} (${sub.source})`,
       [SCORE]: brief(scored.flag),
+      [CONTENT_HASH]: hashContent(text),
     };
   } catch (error) {
     // Descarte permanente sin penalizar el TTL:
@@ -1077,7 +1124,7 @@ const classifySubtitle = async (
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES };
+export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1306,10 +1353,30 @@ export default {
         );
         const w1Ms = Date.now() - tWave1;
 
+        // Deduplicación por contenido en 1ª oleada: se descartan pistas idénticas
+        // (mismo hash de texto) para no saturar el cupo con clones de la misma traducción.
+        const seenHashes = new Set();
+        let duplicadosContenido = 0;
+        for (const i of wave1Idx) {
+          const s = analyzed[i];
+          if (!s || s[FAILED] || s[DISCARDED_404]) continue;
+          const h = s[CONTENT_HASH];
+          if (h) {
+            if (seenHashes.has(h)) {
+              analyzed[i] = { [DISCARDED_DUPLICATE]: true };
+              duplicadosContenido += 1;
+            } else {
+              seenHashes.add(h);
+            }
+          }
+        }
+
         const cleanWave1 = { "OS-V3": 0, "SubDL": 0 };
         for (const i of wave1Idx) {
           const s = analyzed[i];
-          if (s && !s[FAILED] && !s[DISCARDED_404]) cleanWave1[deduped[i].source] += 1;
+          if (s && !s[FAILED] && !s[DISCARDED_404] && !s[DISCARDED_DUPLICATE]) {
+            cleanWave1[deduped[i].source] += 1;
+          }
         }
 
         const wave2Idx = [];
@@ -1330,6 +1397,21 @@ export default {
             })
           );
           w2Ms = Date.now() - tWave2;
+
+          // Deduplicación por contenido en 2ª oleada contra pistas ya vistas
+          for (const i of wave2Idx) {
+            const s = analyzed[i];
+            if (!s || s[FAILED] || s[DISCARDED_404]) continue;
+            const h = s[CONTENT_HASH];
+            if (h) {
+              if (seenHashes.has(h)) {
+                analyzed[i] = { [DISCARDED_DUPLICATE]: true };
+                duplicadosContenido += 1;
+              } else {
+                seenHashes.add(h);
+              }
+            }
+          }
         } else if (wave2Idx.length > 0) {
           console.log(`[subtitles] 2ª oleada omitida por presupuesto de tiempo (w1=${w1Ms}ms)`);
         }
@@ -1348,6 +1430,9 @@ export default {
           if (!s) continue;
           if (s[DISCARDED_404]) {
             descartes404 += 1;
+            continue;
+          }
+          if (s[DISCARDED_DUPLICATE]) {
             continue;
           }
           if (s[FAILED]) {
@@ -1378,7 +1463,7 @@ export default {
           `[subtitles] resumen ${type}/${fullId}: total=${Date.now() - tStart}ms w1=${w1Ms}ms w2=${w2Ms}ms ` +
             `descargas=${wave1Idx.length + (wave2Ran ? wave2Idx.length : 0)} ` +
             `servidas=${subtitles.length} (OS-V3=${kept["OS-V3"]},SubDL=${kept["SubDL"]}) ` +
-            `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} ttl=${ttl}s` +
+            `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} duplicados=${duplicadosContenido} ttl=${ttl}s` +
             (scoreLog.length ? ` | ${scoreLog.join(" | ")}` : "")
         );
         const response = jsonResponse({ subtitles }, ttl);

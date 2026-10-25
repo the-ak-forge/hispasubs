@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES } from "./worker.js";
+import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -198,7 +198,7 @@ globalThis.fetch = (input, init) => {
     }), { status: 200, headers: { "content-type": "application/json" } }));
   }
   if (u.includes("proxy?zipUrl=")) return Promise.resolve(textResp(TXT_LAT));   // zip vía proxy
-  if (u.includes("dl.subdl.com/subtitle/333-444.srt")) return Promise.resolve(textResp(TXT_CAST));
+  if (u.includes("dl.subdl.com/subtitle/333-444.srt")) return Promise.resolve(textResp(TXT_CAST + " subdl"));
   if (u.includes("opensubtitles-v3.strem.io")) {
     return Promise.resolve(new Response(JSON.stringify({
       subtitles: [
@@ -212,7 +212,7 @@ globalThis.fetch = (input, init) => {
       ],
     }), { status: 200, headers: { "content-type": "application/json" } }));
   }
-  if (u.includes("subs5.strem.io")) return Promise.resolve(textResp(TXT_CAST));
+  if (u.includes("subs5.strem.io")) return Promise.resolve(textResp(TXT_CAST + " " + u));
   return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
     { status: 200, headers: { "content-type": "application/json" } }));
 };
@@ -334,7 +334,7 @@ try {
       return Promise.resolve(textResp("<!DOCTYPE html><html><body>404 Not Found</body></html>"));
     }
     if (u.includes("gibberish.srt")) return Promise.resolve(textResp("zzzz qqqq xxxx jj kk ll vv nn mm"));
-    if (u.includes("eses.srt") || u.includes("ok.srt")) return Promise.resolve(textResp(TXT_CAST));
+    if (u.includes("eses.srt") || u.includes("ok.srt")) return Promise.resolve(textResp(TXT_CAST + " " + u));
     return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
       { status: 200, headers: { "content-type": "application/json" } }));
   };
@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.12", m10.version === "1.4.12", m10.version);
+  check("manifest version 1.4.13", m10.version === "1.4.13", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -830,7 +830,7 @@ try {
     if (/spam\d\.srt/.test(u)) {
       return Promise.resolve(textResp("1\n00:00:01,000 --> 00:00:02,000\nVisita www.casino-gana.com\n\ncoche vosotros"));
     }
-    if (/limpia\d\.srt/.test(u)) return Promise.resolve(textResp(TXT_CAST));
+    if (/limpia\d\.srt/.test(u)) return Promise.resolve(textResp(TXT_CAST + " " + u));
     return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
       { status: 200, headers: { "content-type": "application/json" } }));
   };
@@ -1008,7 +1008,7 @@ try {
       ] }), { status: 200, headers: { "content-type": "application/json" } }));
     }
     if (u.includes("roto.srt")) return Promise.resolve(new Response("err", { status: 503 }));
-    if (u.includes("subs5.strem.io/ok")) return Promise.resolve(textResp(TXT_CAST));
+    if (u.includes("subs5.strem.io/ok")) return Promise.resolve(textResp(TXT_CAST + " " + u));
     return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
       { status: 200, headers: { "content-type": "application/json" } }));
   };
@@ -1078,7 +1078,7 @@ try {
     }
     if (u.includes("subs5.strem.io/w")) {
       fetchedWave1Clean.push(u);
-      return Promise.resolve(textResp(TXT_CAST));
+      return Promise.resolve(textResp(TXT_CAST + " " + u));
     }
     return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
       { status: 200, headers: { "content-type": "application/json" } }));
@@ -1250,9 +1250,9 @@ try {
     if (u.includes("dead404.srt")) return Promise.resolve(new Response("Not found", { status: 404 }));
     if (u.includes("w2_6.srt")) {
       wave2CalledOn404 = true;
-      return Promise.resolve(textResp(TXT_CAST));
+      return Promise.resolve(textResp(TXT_CAST + " " + u));
     }
-    if (u.includes("subs5.strem.io/ok")) return Promise.resolve(textResp(TXT_CAST));
+    if (u.includes("subs5.strem.io/ok")) return Promise.resolve(textResp(TXT_CAST + " " + u));
     return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
       { status: 200, headers: { "content-type": "application/json" } }));
   };
@@ -1281,7 +1281,7 @@ try {
       }), { status: 200, headers: { "content-type": "application/json" } }));
     }
     if (u.includes("dead404.srt")) return Promise.resolve(new Response("Not found", { status: 404 }));
-    if (u.includes("subs5.strem.io/ok")) return Promise.resolve(textResp(TXT_CAST));
+    if (u.includes("subs5.strem.io/ok")) return Promise.resolve(textResp(TXT_CAST + " " + u));
     return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
       { status: 200, headers: { "content-type": "application/json" } }));
   };
@@ -1426,7 +1426,7 @@ try {
     if (u.includes("opensubtitles-v3.strem.io")) {
       return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }), { status: 200, headers: { "content-type": "application/json" } }));
     }
-    return Promise.resolve(textResp(TXT_CAST));
+    return Promise.resolve(textResp(TXT_CAST + " " + u));
   };
   try {
     const resCanon = await get(`/${b64url({ subdlKey: "k" })}/subtitles/movie/tt7771101.json`);
@@ -1436,6 +1436,149 @@ try {
       (jCanon.subtitles || []).length === 3 && !/leak[A-D]/.test(bodyCanon), bodyCanon.slice(0, 220));
   } finally {
     globalThis.fetch = prevFetch;
+  }
+}
+
+// 23) v1.4.13: Detección y etiquetado SDH + Deduplicación por contenido (hash determinista)
+{
+  // --- A. Tests unitarios isSdh ---
+  const normalDialog = "1\n00:00:10,000 --> 00:00:12,000\nHola Juan (hace tiempo que no te veo).\n\n2\n00:00:13,000 --> 00:00:15,000\nSí, desde el año (1998) en el hospital (Dr. Gómez).\n";
+  check("v1.4.13 isSdh: diálogo ordinario con paréntesis y fechas -> false",
+    isSdh(normalDialog) === false, `matches=${normalDialog.match(/\[|\]|\(|\)/g)?.length}`);
+
+  const sdhSample = Array.from({ length: SDH_MIN_MATCHES }, (_, i) =>
+    `${i + 1}\n00:0${i}:00,000 --> 00:0${i}:02,000\n[música misteriosa ${i}]\n`
+  ).join("\n");
+  check("v1.4.13 isSdh: anotaciones de efectos/música entre corchetes >= umbral -> true",
+    isSdh(sdhSample) === true);
+
+  const sdhParens = Array.from({ length: SDH_MIN_MATCHES }, (_, i) =>
+    `${i + 1}\n00:0${i}:00,000 --> 00:0${i}:02,000\n(suspira hondo ${i})\n`
+  ).join("\n");
+  check("v1.4.13 isSdh: descriptores de sonido entre paréntesis >= umbral -> true",
+    isSdh(sdhParens) === true);
+
+  const sdhMusicNotes = Array.from({ length: SDH_MIN_MATCHES }, (_, i) =>
+    `${i + 1}\n00:0${i}:00,000 --> 00:0${i}:02,000\n♪ canción de fondo ♪\n`
+  ).join("\n");
+  check("v1.4.13 isSdh: notas musicales >= umbral -> true",
+    isSdh(sdhMusicNotes) === true);
+
+  check("v1.4.13 isSdh: vacíos o falsy -> false",
+    isSdh("") === false && isSdh(null) === false && isSdh(undefined) === false);
+
+  const t0Sdh = performance.now();
+  const hostileSdh = "[[[[[[[[[[((((((((([[[[[[[a".repeat(3000);
+  isSdh(hostileSdh);
+  const dtSdh = performance.now() - t0Sdh;
+  check("v1.4.13 isSdh anti-ReDoS: texto hostil (80k car.) procesa en <50ms",
+    dtSdh < 50, `dt=${dtSdh.toFixed(2)}ms`);
+
+  // --- B. Tests unitarios hashContent ---
+  const crlfText = "1\r\n00:00:01,000 --> 00:00:04,000\r\nHola mundo\r\n\r\n";
+  const lfText = "1\n00:00:01,000 --> 00:00:04,000\nHola mundo\n";
+  const bomText = "\uFEFF1\n00:00:01,000 --> 00:00:04,000\nHola mundo\n";
+  const diffTimeText = "1\n00:00:02,000 --> 00:00:05,000\nHola mundo\n";
+
+  check("v1.4.13 hashContent: CRLF vs LF produce idéntico hash",
+    hashContent(crlfText) === hashContent(lfText),
+    `crlf=${hashContent(crlfText)} lf=${hashContent(lfText)}`);
+
+  check("v1.4.13 hashContent: BOM UTF-8 se descarta y produce idéntico hash",
+    hashContent(bomText) === hashContent(lfText),
+    `bom=${hashContent(bomText)} lf=${hashContent(lfText)}`);
+
+  check("v1.4.13 hashContent: sincronización diferente (distinto timestamp) da distinto hash",
+    hashContent(diffTimeText) !== hashContent(lfText),
+    `diff=${hashContent(diffTimeText)} orig=${hashContent(lfText)}`);
+
+  check("v1.4.13 hashContent: texto vacío o no string produce cadena vacía",
+    hashContent("") === "" && hashContent(null) === "");
+
+  // --- C. Integración: Etiquetado SDH (clasificado y unclassified) ---
+  const sdhCastellano = sdhSample + "\n" + TXT_CAST;
+  const sdhUnclassified = sdhSample + "\nzzzz qqqq xxxx jj kk ll vv nn mm";
+  const origFetch21 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        subtitles: [
+          { id: "sdh1", url: "https://subs5.strem.io/sdh_cast.srt", lang: "spa" },
+          { id: "sdh2", url: "https://subs5.strem.io/sdh_uncl.srt", lang: "spa" },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("sdh_cast.srt")) return Promise.resolve(textResp(sdhCastellano));
+    if (u.includes("sdh_uncl.srt")) return Promise.resolve(textResp(sdhUnclassified));
+    return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }),
+      { status: 200, headers: { "content-type": "application/json" } }));
+  };
+  try {
+    res = await get("/subtitles/movie/tt8880001.json");
+    const sdhSubs = (await res.json()).subtitles || [];
+    const castSdh = sdhSubs.find((e) => e.url.includes("sdh_cast.srt"));
+    const unclSdh = sdhSubs.find((e) => e.url.includes("sdh_uncl.srt"));
+
+    check("v1.4.13 SDH clasificado -> etiqueta incluye (SDH)",
+      castSdh?.label === "🇪🇸 Castellano (SDH) (OS-V3)",
+      `label=${castSdh?.label}`);
+
+    check("v1.4.13 SDH sin clasificar -> etiqueta incluye · SDH ·",
+      unclSdh?.label === "📄 Español (sin clasificar · SDH · OS-V3)",
+      `label=${unclSdh?.label}`);
+  } finally {
+    globalThis.fetch = origFetch21;
+  }
+
+  // --- D. Integración: Deduplicación por contenido y 2ª oleada ---
+  // Subtítulo clonado con URL distinta: se descarta limpiamente sin degradar TTL.
+  // Además, si el clon estaba en 1ª oleada, la 2ª oleada debe activarse para completar las 5 limpias.
+  let wave2RanForDedup = false;
+  const origFetch22 = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({
+        subtitles: [
+          { id: "d1", url: "https://subs5.strem.io/original.srt", lang: "spa" },
+          { id: "d2", url: "https://subs5.strem.io/clon_duplicado.srt", lang: "spa" },
+          { id: "d3", url: "https://subs5.strem.io/sub3.srt", lang: "spa" },
+          { id: "d4", url: "https://subs5.strem.io/sub4.srt", lang: "spa" },
+          { id: "d5", url: "https://subs5.strem.io/sub5.srt", lang: "spa" },
+          { id: "d6", url: "https://subs5.strem.io/reserva_wave2.srt", lang: "spa" },
+        ],
+      }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    // original y clon_duplicado devuelven exactamente el mismo texto
+    if (u.includes("original.srt") || u.includes("clon_duplicado.srt")) {
+      return Promise.resolve(textResp(TXT_CAST + "\ntexto_comun_identico"));
+    }
+    if (u.includes("reserva_wave2.srt")) {
+      wave2RanForDedup = true;
+      return Promise.resolve(textResp(TXT_CAST + "\nreserva"));
+    }
+    return Promise.resolve(textResp(TXT_CAST + "\n" + u));
+  };
+  try {
+    res = await get("/subtitles/movie/tt8880002.json");
+    const dedupSubs = (await res.json()).subtitles || [];
+    const dedupUrls = dedupSubs.map((s) => s.url);
+
+    check("v1.4.13 dedup contenido: original se sirve y clon_duplicado se descarta",
+      dedupUrls.some((u) => u.includes("original.srt")) &&
+      !dedupUrls.some((u) => u.includes("clon_duplicado.srt")),
+      JSON.stringify(dedupUrls));
+
+    check("v1.4.13 dedup contenido: activa 2ª oleada para sustituir al duplicado y llenar cupo de 5",
+      wave2RanForDedup && dedupSubs.length === 5,
+      `w2Ran=${wave2RanForDedup} len=${dedupSubs.length}`);
+
+    check("v1.4.13 dedup contenido: descarte limpio NO degrada TTL (mantiene 7200s)",
+      res.headers.get("cache-control") === "public, max-age=7200",
+      `cc=${res.headers.get("cache-control")}`);
+  } finally {
+    globalThis.fetch = origFetch22;
   }
 }
 

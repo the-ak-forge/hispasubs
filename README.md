@@ -16,10 +16,12 @@ El complemento analiza el texto de los subtítulos, detecta expresiones, pronomb
   - 🇲🇽 Latino: detecta vocabulario, pronombres y expresiones comunes de América Latina (`ustedes`, `celular`, `carro`, `manejar`, `enojar`, etc.).
   - 🇪🇸 Castellano: detecta conjugaciones y giros propios de España (`vosotros`, `ordenador`, `coche`, `conducir`, `enfadar`, etc.).
   - 🌎 Neutro: identifica subtítulos con vocabulario equilibrado o sin localismos marcados (solo se emite cuando el análisis encontró datos reales; un archivo sin ningún match léxico recibe 📄, no 🌎).
+  - 🎧 Etiquetado SDH (Sordos e Hipoacúsicos): detecta automáticamente subtítulos adaptados con descripciones de audio, efectos sonoros o música (`[música]`, `(suspira)`, notas musicales `♪`), etiquetándolos explícitamente (`(SDH)`) para que el usuario elija con conocimiento de causa.
   - Filtro anti-spam: descarta las pistas con publicidad incrustada (casas de apuestas, canales de Telegram/WhatsApp, enlaces, CTAs en la cabecera o el pie…) durante el propio análisis, sin coste de red adicional. Las frases que también pueden ser diálogo («síguenos en Instagram») solo cuentan al principio o al final del subtítulo, no a mitad de una conversación.
 
-- Solo pistas verificadas
+- Solo pistas verificadas y sin duplicados
   - Por título se **analizan hasta 8 candidatos por fuente** y se muestran **como máximo 5 limpios por fuente** (10 pistas en total). Una pista solo se publica si su contenido se descargó y pasó el filtro anti-spam: las descargas fallidas y las que no se llegan a verificar se descartan en vez de colarse sin revisar.
+  - Deduplicación por hash de contenido: identifica y descarta clones idénticos del mismo archivo entre fuentes (OpenSubtitles y SubDL), activando la segunda oleada de descarga para sustituirlos por candidatos alternativos y garantizar la máxima variedad real.
   - 📄 Español (sin clasificar): el texto se analizó correctamente, pero no dio un veredicto léxico fiable (contenido válido sin ninguna palabra del léxico). Las descargas que fallan (red, rate limit, HTML de error) no se muestran.
 
 - Sin configuración obligatoria
@@ -68,7 +70,8 @@ HispaSubs inspecciona el contenido textual de cada subtítulo e identifica patro
 | 🇪🇸 Castellano | Analizado. Vocabulario y giros de España. |
 | 🇲🇽 Latino | Analizado. Vocabulario latinoamericano. |
 | 🌎 Neutro | Analizado. Sin inclinación regional marcada (solo si hubo coincidencias léxicas reales). |
-| 📄 Español (sin clasificar) | El texto se analizó (y pasó el filtro anti-spam), pero no dio un veredicto léxico fiable: contenido sin términos fuertes del léxico (0 coincidencias o solo términos ambiguos débiles) o texto en portugués mal etiquetado (detectado por densidad de tildes nasales, tanto en minúsculas como en mayúsculas de TV, sin confundir con mojibake UTF-8). Las descargas que fallan (red, rate limit, HTML de error) no se muestran. |
+| *(SDH)* | Marcador adicional si la pista incluye adaptaciones acústicas o musicales (ej. `🇪🇸 Castellano (SDH)`). |
+| 📄 Español (sin clasificar) | El texto se analizó (y pasó el filtro anti-spam), pero no dio un veredicto léxico fiable: contenido sin términos fuertes del léxico (0 coincidencias o solo términos ambiguos débiles) o texto en portugués mal etiquetado (detectado por densidad de tildes nasales, tanto en minúsculas como en mayúsculas de TV, sin confundir con mojibake UTF-8). Si contiene anotaciones auditivas, se etiqueta como `📄 Español (sin clasificar · SDH)`. Las descargas que fallan (red, rate limit, HTML de error) no se muestran. |
 
 Esto permite distinguir entre versiones del español con matices regionales sin depender de metadatos ambiguos o genéricos.
 
