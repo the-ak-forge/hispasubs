@@ -1,6 +1,19 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.17
+// HispaSubs — Cloudflare Worker v1.4.18
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.18 (25/10/2026) — auditoría técnica de la 1.4.17:
+//  - [CACHE] Regresión corregida: una clave de SubDL rechazada (401/403,
+//    status:false) se cachea en un namespace POR CLAVE (`k_<hash>`) que el propio
+//    usuario lee tras un fallo en `k_subdl` (antes escribía en el público y leía de
+//    `k_subdl`: nunca había HIT). Un SubDL caído (5xx/429/red) con clave válida
+//    vuelve a cachearse 60 s en `k_subdl` (caché negativa), igual que el `catch`.
+//    No hay envenenamiento: nadie puede provocar un 5xx de SubDL a otros usuarios.
+//  - [CPU] `isSdh` analiza solo la muestra cabeza (48 KB) + cola (16 KB) y sus
+//    clases de caracteres excluyen el delimitador de apertura: sin coste
+//    cuadrático con ficheros hostiles (`[[[[…`, `((((…`).
+//  - [SDH] Léxico acústico con límites de palabra Unicode: `(Marie)`, `(Cantabria)`,
+//    `(Golpeado)` ya no cuentan; `[GRITA]` sí.
 //
 // v1.4.17 (25/10/2026) — auditoría técnica de la 1.4.16:
 //  - [FIX] `canonicalConfigStr` se declara fuera del `try` de /subtitles: el
@@ -685,7 +698,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.17",
+  version: "1.4.18",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -877,11 +890,18 @@ const CONTENT_HASH = Symbol.for("hispasubs.contentHash");
 // Detención temprana una vez alcanzado el umbral para no penalizar CPU.
 const SDH_MIN_MATCHES = 10;
 const SDH_ACOUSTIC_RE =
-  /(?:m[uú]sica|sonido|disparo|pasos|puerta|grito|llanto|llora|suspira|suspiro|aplauso|motor|trueno|campana|tel[eé]fono|alarma|golpe|resoplido|risas?|r[ií]e|silbido|viento|ladra|ladrido|maullido|respiraci[oó]n|explosi[oó]n|murmullo|ruido|silencio|tararea|canta|jade[oa]|a\s+lo\s+lejos|en\s+off|suena|crujido|timbre|chillar|eco|ronquido|chasquido)/i;
-const SDH_BLOCK_RE = /\[([^\]\r\n]{2,60})\]|\((?![0-9\s]+\))([^)\r\n]{2,60})\)/g;
+  /(?<![\p{L}\p{N}_])(?:m[uú]sica|sonidos?|disparos?|pasos|puertas?|gritos?|grita|gritan|gritando|llanto|llora|llorando|suspira|suspiros?|suspirando|aplausos?|motor(?:es)?|truenos?|campanas?|tel[eé]fono|alarma|golpes?|resoplido|risas?|r[ií]e|r[ií]en|riendo|silbido|silba|viento|ladra|ladridos?|maullidos?|respiraci[oó]n|explosi[oó]n|explosiones|murmullos?|ruidos?|silencio|tararea|canta|cantando|jade[oa]|a\s+lo\s+lejos|en\s+off|suena|crujido|timbre|chilla|chillar|ronquidos?|chasquidos?)(?![\p{L}\p{N}_])/iu;
+// Las clases excluyen el delimitador de apertura: sin coste O(n·60) con `[[[[…`.
+const SDH_BLOCK_RE = /\[([^\[\]\r\n]{2,60})\]|\((?![0-9\s]+\))([^()\r\n]{2,60})\)/g;
+// Mismo muestreo que spam/hash: cabeza 48 KB + cola 16 KB.
+const SDH_SAMPLE_HEAD = 49152;
+const SDH_SAMPLE_TAIL = 16384;
 
 const isSdh = (text, threshold = SDH_MIN_MATCHES) => {
   if (typeof text !== "string" || !text) return false;
+  if (text.length > SDH_SAMPLE_HEAD + SDH_SAMPLE_TAIL) {
+    text = text.slice(0, SDH_SAMPLE_HEAD) + "\n" + text.slice(-SDH_SAMPLE_TAIL);
+  }
   SDH_BLOCK_RE.lastIndex = 0;
   let matches = 0;
   let m;
@@ -1382,7 +1402,13 @@ export default {
         // compartir la entrada global pública. Si aporta clave válida, se unifica en "k_subdl".
         canonicalConfigStr = getCanonicalConfigStr(config);
         cacheReq = new Request(subtitleCacheUrl(url.origin, canonicalConfigStr, type, fullId));
-        const cached = await cacheMatch(cacheReq);
+        let cached = await cacheMatch(cacheReq);
+        // Clave rechazada por SubDL: su respuesta (solo OS-V3) vive en un namespace
+        // propio de esa clave, no en el compartido `k_subdl` (anti-envenenamiento).
+        const keyCacheUrl = canonicalConfigStr
+          ? subtitleCacheUrl(url.origin, `k_${hashStr(String(config.subdlKey))}`, type, fullId)
+          : null;
+        if (!cached && keyCacheUrl) cached = await cacheMatch(new Request(keyCacheUrl));
         if (cached) {
           const hitRes = new Response(cached.body, cached);
           hitRes.headers.set("x-cache", "HIT");
@@ -1590,19 +1616,16 @@ export default {
             (scoreLog.length ? ` | ${scoreLog.join(" | ")}` : "")
         );
         const response = jsonResponse({ subtitles }, ttl, { "x-cache": "MISS" });
-        // Si la clave de SubDL estaba presente pero la fuente fue rechazada (p.ej. clave inválida),
-        // no envenenamos la caché unificada de "k_subdl": solo cacheamos si SubDL fue exitoso
-        // o si es la caché pública global de OS-V3.
-        if (!canonicalConfigStr || sdlSubs.status === "fulfilled") {
-          // SubDL "no utilizable" (clave falsa/rechazada/cuota): la respuesta es
-          // solo OS-V3, idéntica a la pública -> va al namespace público.
-          const sdlUnusable = sdlSubs.status === "fulfilled" && sdlSubs.value?.unusable === true;
-          const putReq =
-            canonicalConfigStr && sdlUnusable
-              ? new Request(subtitleCacheUrl(url.origin, "", type, fullId))
-              : cacheReq || request;
-          cachePut(ctx, putReq, response);
-        }
+        // - Sin clave válida: namespace público.
+        // - SubDL "no utilizable" (clave falsa/rechazada/cuota): la respuesta es
+        //   solo OS-V3 -> namespace de ESA clave (nunca `k_subdl`).
+        // - Resto, incluido SubDL caído (ttl 60 s = caché negativa): `k_subdl`.
+        const sdlUnusable = sdlSubs.status === "fulfilled" && sdlSubs.value?.unusable === true;
+        cachePut(
+          ctx,
+          canonicalConfigStr && sdlUnusable ? new Request(keyCacheUrl) : cacheReq || request,
+          response
+        );
         return response;
       } catch (err) {
         // Los errores de una request no deben romper la respuesta de Stremio,
@@ -1610,9 +1633,7 @@ export default {
         // para no repetir el fallo en cada petición del mismo título.
         console.error("[subtitles] error inesperado:", err.message);
         const failed = jsonResponse({ subtitles: [] }, 60, { "x-cache": "MISS" });
-        if (!canonicalConfigStr) {
-          cachePut(ctx, cacheReq || request, failed);
-        }
+        cachePut(ctx, cacheReq || request, failed);
         return failed;
       }
     }

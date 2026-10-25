@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.17", m10.version === "1.4.17", m10.version);
+  check("manifest version 1.4.18", m10.version === "1.4.18", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1803,8 +1803,8 @@ try {
         j.subtitles.length === 1 && r.headers.get("cache-control") === "public, max-age=7200");
       check(`v1.4.17 caché (${label}): nunca escribe en k_subdl (sin envenenamiento)`,
         puts.length === 1 && !puts.some((u) => u.includes("k_subdl")), JSON.stringify(puts));
-      check(`v1.4.17 caché (${label}): la respuesta solo-OS-V3 va al namespace público`,
-        puts[0] === `${base}/subtitles/movie/tt7780002.json`, JSON.stringify(puts));
+      check(`v1.4.18 caché (${label}): la respuesta solo-OS-V3 va al namespace de esa clave (k_<hash>)`,
+        /\/k_[a-z0-9]+\/subtitles\/movie\/tt7780002\.json$/.test(puts[0] || ""), JSON.stringify(puts));
     } finally {
       console.error = origErr;
       globalThis.fetch = prevF;
@@ -1839,6 +1839,121 @@ try {
       globalThis.fetch = prevF;
       restoreGlobal("caches", prevC);
     }
+  }
+}
+
+// 25) v1.4.18: regresión de caché, CPU de isSdh y falsos positivos SDH
+{
+  const jsonR = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
+  const memCache = () => {
+    const m = new Map();
+    return {
+      m,
+      default: {
+        match: async (req) => { const r = m.get(req.url); return r ? r.clone() : undefined; },
+        put: async (req, r) => { m.set(req.url, r); },
+      },
+    };
+  };
+  const mkFetch = (counter, subdl) => (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(jsonR({ subtitles: [{ id: "q1", url: "https://subs5.strem.io/q1.srt", lang: "spa" }] }));
+    }
+    if (u.includes("api.subdl.com")) { counter.subdl++; return Promise.resolve(subdl()); }
+    counter.dl++;
+    return Promise.resolve(textResp(TXT_CAST));
+  };
+  const run = async (key, id, waits) =>
+    worker.fetch(new Request(`${base}/${b64url({ subdlKey: key })}/subtitles/movie/${id}.json`), {},
+      { waitUntil: (p) => waits.push(p) });
+
+  const scenarios = [
+    ["clave rechazada (403)", () => new Response("no", { status: 403 }), 7200],
+    ["clave rechazada (status:false)", () => jsonR({ status: false }), 7200],
+    ["SubDL caído (500) con clave válida", () => new Response("boom", { status: 500 }), 60],
+  ];
+  for (const [label, subdl, ttl] of scenarios) {
+    const cache = memCache();
+    const prevC = mockGlobal("caches", cache);
+    const prevF = globalThis.fetch;
+    const counter = { subdl: 0, dl: 0 };
+    globalThis.fetch = mkFetch(counter, subdl);
+    const origErr = console.error, origLog = console.log;
+    console.error = () => {}; console.log = () => {};
+    try {
+      const waits = [];
+      const r1 = await run("clave_probada_123", "tt7790001", waits);
+      await Promise.all(waits);
+      const after1 = { ...counter };
+      const r2 = await run("clave_probada_123", "tt7790001", waits);
+      await Promise.all(waits);
+      console.log = origLog;
+      check(`v1.4.18 caché (${label}): TTL ${ttl}s`,
+        r1.headers.get("cache-control") === `public, max-age=${ttl}`, r1.headers.get("cache-control"));
+      check(`v1.4.18 caché (${label}): la 2ª petición es HIT sin repetir descargas ni búsqueda`,
+        r2.headers.get("x-cache") === "HIT" && counter.dl === after1.dl && counter.subdl === after1.subdl,
+        `x-cache=${r2.headers.get("x-cache")} dl=${after1.dl}->${counter.dl} subdl=${after1.subdl}->${counter.subdl}`);
+      check(`v1.4.18 caché (${label}): ${ttl === 60 ? "en k_subdl (caché negativa)" : "nunca en k_subdl"}`,
+        ttl === 60
+          ? [...cache.m.keys()].every((u) => u.includes("/k_subdl/"))
+          : ![...cache.m.keys()].some((u) => u.includes("/k_subdl/")),
+        JSON.stringify([...cache.m.keys()]));
+      if (ttl === 7200) {
+        // otro usuario con clave válida NO recibe la respuesta de la clave mala
+        const waits2 = [];
+        const rOther = await run("otra_clave_ok_456", "tt7790001", waits2);
+        check(`v1.4.18 caché (${label}): otro usuario no hereda la entrada de la clave rechazada`,
+          rOther.headers.get("x-cache") === "MISS", String(rOther.headers.get("x-cache")));
+      }
+    } finally {
+      console.error = origErr; console.log = origLog;
+      globalThis.fetch = prevF;
+      restoreGlobal("caches", prevC);
+    }
+  }
+
+  // catch: la caché negativa de 60 s también se escribe para clave válida
+  {
+    const puts = [];
+    const prevC = mockGlobal("caches", {
+      default: {
+        match: async (req) => (req.url.includes("/k_subdl/") ? { body: "x", status: 99 } : undefined),
+        put: async (req) => { puts.push(req.url); },
+      },
+    });
+    const origErr = console.error; console.error = () => {};
+    try {
+      const waits = [];
+      const r = await run("clave_valida_123", "tt7790002", waits);
+      await Promise.all(waits);
+      check("v1.4.18 catch: la caché negativa de 60 s se escribe también con clave válida (k_subdl)",
+        r.status === 200 && puts.length === 1 && puts[0].includes("/k_subdl/"), JSON.stringify(puts));
+    } finally {
+      console.error = origErr;
+      restoreGlobal("caches", prevC);
+    }
+  }
+
+  // CPU de isSdh con ficheros hostiles
+  for (const [label, ch] of [["[", "["], ["(", "("], ["[x", "[x"], ["(x", "(x"]]) {
+    const hostile = ch.repeat(Math.ceil(300000 / ch.length));
+    const t0 = performance.now();
+    const r = isSdh(hostile);
+    const dt = performance.now() - t0;
+    check(`v1.4.18 isSdh: 300 KB hostiles de '${label}' no disparan SDH y tardan <10 ms`,
+      r === false && dt < 10, `dt=${dt.toFixed(1)}ms r=${r}`);
+  }
+  check("v1.4.18 isSdh: una muestra (cabeza+cola) sigue detectando SDH real en ficheros grandes",
+    isSdh("[música]\n".repeat(20) + "Diálogo normal.\n".repeat(40000)) === true);
+
+  // Falsos positivos por subcadena y casos reales
+  const rep12 = (w) => `${w}\n`.repeat(12);
+  for (const fp of ["(Marie)", "[CARRIE]", "(Cantabria)", "(Golpeado)", "[Marielle]"]) {
+    check(`v1.4.18 isSdh: 12× ${fp} NO es SDH`, isSdh(rep12(fp)) === false);
+  }
+  for (const ok of ["[GRITA]", "[música]", "(suspira)", "[Risas]", "(ríe)", "[¡DISPAROS!]"]) {
+    check(`v1.4.18 isSdh: 12× ${ok} SÍ es SDH`, isSdh(rep12(ok)) === true);
   }
 }
 
