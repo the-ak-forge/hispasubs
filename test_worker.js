@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.24", m10.version === "1.4.24", m10.version);
+  check("manifest version 1.4.25", m10.version === "1.4.25", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2382,6 +2382,44 @@ try {
     finally { globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
     check("v1.4.23 429: el 429 del proxy (zip) no se reintenta (1 llamada)", zipCalls === 1, String(zipCalls));
   }
+}
+
+// 31) v1.4.25: endurecimiento SPAM_CREDIT_NAME_TOKEN contra dominios camuflados y muestreo léxico cabeza+centro+cola
+{
+  const srtWith = (head) =>
+    `1\n00:00:01,000 --> 00:00:02,000\n${head}\n\n2\n00:00:03,000 --> 00:00:04,000\nHola chaval, ¿cómo estás?\n\n` +
+    "3\n00:00:05,000 --> 00:00:06,000\nVamos a por el coche.\n\n".repeat(40);
+
+  // A. Dominios camuflados con nombre de comunidad NO se eximen como crédito
+  const spoofCases = [
+    ["dominio compuesto con guion (www.casino-argenteam.top)", "Subtitulado por www.casino-argenteam.top\nTraducido por www.casino-argenteam.top", true],
+    ["subdominio falso (argenteam.casino-ya.top)", "Subtítulos por argenteam.casino-ya.top\nCorregido por subdivx.apuestas.vip", true],
+    ["query/afiliado con nombre de comunidad (https://bet-win.top/?ref=argenteam)", "Subtítulos por\nhttps://bet-win.top/?ref=argenteam", true],
+    ["TLD falso de comunidad (www.argenteam.bet)", "Subtítulos por\nwww.argenteam.bet", true],
+    ["ruta legítima de comunidad (https://www.subdivx.com/usuarios/juan)", "Subtítulos por\nhttps://www.subdivx.com/usuarios/juan", false],
+    ["nombre de comunidad entre paréntesis ([Argenteam] / (SubDivX))", "Subtítulos por [Argenteam]\nSincronizado por (SubDivX)", false],
+  ];
+  for (const [desc, head, expected] of spoofCases) {
+    const v = spamVerdict(srtWith(head));
+    check(`v1.4.25 anti-spoof créditos: ${desc} -> ${expected ? "descarta" : "conserva"}`,
+      v.discard === expected, JSON.stringify(v));
+  }
+
+  // B. Muestreo léxico estratificado (24 KB cabeza + 12 KB centro + 12 KB cola) en archivos >48 KB
+  const neutralLine = "1\n00:00:01,000 --> 00:00:03,000\nHola, buenos días a todos en la casa.\n\n"; // 65 bytes
+  const pad40KB = neutralLine.repeat(640); // ~41.6 KB de diálogo neutro
+
+  // Caso 1: Modismos exclusivamente en el centro (~60 KB) de un subtítulo de ~100 KB
+  const midCastellano = pad40KB + "\n" + "Vosotros tenéis el coche aparcado frente al ordenador.\n".repeat(6) + "\n" + pad40KB;
+  const resMidEs = scoreText(midCastellano);
+  check("v1.4.25 muestreo léxico: detecta Castellano en el centro de un archivo de ~85 KB",
+    resMidEs?.flag === "🇪🇸 Castellano", JSON.stringify(resMidEs));
+
+  // Caso 2: Modismos exclusivamente al final (últimos 8 KB) de un subtítulo de ~90 KB
+  const tailLatino = pad40KB + pad40KB + "\n" + "Oye wey, prende el celular y estaciona el carro ahorita.\n".repeat(6);
+  const resTailLat = scoreText(tailLatino);
+  check("v1.4.25 muestreo léxico: detecta Latino en la cola de un archivo de ~85 KB",
+    resTailLat?.flag === "🇲🇽 Latino", JSON.stringify(resTailLat));
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

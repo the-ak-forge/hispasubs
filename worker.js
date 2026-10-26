@@ -1,6 +1,18 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.24
+// HispaSubs — Cloudflare Worker v1.4.25
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.25 (26/10/2026):
+//  - [ANTI-SPAM / CRÉDITOS] Endurecimiento de `SPAM_CREDIT_NAME_TOKEN`: en vez
+//    de `\S*...\S*` (que permitía camuflar dominios propios o URLs de afiliado
+//    como `www.casino-argenteam.top` o `https://bet.top/?ref=argenteam`), ahora
+//    solo consume el nombre exacto de la comunidad o su URL oficial legítima
+//    (`argenteam.net`, `subdivx.com`, `subtitulos.es`, `allsubs.org`, `asia-team.net`,
+//    `tusubtitulo.com`, `subtitulamos.tv`, `elrincondelsub.com`).
+//  - [LÉXICO / MUESTREO] `scoreText` pasa de cortar en los primeros 48 KB a un
+//    muestreo estratificado de 3 ventanas (24 KB cabeza + 12 KB centro + 12 KB
+//    cola = 48 KB totales). Mantiene exactamente el mismo techo de CPU (<0,4 ms)
+//    pero captura modismos en el segundo y tercer acto de películas de >48 KB.
 //
 // v1.4.24 (26/10/2026):
 //  - [ANTI-SPAM / VECTOR DE ELUSIÓN] Cierre de fuga en exención de créditos:
@@ -789,7 +801,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.24",
+  version: "1.4.25",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1122,18 +1134,37 @@ const unclassified = (sub, finalUrl, failed = false, sdh = false) => ({
   ...(failed ? { [FAILED]: true } : {}),
 });
 
-const MAX_SCORE_BYTES = 48 * 1024; // 48 KB
+const MAX_SCORE_BYTES = 48 * 1024; // 48 KB (24 KB cabeza + 12 KB centro + 12 KB cola)
+const SCORE_HEAD_BYTES = 24 * 1024;
+const SCORE_MID_BYTES = 12 * 1024;
+const SCORE_TAIL_BYTES = 12 * 1024;
+
+// Extrae una muestra representativa de hasta 48 KB repartida en 3 ventanas
+// (cabeza, centro y cola) separadas por salto de línea para no unir palabras
+// en los cortes. Evita que películas de >48 KB cuyos modismos aparecen en la
+// segunda mitad caigan en 📄 "sin clasificar" o Neutro, sin subir el coste CPU.
+const sampleScoreText = (rawText) => {
+  if (rawText.length <= MAX_SCORE_BYTES) return rawText;
+  const midStart = Math.floor((rawText.length - SCORE_MID_BYTES) / 2);
+  return (
+    rawText.slice(0, SCORE_HEAD_BYTES) +
+    "\n" +
+    rawText.slice(midStart, midStart + SCORE_MID_BYTES) +
+    "\n" +
+    rawText.slice(-SCORE_TAIL_BYTES)
+  );
+};
 
 // Puntuación pura de un texto. Exportada para test_worker.js, que la ejercita
 // contra un corpus etiquetado (fronteras Unicode, conjugaciones y términos
 // ambiguos). Devuelve null cuando NO hay datos suficientes para afirmar nada
 // (📄 "sin clasificar"); nunca decide por defecto.
 //
-// Optimización v1.4.16: se acota a MAX_SCORE_BYTES (48 KB), donde el léxico
-// dialectal satura de sobra, evitando recorrer 300 KB con 5 regexes globales.
+// Optimización v1.4.16 / v1.4.25: se acota a MAX_SCORE_BYTES (48 KB) mediante
+// muestreo estratificado cabeza+centro+cola, evitando recorrer 300 KB con 5 regexes globales.
 const scoreText = (rawText, diag = {}) => {
   if (typeof rawText !== "string" || !rawText) return null;
-  const text = rawText.length > MAX_SCORE_BYTES ? rawText.slice(0, MAX_SCORE_BYTES) : rawText;
+  const text = sampleScoreText(rawText);
 
   // Guarda contra portugués mal etiquetado como español: ≥10 "ã"/"õ" Y ≥0,2 %
   // de los caracteres (un nombre como "João"/"São Paulo" no debe tumbar un
@@ -1246,10 +1277,10 @@ const SPAM_WEAK_LINE = /(?<![\p{L}\p{N}_])(?:(?:https?:\/\/|www\.)[^\s<>"']+|(?:
 const SPAM_CREDIT_LINE = /(?<![\p{L}\p{N}_])(?:argenteam|subdivx|tusubtitulo|subtitulamos|elrincondelsub|allsubs|asia-team|subtitulos\.es)(?![\p{L}\p{N}_])|(?<![\p{L}\p{N}_])(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])/iu;
 
 // Una línea es "solo crédito" si, quitando las frases de crédito y los tokens
-// que contienen el nombre de una comunidad conocida, ya no queda NINGUNA señal
-// débil. Así "Subtitulado por www.casino-ya.top" NO se exime: tras quitar la
-// frase sigue quedando un dominio ajeno.
-const SPAM_CREDIT_NAME_TOKEN = /\S*(?<![\p{L}\p{N}_])(?:argenteam|subdivx|tusubtitulo|subtitulamos|elrincondelsub|allsubs|asia-team|subtitulos\.es)(?![\p{L}\p{N}_])\S*/giu;
+// exactos de una comunidad conocida (su nombre o su dominio oficial, nunca un
+// dominio compuesto o query ajena como `www.casino-argenteam.top` o
+// `https://bet.top/?ref=argenteam`), ya no queda NINGUNA señal débil.
+const SPAM_CREDIT_NAME_TOKEN = /(?<![\p{L}\p{N}_.-])(?:https?:\/\/)?(?:www\.)?(?:(?:argenteam|asia-team)(?:\.net)?|(?:subdivx|tusubtitulo|elrincondelsub)(?:\.com)?|subtitulamos(?:\.tv)?|allsubs(?:\.org)?|subtitulos\.es)(?:\/[a-z0-9/_-]*)?(?![\p{L}\p{N}_.?=&-])/giu;
 const SPAM_CREDIT_PHRASE = /(?<![\p{L}\p{N}_])(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])/giu;
 const isCreditOnlyLine = (line) =>
   SPAM_CREDIT_LINE.test(line) &&
