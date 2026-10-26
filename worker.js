@@ -1,6 +1,20 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.21
+// HispaSubs — Cloudflare Worker v1.4.22
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.22 (26/10/2026):
+//  - [SUBDL NOT FOUND / CACHE] Corrección de regex en SubDL: se acota estrictamente
+//    al mensaje exacto ("can't find movie or tv") para evitar que avisos de clave
+//    inválida ("api_key not found") se tomen como 0 resultados legítimos. Además,
+//    un título no encontrado en SubDL se marca unusable (se guarda en el namespace
+//    de esa clave y nunca en el k_subdl compartido), blindando la caché contra
+//    envenenamiento por claves inválidas.
+//  - [RANKING RECORTADO] Simplificación del ranking: solo los subtítulos procedentes
+//    de plataformas oficiales ([PLAT]) se ordenan al frente; el resto de pistas
+//    conserva el orden natural del proveedor (evita priorizar arbitrariamente
+//    WEB sobre BluRay sin disponer del filename del reproductor).
+//  - [UX CONFIGURADOR] Ajuste del texto de ayuda de SubDL para reflejar fielmente
+//    su función (ampliar el catálogo de búsqueda con subtítulos adicionales).
 //
 // v1.4.21 (26/10/2026):
 //  - [RANKING DE CALIDAD] Priorización activa de subtítulos: las pistas
@@ -704,7 +718,7 @@ const parseConfig = (configStr) => {
 
 const getConfigureHTML = (existingConfig = {}) => `
 <!DOCTYPE html>
-<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Configuración | HispaSubs</title><style>body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background-color: #121212; color: #ffffff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; } .container { background-color: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); max-width: 500px; width: 100%; text-align: center; } h1 { margin-top: 10px; color: #00d2ff; font-size: 28px; } p { color: #aaaaaa; font-size: 14px; margin-bottom: 24px; line-height: 1.5; } .form-group { text-align: left; margin-bottom: 20px; } label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 14px; } input { width: 100%; padding: 12px; border: 1px solid #333; border-radius: 6px; background-color: #2a2a2a; color: #fff; box-sizing: border-box; font-family: monospace; } input:focus { outline: none; border-color: #00d2ff; } .btn-container { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; } button { font-size: 16px; font-weight: bold; border-radius: 6px; cursor: pointer; width: 100%; padding: 14px 24px; transition: all 0.3s; } .btn-primary { background-color: #00d2ff; color: #121212; border: none; } .btn-primary:hover { background-color: #00a8cc; transform: translateY(-2px); } .btn-secondary { background-color: transparent; color: #00d2ff; border: 2px solid #00d2ff; } </style></head><body><div class="container"><div>${LOGO_SVG}</div><h1>HispaSubs</h1><p>Clasificación léxica en tiempo real para Stremio.<br>Detecta automáticamente modismos en español y los divide en <strong>🇲🇽 Latino</strong>, <strong>🇪🇸 Castellano</strong> y <strong>🌎 Neutro</strong>.</p><div class="form-group"><label>SubDL API Key (Opcional — Mayor catálogo)</label><input type="password" id="subdlKey" placeholder="ej: abc123def456..." value="${esc(existingConfig.subdlKey || "")}"><small style="display:block;margin-top:6px;color:#888;font-size:12px;line-height:1.4;">Obtén una clave gratis en <a href="https://subdl.com" target="_blank" style="color:#00d2ff;text-decoration:none;">subdl.com</a> para ampliar la búsqueda y priorizar versiones sincronizadas de alta calidad.</small></div><div class="btn-container"><button class="btn-primary" onclick="installAddon()">Instalar en Stremio</button><button class="btn-secondary" id="copyBtn" onclick="copyManifest()">Copiar URL del Manifest</button></div></div>
+<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Configuración | HispaSubs</title><style>body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background-color: #121212; color: #ffffff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; } .container { background-color: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); max-width: 500px; width: 100%; text-align: center; } h1 { margin-top: 10px; color: #00d2ff; font-size: 28px; } p { color: #aaaaaa; font-size: 14px; margin-bottom: 24px; line-height: 1.5; } .form-group { text-align: left; margin-bottom: 20px; } label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 14px; } input { width: 100%; padding: 12px; border: 1px solid #333; border-radius: 6px; background-color: #2a2a2a; color: #fff; box-sizing: border-box; font-family: monospace; } input:focus { outline: none; border-color: #00d2ff; } .btn-container { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; } button { font-size: 16px; font-weight: bold; border-radius: 6px; cursor: pointer; width: 100%; padding: 14px 24px; transition: all 0.3s; } .btn-primary { background-color: #00d2ff; color: #121212; border: none; } .btn-primary:hover { background-color: #00a8cc; transform: translateY(-2px); } .btn-secondary { background-color: transparent; color: #00d2ff; border: 2px solid #00d2ff; } </style></head><body><div class="container"><div>${LOGO_SVG}</div><h1>HispaSubs</h1><p>Clasificación léxica en tiempo real para Stremio.<br>Detecta automáticamente modismos en español y los divide en <strong>🇲🇽 Latino</strong>, <strong>🇪🇸 Castellano</strong> y <strong>🌎 Neutro</strong>.</p><div class="form-group"><label>SubDL API Key (Opcional — Mayor catálogo)</label><input type="password" id="subdlKey" placeholder="ej: abc123def456..." value="${esc(existingConfig.subdlKey || "")}"><small style="display:block;margin-top:6px;color:#888;font-size:12px;line-height:1.4;">Obtén una clave gratis en <a href="https://subdl.com" target="_blank" style="color:#00d2ff;text-decoration:none;">subdl.com</a> para ampliar la búsqueda con subtítulos adicionales de su catálogo.</small></div><div class="btn-container"><button class="btn-primary" onclick="installAddon()">Instalar en Stremio</button><button class="btn-secondary" id="copyBtn" onclick="copyManifest()">Copiar URL del Manifest</button></div></div>
 <script>
 // NOTA: se usa split/join en vez de .replace(/.../) para no depender de
 // escapes anidados dentro del template literal del Worker (el bug ///g de 1.0.0).
@@ -734,7 +748,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.21",
+  version: "1.4.22",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -831,14 +845,23 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
     const data = await fetchJSON(url, 2500);
     // SubDL responde 200 con status:false tanto cuando la clave es inválida
     // como cuando no encuentra el título ("can't find movie or tv").
-    // v1.4.21: distinguimos "título no encontrado" (0 resultados normales, utilizable
-    // y cacheable en k_subdl) de errores reales de autenticación o cuota (unusable).
+    // v1.4.22: "título no encontrado" se registra de forma informativa pero se marca
+    // unusable (se cachea en k_<key> y no en k_subdl compartido) para evitar envenenamiento
+    // si un error de clave contiene mensajes similares.
     if (data.status === false || !Array.isArray(data.subtitles)) {
       const errMsg = String(data.error || data.message || "");
-      const isNotFound = /can'?t find|not found|no (?:movie|tv|subtitles)/i.test(errMsg);
+      // Solo el mensaje EXACTO observado en producción. La regex anterior
+      // (`not found` a secas) también casaba con avisos de clave inválida del
+      // estilo "api_key not found", y entonces una clave falsa dejaba el
+      // resultado (sin SubDL) en el `k_subdl` compartido.
+      const isNotFound = /can'?t\s+find\s+movie\s+or\s+tv/i.test(errMsg);
       if (isNotFound) {
-        console.log(`[SubDL] 0 resultados para ${imdbId} (${subdlType}${season ? ` s${season}e${episode}` : ""}): ${errMsg}`);
-        return [];
+        // Informativo (no error). El resultado se marca `unusable`: la respuesta
+        // (solo OS-V3) va al namespace de ESA clave, nunca al `k_subdl`
+        // compartido, porque desde aquí no se puede distinguir "el título no
+        // existe en SubDL" de "esta clave no sirve" con certeza.
+        console.log(`[SubDL] título no encontrado ${imdbId} (${subdlType}${season ? ` s${season}e${episode}` : ""}): ${errMsg}`);
+        return unusableSubDL();
       }
       console.error("[SubDL] respuesta sin subs:", data.error || "campo subtitles ausente", data.message || "");
       return unusableSubDL();
@@ -1700,36 +1723,14 @@ export default {
           if (s[SCORE]) scoreLog.push(`${source}:${s[SCORE]}`);
         }
 
-        // Ranking de calidad v1.4.21:
-        // 1º Subtítulos de calidad profesional y retail (máxima fidelidad de release).
-        // 2º Ripeos WEB-DL / WEBRip (sincronizados con la mayoría de streams).
-        // 3º Ediciones de disco (BluRay / BDRip / UHD).
-        // 4º Dialecto verificado (🇲🇽/🇪🇸/🌎) sobre sin clasificar (📄).
-        // 5º Resto de pistas en orden natural del proveedor.
-        // Se preservan todas las pistas válidas del pool sin descartar ninguna;
-        // orden estable dentro de cada nivel.
-        subtitles.sort((a, b) => {
-          const platA = a[IS_PLATFORM] ? 1 : 0;
-          const platB = b[IS_PLATFORM] ? 1 : 0;
-          if (platB !== platA) return platB - platA;
-
-          const sourceWeight = (s) => {
-            const rel = s[RELEASE_SOURCE];
-            if (rel === "web") return 2;
-            if (rel === "disco") return 1;
-            return 0;
-          };
-          const wA = sourceWeight(a);
-          const wB = sourceWeight(b);
-          if (wB !== wA) return wB - wA;
-
-          const isClassified = (s) => (s.label && !s.label.startsWith("📄") ? 1 : 0);
-          const cA = isClassified(a);
-          const cB = isClassified(b);
-          if (cB !== cA) return cB - cA;
-
-          return 0;
-        });
+        // Ranking (v1.4.22): SOLO las pistas con etiqueta de servicio
+        // de streaming (IS_PLATFORM) van delante; el resto conserva el orden del
+        // proveedor (sort estable, no se descarta nada). WEB-DL/BluRay NO ordenan:
+        // indican contra qué vídeo está sincronizado el subtítulo, y sin el
+        // `filename` del usuario no se sabe cuál le conviene (quien reproduce un
+        // BluRay recibía las pistas web primero). Ese ranking necesita el nombre
+        // del fichero (extra de Stremio) y una clave de caché que lo contemple.
+        subtitles.sort((a, b) => (b[IS_PLATFORM] ? 1 : 0) - (a[IS_PLATFORM] ? 1 : 0));
 
         // TTL según fiabilidad (v1.4.5/1.4.6, por fuente): una fuente se
         // considera degradada si rechazó entera (`sourceFailed`), si tuvo >=1

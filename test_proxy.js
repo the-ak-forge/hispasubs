@@ -8,7 +8,7 @@
 
 import AdmZip from "adm-zip";
 import dns from "node:dns/promises";
-import handler, { ALLOWED_HOSTS, MAX_BYTES, isPublicIP, readCapped, rateLimit, RATE_MAP_CAP } from "./api/proxy.js";
+import handler, { ALLOWED_HOSTS, MAX_BYTES, MAX_ENTRY_BYTES, isPublicIP, readCapped, rateLimit, RATE_MAP_CAP } from "./api/proxy.js";
 
 let pass = 0;
 let fail = 0;
@@ -706,5 +706,46 @@ section("7. allowlist del proxy vs del worker");
 // ===========================================================================
 // Resumen
 // ===========================================================================
+section("v1.4.22: tope de descarga (10 MB) separado del tope por entrada extraída (4 MB)");
+{
+  const mkSrt = (mb) => {
+    let t = "", i = 1;
+    while (t.length < mb * 1024 * 1024) { t += `${i}\n00:00:01,000 --> 00:00:02,000\nHola mundo línea ${i} variable ${(i * 7919) % 1000}\n\n`; i++; }
+    return t;
+  };
+  const q = "/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/subtitle/9-9.zip");
+
+  // A. entrada de 6 MB: pasaría el tope de descarga pero NO el de respuesta (Vercel 4,5 MB)
+  {
+    const z = new AdmZip(); z.addFile("Show.S01E01.srt", Buffer.from(mkSrt(6)));
+    const zipBuf = z.toBuffer();
+    fetchImpl = () => new Response(zipBuf, { status: 200, headers: { "content-length": String(zipBuf.length) } });
+    const res = await call(q);
+    check("entrada extraída de 6 MB -> no se sirve (422), no un cuerpo >4,5 MB",
+      res.statusCode === 422 && Buffer.byteLength(String(res.body)) < 1024, `${res.statusCode} ${Buffer.byteLength(String(res.body))}B`);
+  }
+  // B. entrada de ~3 MB: sí se sirve
+  {
+    const z = new AdmZip(); z.addFile("Show.S01E01.srt", Buffer.from(mkSrt(3)));
+    const zipBuf = z.toBuffer();
+    fetchImpl = () => new Response(zipBuf, { status: 200, headers: { "content-length": String(zipBuf.length) } });
+    const res = await call(q);
+    check("entrada extraída de 3 MB -> 200", res.statusCode === 200 && Buffer.byteLength(String(res.body)) > 3 * 1024 * 1024, `${res.statusCode}`);
+  }
+  // C. season pack de ~8,8 MB (zip) con el episodio pedido pequeño: sí se sirve (motivo de la ampliación a 10 MB)
+  {
+    const z = new AdmZip();
+    for (let e = 1; e <= 24; e++) z.addFile(`Show.S03E${String(e).padStart(2, "0")}.srt`, Buffer.from(mkSrt(0.035)));
+    const filler = Buffer.alloc(Math.floor(8.7 * 1024 * 1024 / 4) * 4);
+    for (let i = 0; i < filler.length; i += 4) filler.writeUInt32LE((Math.random() * 2 ** 32) >>> 0, i);
+    z.addFile("extras/otros_idiomas.bin.srt", filler);
+    const zipBuf = z.toBuffer();
+    check("el pack de prueba supera 4 MB y cabe en MAX_BYTES", zipBuf.length > 4 * 1024 * 1024 && zipBuf.length <= MAX_BYTES, String(zipBuf.length));
+    fetchImpl = () => new Response(zipBuf, { status: 200, headers: { "content-length": String(zipBuf.length) } });
+    const res = await call(q + "&s=3&e=11");
+    check("season pack ~8,8 MB: se extrae el episodio pedido (200)", res.statusCode === 200 && /línea 1 /.test(String(res.body)), `${res.statusCode}`);
+  }
+}
+
 console.log(`\n${pass} ok, ${fail} fallos`);
 process.exit(fail > 0 ? 1 : 0);

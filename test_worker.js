@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.21", m10.version === "1.4.21", m10.version);
+  check("manifest version 1.4.22", m10.version === "1.4.22", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2118,7 +2118,7 @@ try {
 
 // 28) v1.4.21: Ranking de calidad activo, SubDL 'not found' sin envenenamiento y mitigación 429
 {
-  // A. SubDL "can't find movie or tv": resultado vacío utilizable, escribe en k_subdl
+  // A. SubDL "can't find movie or tv": sin console.error, pero NO escribe en k_subdl (v1.4.22)
   {
     const store = new Map();
     const prevC = mockGlobal("caches", {
@@ -2172,9 +2172,11 @@ try {
       const keys = [...store.keys()];
 
       check("v1.4.21 SubDL 'not found': no emite console.error", errCalled === false);
-      check("v1.4.21 SubDL 'not found': emite log informativo", logMsg.includes("[SubDL] 0 resultados para tt9876543"));
+      check("v1.4.21 SubDL 'not found': emite log informativo", logMsg.includes("[SubDL] título no encontrado tt9876543"));
       check("v1.4.21 SubDL 'not found': sirve subtítulos de OS-V3", data.subtitles && data.subtitles.length === 1);
-      check("v1.4.21 SubDL 'not found': se cachea en k_subdl compartido", keys.some((k) => k.includes("/k_subdl/subtitles/movie/tt9876543.json")));
+      check("v1.4.22 SubDL 'not found': NO se cachea en k_subdl compartido", !keys.some((k) => k.includes("/k_subdl/")), JSON.stringify(keys));
+      check("v1.4.22 SubDL 'not found': se cachea en el namespace de esa clave",
+        keys.some((k) => /\/k_[0-9a-z]+\/subtitles\/movie\/tt9876543\.json$/.test(k) && !k.includes("/k_subdl/")), JSON.stringify(keys));
     } finally {
       console.log = origLog;
       console.error = origErr;
@@ -2183,7 +2185,7 @@ try {
     }
   }
 
-  // B. Ranking de calidad: [PLAT] > web > disco > resto
+  // B. Ranking recortado (v1.4.22): solo [PLAT] primero; el resto, orden del proveedor
   {
     const prevF = globalThis.fetch;
     try {
@@ -2218,14 +2220,63 @@ try {
       const ids = (data.subtitles || []).map((s) => s.id);
 
       check("v1.4.21 ranking: plataforma oficial se sirve de primero", ids[0] === "s_plat");
-      check("v1.4.21 ranking: web con dialecto verificado se sirve de segundo", ids[1] === "s_web");
-      check("v1.4.21 ranking: web sin clasificar se sirve tras el verificado", ids[2] === "s_web_unclass");
-      check("v1.4.21 ranking: disco se sirve de cuarto", ids[3] === "s_disco");
-      check("v1.4.21 ranking: genérico se sirve al final", ids[4] === "s_generic");
+      check("v1.4.22 ranking: el resto conserva el orden del proveedor (web/disco no ordenan)",
+        JSON.stringify(ids.slice(1)) === JSON.stringify(["s_generic", "s_disco", "s_web_unclass", "s_web"]), JSON.stringify(ids));
       check("v1.4.21 ranking: todas las pistas del pool están presentes", ids.length === 5);
     } finally {
       globalThis.fetch = prevF;
     }
+  }
+}
+
+// 29) v1.4.22: un aviso de clave inválida con "not found" NO envenena k_subdl
+{
+  const jsonR = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
+  for (const msg of ["api_key not found", "API key not found", "Invalid API key", "can't find movie or tv"]) {
+    const store = new Map();
+    const prevC = mockGlobal("caches", {
+      default: {
+        match: async (r) => { const v = store.get(r.url); return v ? v.clone() : undefined; },
+        put: async (r, res) => { store.set(r.url, res.clone()); },
+      },
+    });
+    const prevF = globalThis.fetch;
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) {
+        return Promise.resolve(jsonR({ subtitles: [{ id: "p1", url: "https://subs5.strem.io/p1.srt", lang: "spa" }] }));
+      }
+      if (u.includes("api.subdl.com")) {
+        return Promise.resolve(u.includes("api_key=CLAVE_BUENA_123")
+          ? jsonR({ status: true, subtitles: [{ url: "/subtitle/1-2.zip", file_id: 1 }] })
+          : jsonR({ status: false, error: msg }));
+      }
+      return Promise.resolve(textResp(TXT_CAST + " " + u)); // texto distinto por URL: sin duplicados por hash
+    };
+    const origErr = console.error, origLog = console.log;
+    let atacante, legitimo, keys;
+    console.error = () => {}; console.log = () => {};
+    try {
+      const get = async (key) => {
+        const w = [];
+        const r = await worker.fetch(
+          new Request(`${base}/${b64url({ subdlKey: key })}/subtitles/movie/tt5550002.json`),
+          {}, { waitUntil: (p) => w.push(p) });
+        await Promise.all(w);
+        return { hit: r.headers.get("x-cache"), n: (await r.json()).subtitles.length };
+      };
+      atacante = await get("CLAVE_FALSA_9999");
+      keys = [...store.keys()];
+      legitimo = await get("CLAVE_BUENA_123");
+    } finally {
+      console.error = origErr; console.log = origLog;
+      globalThis.fetch = prevF;
+      restoreGlobal("caches", prevC);
+    }
+    check(`v1.4.22 SubDL error "${msg}": la clave falsa no escribe en k_subdl`,
+      !keys.some((k) => k.includes("/k_subdl/")), JSON.stringify(keys));
+    check(`v1.4.22 SubDL error "${msg}": el usuario legítimo no hereda la respuesta del atacante`,
+      legitimo.hit === "MISS" && legitimo.n === 2, JSON.stringify({ atacante, legitimo }));
   }
 }
 

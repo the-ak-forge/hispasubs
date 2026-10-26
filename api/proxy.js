@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.21
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.22
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -12,12 +12,19 @@
 //    de redirección (1.0.2 seguía el segundo salto con redirect:"follow"
 //    sin validarlo -> bypass de la allowlist).
 //  - Tamaño máximo descargable: 10 MB (v1.4.21: ampliado desde 4 MB para
-//    soportar season packs completos de series; la respuesta de la función
-//    sigue siendo un único .srt extraído de <500 KB, muy por debajo de los
-//    4,5 MB de límite de salida de Vercel).
+//    soportar season packs completos de series; v1.4.22: acotado con tope de
+//    extracción de 4 MB por entrada para garantizar que la respuesta no
+//    supere los 4,5 MB de límite de salida de Vercel).
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
+//
+// v1.4.22 (26/10/2026):
+//  - [LÍMITE EXTRACCIÓN] Separación entre el tope de descarga del ZIP (10 MB)
+//    y el tope por entrada extraída (MAX_ENTRY_BYTES = 4 MB). Evita que archivos
+//    .srt individuales de más de 4,5 MB extraídos de zips grandes causen un
+//    error 413 FUNCTION_PAYLOAD_TOO_LARGE en Vercel.
+//  - Compatibilidad de versión con el Worker v1.4.22.
 //
 // v1.4.21 (26/10/2026):
 //  - [LÍMITE ZIP] MAX_BYTES ampliado de 4 MB a 10 MB para evitar HTTP 413 en
@@ -178,6 +185,11 @@ const ALLOWED_PORTS = new Set(["", "443"]);
 // La respuesta de la función es un único .srt extraído (< 500 KB), muy por
 // debajo del límite de respuesta de Vercel (4,5 MB).
 const MAX_BYTES = 10 * 1024 * 1024;
+// Tope por ENTRADA extraída (y por tanto del cuerpo de la respuesta): Vercel
+// rechaza respuestas de función de más de 4,5 MB (413 FUNCTION_PAYLOAD_TOO_LARGE).
+// MAX_BYTES solo acota la DESCARGA del zip; sin este tope una entrada de 6-10 MB
+// pasaba el proxy con 200 y fallaba en la plataforma.
+const MAX_ENTRY_BYTES = 4 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
@@ -185,7 +197,7 @@ const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
 // quien sube el zip, así que se ignoran las entradas con nombres más largos: defensa en
 // profundidad contra ReDoS en TODOS los regex de episodio (no solo SE_HEAD/EP_NEXT).
 const MAX_ENTRY_NAME = 512;
-const USER_AGENT = "HispaSubs/1.4.21";
+const USER_AGENT = "HispaSubs/1.4.22";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 
@@ -527,7 +539,7 @@ export default async function handler(req, res) {
     // pagaba la descompresión de todas aunque solo se sirviera una.
     const candidates = [];
     let scanned = 0;
-    const MAX_BYTES_TOTAL = MAX_BYTES * 2; // presupuesto agregado conservador (8 MB por zip)
+    const MAX_BYTES_TOTAL = MAX_ENTRY_BYTES * 2; // presupuesto agregado conservador (8 MB por zip)
     for (const entry of entries) {
       if (++scanned > MAX_ENTRIES) break;
       if (entry.isDirectory) continue;
@@ -539,7 +551,7 @@ export default async function handler(req, res) {
       // ordenar por data.length sin haber descomprimido nada, y además es
       // defensa adicional al fix de adm-zip 0.6.1 (zip bomb).
       const declared = entry.header && entry.header.size;
-      if (declared && declared > MAX_BYTES) continue;
+      if (declared && declared > MAX_ENTRY_BYTES) continue;
       candidates.push({ entry, name, declared: declared || 0 });
     }
 
@@ -625,7 +637,7 @@ export default async function handler(req, res) {
       } catch {
         continue; // entrada corrupta: la saltamos, no tiramos el zip entero
       }
-      if (!data || data.length === 0 || data.length > MAX_BYTES) continue;
+      if (!data || data.length === 0 || data.length > MAX_ENTRY_BYTES) continue;
       if (totalUncompressed + data.length > MAX_BYTES_TOTAL) break;
       totalUncompressed += data.length;
       // Un .sub VobSub es BINARIO (muestreo de vídeo, no texto): con la
@@ -663,4 +675,4 @@ export default async function handler(req, res) {
 }
 
 // Exportados para test_proxy.js (la lógica de SSRF no puede quedar sin tests).
-export { ALLOWED_HOSTS, MAX_BYTES, isPublicIP, assertSafeUrl, readCapped, rateLimit, RATE_MAP_CAP };
+export { ALLOWED_HOSTS, MAX_BYTES, MAX_ENTRY_BYTES, isPublicIP, assertSafeUrl, readCapped, rateLimit, RATE_MAP_CAP };
