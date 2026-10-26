@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr } from "./worker.js";
+import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.18", m10.version === "1.4.18", m10.version);
+  check("manifest version 1.4.19", m10.version === "1.4.19", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1955,6 +1955,56 @@ try {
   for (const ok of ["[GRITA]", "[música]", "(suspira)", "[Risas]", "(ríe)", "[¡DISPAROS!]"]) {
     check(`v1.4.18 isSdh: 12× ${ok} SÍ es SDH`, isSdh(rep12(ok)) === true);
   }
+}
+
+// 26) v1.4.19: Detección y observación de subtítulos de plataforma oficial / retail
+{
+  // A. Coincidencias positivas de plataformas oficiales (streaming y discos físicos)
+  const officialRips = [
+    { releaseName: "Stranger.Things.S04E01.720p.NF.WEB-DL.DDP5.1.x264-NTb" },
+    { releaseName: "The.Boys.S03E01.1080p.AMZN.WEBRip.DDP5.1.x264-FLUX" },
+    { releaseName: "Loki.S02E01.720p.DSNP.WEB-DL.DDP5.1.x264-CMRG" },
+    { releaseName: "Ted.Lasso.S03E01.1080p.ATVP.WEB-DL.DDP5.1.x264-GLHF" },
+    { releaseName: "House.of.the.Dragon.S01E01.1080p.HMAX.WEB-DL" },
+    { releaseName: "The.Bear.S02E01.1080p.HULU.WEB-DL.DDP5.1.H.264" },
+    { releaseName: "Inception.2010.1080p.BluRay.DTS.dxva.x264.D-Z0N3" },
+    { releaseName: "Oppenheimer.2023.2160p.UHD.BDRip.x265" },
+    { releaseName: "Dune.Part.Two.2024.1080p.WEB-DL.DDP5.1.Atmos" },
+  ];
+
+  for (const sub of officialRips) {
+    check(`v1.4.19 isPlatformRelease: detecta '${sub.releaseName.slice(0, 30)}...'`,
+      isPlatformRelease(sub) === true);
+  }
+
+  // B. Falsos negativos evitados (grabaciones de cine, ripeos caseros o títulos sin metadatos)
+  const nonOfficial = [
+    { releaseName: "Inception 2010.CAM. XviD-MAGNET", releaseFormat: "Cam" },
+    { releaseName: "Inception iNTERNAL TELESYNC 720p x264-ORC", releaseFormat: "Telesync" },
+    { releaseName: "Deadpool.HDCAM.x264-TITAN" },
+    { releaseName: "Inception.srt" },
+    { releaseName: "Subtítulo aficionado" },
+    {},
+    null,
+  ];
+
+  for (const sub of nonOfficial) {
+    check(`v1.4.19 isPlatformRelease: rechaza '${(sub?.releaseName || "vacío").slice(0, 25)}'`,
+      isPlatformRelease(sub) === false);
+  }
+
+  // C. Metadata en símbolo IS_PLATFORM no se filtra al JSON final de Stremio
+  const subCandidate = {
+    id: "test_sub_1",
+    url: "https://example.com/sub.srt",
+    lang: "spa",
+    label: "🇪🇸 Castellano (OS-V3)",
+    [IS_PLATFORM]: true,
+  };
+  const jsonStr = JSON.stringify(subCandidate);
+  const parsed = JSON.parse(jsonStr);
+  check("v1.4.19 IS_PLATFORM: símbolo interno se omite del JSON final",
+    !("isPlatform" in parsed) && Object.keys(parsed).length === 4);
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

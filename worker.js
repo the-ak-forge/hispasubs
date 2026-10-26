@@ -1,6 +1,14 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.18
+// HispaSubs — Cloudflare Worker v1.4.19
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.19 (25/10/2026):
+//  - [OFICIAL / OBSERVACIÓN] Detección de subtítulos oficiales de plataforma
+//    (Netflix, Amazon Prime, Disney+, Apple TV+, HBO Max, BluRay, Web-DL)
+//    a través de metadatos de release (`movieReleaseName`, `releaseGroup`,
+//    `releaseFormat`, `release_name`). Se conserva la metadata en el pool, se marca
+//    con `[IS_PLATFORM]` y se añade métrica `plataforma=X/Y` en los logs del resumen
+//    sin alterar el orden de entrega al cliente (modo observación previo al ranking).
 //
 // v1.4.18 (25/10/2026) — auditoría técnica de la 1.4.17:
 //  - [CACHE] Regresión corregida: una clave de SubDL rechazada (401/403,
@@ -698,7 +706,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.18",
+  version: "1.4.19",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -754,6 +762,9 @@ const getOpenSubtitlesV3 = async (type, fullId) => {
         url: sub.url,
         lang: "spa",
         source: "OS-V3",
+        releaseName: sub.movieReleaseName || sub.subtitleFileName || "",
+        releaseGroup: sub.releaseGroup || "",
+        releaseFormat: sub.releaseFormat || "",
       }));
   } catch (e) {
     console.error("[OS-V3]", e.message);
@@ -838,6 +849,9 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
           url: dlUrl,
           lang: "spa",
           source: "SubDL",
+          releaseName: sub.release_name || sub.name || "",
+          releaseGroup: sub.author || "",
+          releaseFormat: "",
         };
       })
       .filter(Boolean); // entradas malformadas se descartan una a una
@@ -965,11 +979,25 @@ const dedupWave = (indices, analyzed, seenHashes) => {
   return duplicates;
 };
 
+// Identificación de subtítulos de plataforma oficial / retail (v1.4.19)
+// Extraídos directamente de servicios de streaming (NF, AMZN, DSNP, ATVP, HMAX, HULU)
+// o de medios físicos (BluRay, BDRip, UHD) según metadatos de release y grupo.
+const IS_PLATFORM = Symbol.for("hispasubs.isPlatform");
+const PLATFORM_RELEASE_RE =
+  /(?<![\p{L}\p{N}_])(?:NF|NETFLIX|AMZN|PRIME|DSNP|DISNEY\+?|ATVP|APPLE|HMAX|MAX|HULU|BLURAY|BDRIP|UHD|WEB-?DL|WEBRIP)(?![\p{L}\p{N}_])/iu;
+
+const isPlatformRelease = (sub) => {
+  if (!sub) return false;
+  const str = `${sub.releaseName || ""} ${sub.releaseGroup || ""} ${sub.releaseFormat || ""}`;
+  return PLATFORM_RELEASE_RE.test(str);
+};
+
 const unclassified = (sub, finalUrl, failed = false, sdh = false) => ({
   id: sub.id,
   url: finalUrl,
   lang: LANG_ISO_ES,
   label: `📄 Español (sin clasificar${sdh ? " · SDH" : ""} · ${sub.source})`,
+  [IS_PLATFORM]: isPlatformRelease(sub),
   ...(failed ? { [FAILED]: true } : {}),
 });
 
@@ -1227,11 +1255,12 @@ const classifySubtitle = async (
 
     const sdh = isSdh(text);
     const sdhTag = sdh ? " (SDH)" : "";
+    const isPlatform = isPlatformRelease(sub);
 
     const diag = {};
     const scored = scoreText(text, diag);
     const brief = (flag) =>
-      `${flag}${sdh ? " SDH" : ""} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0}${
+      `${flag}${isPlatform ? " [PLAT]" : ""}${sdh ? " SDH" : ""} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0}${
         diag.reason ? ` (${diag.reason})` : ""
       }`;
     if (!scored) {
@@ -1250,6 +1279,7 @@ const classifySubtitle = async (
       label: `${scored.flag}${sdhTag} (${sub.source})`,
       [SCORE]: brief(scored.flag),
       [CONTENT_HASH]: hashContent(text),
+      [IS_PLATFORM]: isPlatform,
     };
   } catch (error) {
     // Descarte permanente sin penalizar el TTL:
@@ -1284,7 +1314,7 @@ const getCanonicalConfigStr = (config) =>
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr };
+export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1608,10 +1638,12 @@ export default {
         if (ttl !== 7200) {
           console.log(`[subtitles] respuesta degradada (fallo de clasificación o fuente): TTL ${ttl}s`);
         }
+        const platformCount = subtitles.filter((s) => s[IS_PLATFORM]).length;
         console.log(
           `[subtitles] resumen ${type}/${fullId}: total=${Date.now() - tStart}ms w1=${w1Ms}ms w2=${w2Ms}ms ` +
             `descargas=${wave1Idx.length + (wave2Ran ? wave2Idx.length : 0)} ` +
             `servidas=${subtitles.length} (OS-V3=${kept["OS-V3"]},SubDL=${kept["SubDL"]}) ` +
+            `plataforma=${platformCount}/${subtitles.length} ` +
             `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} duplicados=${duplicadosContenido} ttl=${ttl}s` +
             (scoreLog.length ? ` | ${scoreLog.join(" | ")}` : "")
         );
