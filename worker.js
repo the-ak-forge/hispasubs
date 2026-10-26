@@ -1,6 +1,20 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.19
+// HispaSubs — Cloudflare Worker v1.4.20
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.20 (25/10/2026):
+//  - [CACHE] Anti-envenenamiento en rama vacía: cuando `deduped.length === 0` y
+//    SubDL no fue utilizable (clave falsa o rechazada), la lista vacía se
+//    guarda en el namespace propio de esa clave (`k_<hash>`) y NUNCA en `k_subdl`.
+//    Evita dejar sin resultados a los usuarios legítimos de SubDL durante 60 s.
+//  - [OFICIAL] Corrección de precedencia: `releaseName` toma solo `subtitleFileName`
+//    en OS-V3, evitando que el título de la película (`movieReleaseName`) diluya o
+//    provoque falsos positivos.
+//  - [OFICIAL] Regex de streaming estricta: solo `NF|NETFLIX|AMZN|DSNP|ATVP|HMAX|HULU`
+//    (y `MAX` solo ante `WEB`). Se eliminan falsos positivos por títulos de película
+//    ("Mad Max", "Prime", "The Apple", "Disney Princess").
+//  - [TELEMETRÍA] Separación de origen de video: `WEB-DL` y `BluRay` se miden
+//    independientemente en el log (`web=N disco=M`), sin confundirlos con plataforma.
 //
 // v1.4.19 (25/10/2026):
 //  - [OFICIAL / OBSERVACIÓN] Detección de subtítulos oficiales de plataforma
@@ -706,7 +720,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.19",
+  version: "1.4.20",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -762,7 +776,10 @@ const getOpenSubtitlesV3 = async (type, fullId) => {
         url: sub.url,
         lang: "spa",
         source: "OS-V3",
-        releaseName: sub.movieReleaseName || sub.subtitleFileName || "",
+        // `movieReleaseName` es el TÍTULO ("Inception (2010)"), no el release: las
+        // etiquetas (AMZN, WEB-DL…) viven en el nombre del fichero. Con el título
+        // en la cadena, "Mad Max" o "Prime" salían como plataforma.
+        releaseName: sub.subtitleFileName || "",
         releaseGroup: sub.releaseGroup || "",
         releaseFormat: sub.releaseFormat || "",
       }));
@@ -850,7 +867,7 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
           lang: "spa",
           source: "SubDL",
           releaseName: sub.release_name || sub.name || "",
-          releaseGroup: sub.author || "",
+          releaseGroup: "",
           releaseFormat: "",
         };
       })
@@ -979,17 +996,34 @@ const dedupWave = (indices, analyzed, seenHashes) => {
   return duplicates;
 };
 
-// Identificación de subtítulos de plataforma oficial / retail (v1.4.19)
-// Extraídos directamente de servicios de streaming (NF, AMZN, DSNP, ATVP, HMAX, HULU)
-// o de medios físicos (BluRay, BDRip, UHD) según metadatos de release y grupo.
+// Identificación de subtítulos de plataforma (v1.4.19, corregida).
+// SOLO etiquetas de servicio de streaming (NF, AMZN, DSNP, ATVP, HMAX, HULU, MAX
+// junto a WEB) y SOLO sobre campos de release (nombre de fichero / release,
+// grupo, formato), nunca sobre el título. WEB-DL, WEBRip, BluRay… indican contra
+// qué VÍDEO está sincronizado el subtítulo, no de dónde salió el texto: se
+// cuentan aparte (RELEASE_SOURCE) y no como "plataforma".
 const IS_PLATFORM = Symbol.for("hispasubs.isPlatform");
+const RELEASE_SOURCE = Symbol.for("hispasubs.releaseSource");
 const PLATFORM_RELEASE_RE =
-  /(?<![\p{L}\p{N}_])(?:NF|NETFLIX|AMZN|PRIME|DSNP|DISNEY\+?|ATVP|APPLE|HMAX|MAX|HULU|BLURAY|BDRIP|UHD|WEB-?DL|WEBRIP)(?![\p{L}\p{N}_])/iu;
+  /(?<![\p{L}\p{N}])(?:NF|NETFLIX|AMZN|DSNP|ATVP|HMAX|HULU|MAX(?=[\s._-]*WEB))(?![\p{L}\p{N}])/iu;
+const DISC_RELEASE_RE =
+  /(?<![\p{L}\p{N}])(?:BLU-?RAY|BD-?RIP|BR-?RIP|BDREMUX|REMUX|UHD)(?![\p{L}\p{N}])/iu;
+const WEB_RELEASE_RE =
+  /(?<![\p{L}\p{N}])(?:WEB-?DL|WEB-?RIP|WEB)(?![\p{L}\p{N}])/iu;
 
-const isPlatformRelease = (sub) => {
-  if (!sub) return false;
-  const str = `${sub.releaseName || ""} ${sub.releaseGroup || ""} ${sub.releaseFormat || ""}`;
-  return PLATFORM_RELEASE_RE.test(str);
+const releaseText = (sub) =>
+  `${sub.releaseName || ""} ${sub.releaseGroup || ""} ${sub.releaseFormat || ""}`;
+
+const isPlatformRelease = (sub) => (sub ? PLATFORM_RELEASE_RE.test(releaseText(sub)) : false);
+
+// "disco" | "web" | "": origen del VÍDEO al que está sincronizado (señal de
+// sincronía, no de calidad del subtítulo).
+const releaseSourceOf = (sub) => {
+  if (!sub) return "";
+  const t = releaseText(sub);
+  if (DISC_RELEASE_RE.test(t)) return "disco";
+  if (WEB_RELEASE_RE.test(t) || PLATFORM_RELEASE_RE.test(t)) return "web";
+  return "";
 };
 
 const unclassified = (sub, finalUrl, failed = false, sdh = false) => ({
@@ -998,6 +1032,7 @@ const unclassified = (sub, finalUrl, failed = false, sdh = false) => ({
   lang: LANG_ISO_ES,
   label: `📄 Español (sin clasificar${sdh ? " · SDH" : ""} · ${sub.source})`,
   [IS_PLATFORM]: isPlatformRelease(sub),
+  [RELEASE_SOURCE]: releaseSourceOf(sub),
   ...(failed ? { [FAILED]: true } : {}),
 });
 
@@ -1280,6 +1315,7 @@ const classifySubtitle = async (
       [SCORE]: brief(scored.flag),
       [CONTENT_HASH]: hashContent(text),
       [IS_PLATFORM]: isPlatform,
+      [RELEASE_SOURCE]: releaseSourceOf(sub),
     };
   } catch (error) {
     // Descarte permanente sin penalizar el TTL:
@@ -1314,7 +1350,7 @@ const getCanonicalConfigStr = (config) =>
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM };
+export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1516,7 +1552,11 @@ export default {
         if (deduped.length === 0) {
           console.log(`[subtitles] 0 resultados para ${type}/${fullId}`);
           const empty = jsonResponse({ subtitles: [] }, 60);
-          cachePut(ctx, cacheReq, empty);
+          // Igual que el `put` final: con SubDL "no utilizable" (clave falsa o
+          // rechazada) la lista vacía es culpa de ESA clave; escribirla en el
+          // `k_subdl` compartido dejaba sin SubDL a los demás durante 60 s.
+          const emptyUnusable = sdlSubs.status === "fulfilled" && sdlSubs.value?.unusable === true;
+          cachePut(ctx, canonicalConfigStr && emptyUnusable ? new Request(keyCacheUrl) : cacheReq, empty);
           return empty;
         }
 
@@ -1639,11 +1679,13 @@ export default {
           console.log(`[subtitles] respuesta degradada (fallo de clasificación o fuente): TTL ${ttl}s`);
         }
         const platformCount = subtitles.filter((s) => s[IS_PLATFORM]).length;
+        const webCount = subtitles.filter((s) => s[RELEASE_SOURCE] === "web").length;
+        const discCount = subtitles.filter((s) => s[RELEASE_SOURCE] === "disco").length;
         console.log(
           `[subtitles] resumen ${type}/${fullId}: total=${Date.now() - tStart}ms w1=${w1Ms}ms w2=${w2Ms}ms ` +
             `descargas=${wave1Idx.length + (wave2Ran ? wave2Idx.length : 0)} ` +
             `servidas=${subtitles.length} (OS-V3=${kept["OS-V3"]},SubDL=${kept["SubDL"]}) ` +
-            `plataforma=${platformCount}/${subtitles.length} ` +
+            `plataforma=${platformCount}/${subtitles.length} web=${webCount} disco=${discCount} ` +
             `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} duplicados=${duplicadosContenido} ttl=${ttl}s` +
             (scoreLog.length ? ` | ${scoreLog.join(" | ")}` : "")
         );

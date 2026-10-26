@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM } from "./worker.js";
+import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.19", m10.version === "1.4.19", m10.version);
+  check("manifest version 1.4.20", m10.version === "1.4.20", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1967,9 +1967,6 @@ try {
     { releaseName: "Ted.Lasso.S03E01.1080p.ATVP.WEB-DL.DDP5.1.x264-GLHF" },
     { releaseName: "House.of.the.Dragon.S01E01.1080p.HMAX.WEB-DL" },
     { releaseName: "The.Bear.S02E01.1080p.HULU.WEB-DL.DDP5.1.H.264" },
-    { releaseName: "Inception.2010.1080p.BluRay.DTS.dxva.x264.D-Z0N3" },
-    { releaseName: "Oppenheimer.2023.2160p.UHD.BDRip.x265" },
-    { releaseName: "Dune.Part.Two.2024.1080p.WEB-DL.DDP5.1.Atmos" },
   ];
 
   for (const sub of officialRips) {
@@ -1984,6 +1981,11 @@ try {
     { releaseName: "Deadpool.HDCAM.x264-TITAN" },
     { releaseName: "Inception.srt" },
     { releaseName: "Subtítulo aficionado" },
+    // v1.4.20: etiquetas de VÍDEO (sincronía), no de plataforma
+    { releaseName: "Inception.2010.1080p.BluRay.DTS.dxva.x264.D-Z0N3" },
+    { releaseName: "Oppenheimer.2023.2160p.UHD.BDRip.x265" },
+    { releaseName: "Dune.Part.Two.2024.1080p.WEB-DL.DDP5.1.Atmos" },
+    { releaseName: "Movie.2020.WEBRip.x265" },
     {},
     null,
   ];
@@ -2005,6 +2007,113 @@ try {
   const parsed = JSON.parse(jsonStr);
   check("v1.4.19 IS_PLATFORM: símbolo interno se omite del JSON final",
     !("isPlatform" in parsed) && Object.keys(parsed).length === 4);
+}
+
+// 27) v1.4.20: métrica de plataforma sin falsos positivos por título; precedencia
+//     de campos de OS-V3; rama "sin resultados" sin envenenar k_subdl
+{
+  const jsonR = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
+
+  // A. Títulos de película NO son plataforma (regresión: "Mad Max" -> MAX)
+  for (const n of ["Mad Max: Fury Road (2015)", "Max (2015)", "Prime (2005)", "The Apple (1980)",
+                   "Apple of My Eye", "Disney Princess", "UHD Review", "Maxwell.srt"]) {
+    check(`v1.4.20 plataforma: título '${n}' no es plataforma`, isPlatformRelease({ releaseName: n }) === false);
+  }
+  // B. Etiquetas de servicio sí, con cualquier separador (incluido '_')
+  for (const n of ["Movie.2020.1080p.AMZN.WEB-DL", "Movie_2020_NF_WEB-DL", "Movie 2020 [DSNP] WEB",
+                   "Show.S01E01.1080p.MAX.WEB-DL.DDP5.1", "Show.S01E01.NETFLIX.srt"]) {
+    check(`v1.4.20 plataforma: detecta '${n}'`, isPlatformRelease({ releaseName: n }) === true);
+  }
+  check("v1.4.20 plataforma: 'MAX' sin WEB a continuación no cuenta",
+    isPlatformRelease({ releaseName: "Movie.2020.MAX.Quality.srt" }) === false);
+  // C. Origen del vídeo, aparte de plataforma
+  check("v1.4.20 origen: BluRay -> disco", releaseSourceOf({ releaseName: "A.2010.1080p.BluRay.x264" }) === "disco");
+  check("v1.4.20 origen: UHD BDRip -> disco", releaseSourceOf({ releaseName: "A.2023.2160p.UHD.BDRip" }) === "disco");
+  check("v1.4.20 origen: WEB-DL -> web", releaseSourceOf({ releaseName: "A.2010.1080p.WEB-DL" }) === "web");
+  check("v1.4.20 origen: plataforma implica web", releaseSourceOf({ releaseName: "A.2010.1080p.NF" }) === "web");
+  check("v1.4.20 origen: sin etiquetas -> ''", releaseSourceOf({ releaseName: "madmax_esp.srt" }) === "" && releaseSourceOf(null) === "");
+
+  // D. Extremo a extremo: OS-V3 envía título en movieReleaseName y el release en subtitleFileName
+  {
+    const prevC = mockGlobal("caches", { default: { match: async () => undefined, put: async () => {} } });
+    const prevF = globalThis.fetch;
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) {
+        return Promise.resolve(jsonR({ subtitles: [
+          { id: "1", url: "https://subs5.strem.io/a.srt", lang: "spa", movieReleaseName: "Inception (2010)", subtitleFileName: "Inception.2010.1080p.AMZN.WEB-DL.DDP5.1.srt" },
+          { id: "2", url: "https://subs5.strem.io/b.srt", lang: "spa", movieReleaseName: "Mad Max: Fury Road (2015)", subtitleFileName: "madmax_esp.srt" },
+          { id: "3", url: "https://subs5.strem.io/c.srt", lang: "spa", movieReleaseName: "Inception (2010)", subtitleFileName: "x.srt", releaseFormat: "BluRay" },
+        ] }));
+      }
+      return Promise.resolve(textResp(TXT_CAST + " " + u));
+    };
+    const lines = [];
+    const origLog = console.log;
+    console.log = (...a) => { lines.push(a.join(" ")); };
+    try {
+      const r = await worker.fetch(new Request(`${base}/subtitles/movie/tt7770001.json`), {}, { waitUntil: () => {} });
+      await r.text();
+    } finally {
+      console.log = origLog;
+      globalThis.fetch = prevF;
+      restoreGlobal("caches", prevC);
+    }
+    const resumen = lines.find((l) => l.includes("resumen")) || "";
+    check("v1.4.20 log: plataforma=1/3 (solo AMZN; 'Mad Max' y BluRay no cuentan)",
+      resumen.includes("plataforma=1/3"), resumen.slice(0, 220));
+    check("v1.4.20 log: web=1 disco=1", resumen.includes("web=1 disco=1"), resumen.slice(0, 220));
+  }
+
+  // E. Rama "sin resultados": clave falsa -> NO escribe la lista vacía en k_subdl
+  {
+    const store = new Map();
+    const prevC = mockGlobal("caches", {
+      default: {
+        match: async (r) => { const v = store.get(r.url); return v ? v.clone() : undefined; },
+        put: async (r, res) => { store.set(r.url, res.clone()); },
+      },
+    });
+    const prevF = globalThis.fetch;
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) return Promise.resolve(jsonR({ subtitles: [] }));
+      if (u.includes("api.subdl.com")) {
+        return Promise.resolve(u.includes("api_key=CLAVE_BUENA_123")
+          ? jsonR({ status: true, subtitles: [{ url: "/subtitle/1-2.zip", file_id: 1 }] })
+          : new Response("forbidden", { status: 403 }));
+      }
+      return Promise.resolve(textResp(TXT_CAST));
+    };
+    const origErr = console.error, origLog = console.log;
+    let atacante, atacante2, legitimo, keysAfterFirst;
+    console.error = () => {}; console.log = () => {};
+    try {
+      const get = async (key) => {
+        const w = [];
+        const r = await worker.fetch(
+          new Request(`${base}/${b64url({ subdlKey: key })}/subtitles/movie/tt5550001.json`),
+          {}, { waitUntil: (p) => w.push(p) });
+        await Promise.all(w);
+        return { hit: r.headers.get("x-cache"), n: (await r.json()).subtitles.length };
+      };
+      atacante = await get("CLAVE_FALSA_9999");
+      keysAfterFirst = [...store.keys()];
+      atacante2 = await get("CLAVE_FALSA_9999");
+      legitimo = await get("CLAVE_BUENA_123");
+    } finally {
+      console.error = origErr; console.log = origLog;
+      globalThis.fetch = prevF;
+      restoreGlobal("caches", prevC);
+    }
+    check("v1.4.20 vacío: la clave falsa no escribe en k_subdl",
+      !keysAfterFirst.some((k) => k.includes("/k_subdl/")), JSON.stringify(keysAfterFirst));
+    check("v1.4.20 vacío: la clave falsa sí cachea en su namespace propio",
+      keysAfterFirst.some((k) => /\/k_[0-9a-z]+\/subtitles\/movie\/tt5550001\.json$/.test(k) && !k.includes("/k_subdl/")));
+    check("v1.4.20 vacío: la clave falsa repetida da HIT (sin recomputar)", atacante2.hit === "HIT" && atacante.n === 0);
+    check("v1.4.20 vacío: el usuario legítimo NO recibe la lista vacía del atacante",
+      legitimo.hit === "MISS" && legitimo.n === 1, JSON.stringify(legitimo));
+  }
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);
