@@ -17,10 +17,9 @@
 //    independientemente en el log (`web=N disco=M`), sin confundirlos con plataforma.
 //
 // v1.4.19 (25/10/2026):
-//  - [OFICIAL / OBSERVACIÓN] Detección de subtítulos oficiales de plataforma
-//    (Netflix, Amazon Prime, Disney+, Apple TV+, HBO Max, BluRay, Web-DL)
-//    a través de metadatos de release (`movieReleaseName`, `releaseGroup`,
-//    `releaseFormat`, `release_name`). Se conserva la metadata en el pool, se marca
+//  - [OFICIAL / OBSERVACIÓN] Detección inicial de subtítulos de streaming
+//    (Netflix, Amazon Prime, Disney+, Apple TV+, HBO Max) a través de
+//    metadatos de release. Se conserva la metadata en el pool interno, se marca
 //    con `[IS_PLATFORM]` y se añade métrica `plataforma=X/Y` en los logs del resumen
 //    sin alterar el orden de entrega al cliente (modo observación previo al ranking).
 //
@@ -996,7 +995,7 @@ const dedupWave = (indices, analyzed, seenHashes) => {
   return duplicates;
 };
 
-// Identificación de subtítulos de plataforma (v1.4.19, corregida).
+// Identificación de subtítulos de plataforma (v1.4.20, corregida).
 // SOLO etiquetas de servicio de streaming (NF, AMZN, DSNP, ATVP, HMAX, HULU, MAX
 // junto a WEB) y SOLO sobre campos de release (nombre de fichero / release,
 // grupo, formato), nunca sobre el título. WEB-DL, WEBRip, BluRay… indican contra
