@@ -4,10 +4,9 @@
 //
 // v1.4.21 (26/10/2026):
 //  - [RANKING DE CALIDAD] Priorización activa de subtítulos: las pistas
-//    extraídas de plataformas oficiales ([PLAT]: NF, AMZN, DSNP, ATVP, HMAX,
-//    HULU) se sirven primero, seguidas por ripeos WEB-DL/WEBRip, ediciones
-//    físicas (BluRay/UHD) y resto de pistas, manteniendo todas las pistas del
-//    pool disponibles.
+//    extraídas de releases profesionales y retail se sirven primero, seguidas
+//    por ripeos WEB-DL/WEBRip, ediciones físicas (BluRay/UHD) y resto de pistas,
+//    manteniendo todas las pistas del pool disponibles.
 //  - [SUBDL NOT FOUND] Distinción entre título ausente en SubDL ("can't find
 //    movie or tv" / 0 resultados legítimos) y clave inválida/revocada: se
 //    registra como info (no error) y se cachea en `k_subdl` normal de 2 h
@@ -16,7 +15,7 @@
 //    hacia OS-V3 para evitar ráfagas de 5 descargas simultáneas en 0 ms que
 //    disparan el rate limit HTTP 429 del proveedor.
 //  - [UX CONFIGURADOR] En /configure se añade ayuda visual destacando que la
-//    clave gratuita de SubDL activa subtítulos oficiales de streaming.
+//    clave gratuita de SubDL amplía el catálogo y prioriza versiones de calidad.
 //
 // v1.4.20 (25/10/2026):
 //  - [CACHE] Anti-envenenamiento en rama vacía: cuando `deduped.length === 0` y
@@ -1702,7 +1701,7 @@ export default {
         }
 
         // Ranking de calidad v1.4.21:
-        // 1º Subtítulos de plataforma oficial (señal fuerte de release oficial).
+        // 1º Subtítulos de calidad profesional y retail (máxima fidelidad de release).
         // 2º Ripeos WEB-DL / WEBRip (sincronizados con la mayoría de streams).
         // 3º Ediciones de disco (BluRay / BDRip / UHD).
         // 4º Dialecto verificado (🇲🇽/🇪🇸/🌎) sobre sin clasificar (📄).
