@@ -1,6 +1,15 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.25
+// HispaSubs — Cloudflare Worker v1.4.26
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.26 (26/10/2026):
+//  - [LÉXICO / FIX SOLAPAMIENTO] Corrección matemática en `sampleScoreText`:
+//    el inicio de la ventana central se calcula ahora centrando dentro del
+//    hueco libre entre cabeza y cola (`SCORE_HEAD_BYTES + Math.floor((len - MAX_SCORE_BYTES) / 2)`)
+//    en lugar de sobre la longitud total (`(len - SCORE_MID_BYTES) / 2`).
+//    Elimina el solapamiento de hasta 6 KB con la cabeza en archivos de entre
+//    48 KB y 60 KB, evitando que un único modismo en la franja [18 KB, 24 KB]
+//    se cuente doble y dispare un falso positivo por override sin oposición.
 //
 // v1.4.25 (26/10/2026):
 //  - [ANTI-SPAM / CRÉDITOS] Endurecimiento de `SPAM_CREDIT_NAME_TOKEN`: en vez
@@ -801,7 +810,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.25",
+  version: "1.4.26",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1140,12 +1149,15 @@ const SCORE_MID_BYTES = 12 * 1024;
 const SCORE_TAIL_BYTES = 12 * 1024;
 
 // Extrae una muestra representativa de hasta 48 KB repartida en 3 ventanas
-// (cabeza, centro y cola) separadas por salto de línea para no unir palabras
-// en los cortes. Evita que películas de >48 KB cuyos modismos aparecen en la
-// segunda mitad caigan en 📄 "sin clasificar" o Neutro, sin subir el coste CPU.
+// disjuntas (cabeza, centro y cola) separadas por salto de línea para no unir
+// palabras en los cortes. La ventana central se centra dentro del hueco libre
+// entre cabeza y cola (`SCORE_HEAD_BYTES + Math.floor((len - MAX_SCORE_BYTES) / 2)`),
+// garantizando matemáticamente `SCORE_HEAD_BYTES <= midStart` y
+// `midStart + SCORE_MID_BYTES <= len - SCORE_TAIL_BYTES` (cero solapamiento en
+// archivos de 48-60 KB, evitando duplicar apariciones léxicas).
 const sampleScoreText = (rawText) => {
   if (rawText.length <= MAX_SCORE_BYTES) return rawText;
-  const midStart = Math.floor((rawText.length - SCORE_MID_BYTES) / 2);
+  const midStart = SCORE_HEAD_BYTES + Math.floor((rawText.length - MAX_SCORE_BYTES) / 2);
   return (
     rawText.slice(0, SCORE_HEAD_BYTES) +
     "\n" +

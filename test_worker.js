@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.25", m10.version === "1.4.25", m10.version);
+  check("manifest version 1.4.26", m10.version === "1.4.26", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2420,6 +2420,17 @@ try {
   const resTailLat = scoreText(tailLatino);
   check("v1.4.25 muestreo léxico: detecta Latino en la cola de un archivo de ~85 KB",
     resTailLat?.flag === "🇲🇽 Latino", JSON.stringify(resTailLat));
+
+  // Caso 3 (v1.4.26): Sin solapamiento entre cabeza y centro en archivos de 48–60 KB (~50.000 bytes).
+  // Un único término fuerte ("coche") en torno al byte 20.000 NO debe contarse doble
+  // ni activar el override sin oposición (debe quedar en Neutro con esMatches=1, nunca Castellano con esMatches=2).
+  const prefix20k = "a".repeat(20000) + " coche ";
+  const suffix30k = "a".repeat(50000 - prefix20k.length);
+  const overlapProbe50k = prefix20k + suffix30k;
+  const resOverlap = scoreText(overlapProbe50k);
+  check("v1.4.26 muestreo sin solapamiento (50 KB): 1 término en byte 20.000 cuenta 1 sola vez (Neutro, no Castellano)",
+    resOverlap?.esMatches === 1 && resOverlap?.strongTotal === 1 && resOverlap?.flag === "🌎 Neutro",
+    JSON.stringify(resOverlap));
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);
