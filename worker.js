@@ -1,6 +1,22 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.20
+// HispaSubs — Cloudflare Worker v1.4.21
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.21 (26/10/2026):
+//  - [RANKING DE CALIDAD] Priorización activa de subtítulos: las pistas
+//    extraídas de plataformas oficiales ([PLAT]: NF, AMZN, DSNP, ATVP, HMAX,
+//    HULU) se sirven primero, seguidas por ripeos WEB-DL/WEBRip, ediciones
+//    físicas (BluRay/UHD) y resto de pistas, manteniendo todas las pistas del
+//    pool disponibles.
+//  - [SUBDL NOT FOUND] Distinción entre título ausente en SubDL ("can't find
+//    movie or tv" / 0 resultados legítimos) y clave inválida/revocada: se
+//    registra como info (no error) y se cachea en `k_subdl` normal de 2 h
+//    junto a OS-V3, evitando quemar cuota de API en títulos que no existen.
+//  - [OS-V3 429] Escalonado (stagger) de 25 ms por candidato concurrente
+//    hacia OS-V3 para evitar ráfagas de 5 descargas simultáneas en 0 ms que
+//    disparan el rate limit HTTP 429 del proveedor.
+//  - [UX CONFIGURADOR] En /configure se añade ayuda visual destacando que la
+//    clave gratuita de SubDL activa subtítulos oficiales de streaming.
 //
 // v1.4.20 (25/10/2026):
 //  - [CACHE] Anti-envenenamiento en rama vacía: cuando `deduped.length === 0` y
@@ -689,7 +705,7 @@ const parseConfig = (configStr) => {
 
 const getConfigureHTML = (existingConfig = {}) => `
 <!DOCTYPE html>
-<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Configuración | HispaSubs</title><style>body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background-color: #121212; color: #ffffff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; } .container { background-color: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); max-width: 500px; width: 100%; text-align: center; } h1 { margin-top: 10px; color: #00d2ff; font-size: 28px; } p { color: #aaaaaa; font-size: 14px; margin-bottom: 24px; line-height: 1.5; } .form-group { text-align: left; margin-bottom: 20px; } label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 14px; } input { width: 100%; padding: 12px; border: 1px solid #333; border-radius: 6px; background-color: #2a2a2a; color: #fff; box-sizing: border-box; font-family: monospace; } input:focus { outline: none; border-color: #00d2ff; } .btn-container { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; } button { font-size: 16px; font-weight: bold; border-radius: 6px; cursor: pointer; width: 100%; padding: 14px 24px; transition: all 0.3s; } .btn-primary { background-color: #00d2ff; color: #121212; border: none; } .btn-primary:hover { background-color: #00a8cc; transform: translateY(-2px); } .btn-secondary { background-color: transparent; color: #00d2ff; border: 2px solid #00d2ff; } </style></head><body><div class="container"><div>${LOGO_SVG}</div><h1>HispaSubs</h1><p>Clasificación léxica en tiempo real para Stremio.<br>Detecta automáticamente modismos en español y los divide en <strong>🇲🇽 Latino</strong>, <strong>🇪🇸 Castellano</strong> y <strong>🌎 Neutro</strong>.</p><div class="form-group"><label>SubDL API Key (Opcional - Expande catálogo)</label><input type="password" id="subdlKey" placeholder="ej: abc123def456..." value="${esc(existingConfig.subdlKey || "")}"></div><div class="btn-container"><button class="btn-primary" onclick="installAddon()">Instalar en Stremio</button><button class="btn-secondary" id="copyBtn" onclick="copyManifest()">Copiar URL del Manifest</button></div></div>
+<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Configuración | HispaSubs</title><style>body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background-color: #121212; color: #ffffff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; } .container { background-color: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); max-width: 500px; width: 100%; text-align: center; } h1 { margin-top: 10px; color: #00d2ff; font-size: 28px; } p { color: #aaaaaa; font-size: 14px; margin-bottom: 24px; line-height: 1.5; } .form-group { text-align: left; margin-bottom: 20px; } label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 14px; } input { width: 100%; padding: 12px; border: 1px solid #333; border-radius: 6px; background-color: #2a2a2a; color: #fff; box-sizing: border-box; font-family: monospace; } input:focus { outline: none; border-color: #00d2ff; } .btn-container { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; } button { font-size: 16px; font-weight: bold; border-radius: 6px; cursor: pointer; width: 100%; padding: 14px 24px; transition: all 0.3s; } .btn-primary { background-color: #00d2ff; color: #121212; border: none; } .btn-primary:hover { background-color: #00a8cc; transform: translateY(-2px); } .btn-secondary { background-color: transparent; color: #00d2ff; border: 2px solid #00d2ff; } </style></head><body><div class="container"><div>${LOGO_SVG}</div><h1>HispaSubs</h1><p>Clasificación léxica en tiempo real para Stremio.<br>Detecta automáticamente modismos en español y los divide en <strong>🇲🇽 Latino</strong>, <strong>🇪🇸 Castellano</strong> y <strong>🌎 Neutro</strong>.</p><div class="form-group"><label>SubDL API Key (Recomendado — Subtítulos oficiales)</label><input type="password" id="subdlKey" placeholder="ej: abc123def456..." value="${esc(existingConfig.subdlKey || "")}"><small style="display:block;margin-top:6px;color:#888;font-size:12px;line-height:1.4;">Obtén tu clave gratis en <a href="https://subdl.com" target="_blank" style="color:#00d2ff;text-decoration:none;">subdl.com</a> (toma 30 s) para desbloquear subtítulos oficiales de <strong>Netflix, Prime Video, Disney+, Max y Apple TV+</strong> marcados con <code>[PLAT]</code>.</small></div><div class="btn-container"><button class="btn-primary" onclick="installAddon()">Instalar en Stremio</button><button class="btn-secondary" id="copyBtn" onclick="copyManifest()">Copiar URL del Manifest</button></div></div>
 <script>
 // NOTA: se usa split/join en vez de .replace(/.../) para no depender de
 // escapes anidados dentro del template literal del Worker (el bug ///g de 1.0.0).
@@ -719,7 +735,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.20",
+  version: "1.4.21",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -814,9 +830,17 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
     }
 
     const data = await fetchJSON(url, 2500);
-    // SubDL responde 200 con status:false (p.ej. key revocada, cuota agotada).
-    // Antes esto se tragaba en silencio; ahora queda en los logs.
+    // SubDL responde 200 con status:false tanto cuando la clave es inválida
+    // como cuando no encuentra el título ("can't find movie or tv").
+    // v1.4.21: distinguimos "título no encontrado" (0 resultados normales, utilizable
+    // y cacheable en k_subdl) de errores reales de autenticación o cuota (unusable).
     if (data.status === false || !Array.isArray(data.subtitles)) {
+      const errMsg = String(data.error || data.message || "");
+      const isNotFound = /can'?t find|not found|no (?:movie|tv|subtitles)/i.test(errMsg);
+      if (isNotFound) {
+        console.log(`[SubDL] 0 resultados para ${imdbId} (${subdlType}${season ? ` s${season}e${episode}` : ""}): ${errMsg}`);
+        return [];
+      }
       console.error("[SubDL] respuesta sin subs:", data.error || "campo subtitles ausente", data.message || "");
       return unusableSubDL();
     }
@@ -1231,6 +1255,10 @@ const ANALYSIS_FETCH_PER_SOURCE = 8;
 const CLASSIFY_BUDGET_MS = 6000;
 const WAVE2_MAX_W1_MS = 4000;
 
+// v1.4.21: Escalonado entre peticiones concurrentes a OS-V3 para evitar ráfagas
+// de 5 descargas en 0 ms que disparen rate limit HTTP 429 en su origen comunitario.
+const DOWNLOAD_STAGGER_MS = 25;
+
 const classifySubtitle = async (
   sub,
   pBase = VERCEL_UNZIPPER,
@@ -1589,8 +1617,13 @@ export default {
         }
 
         const tWave1 = Date.now();
+        let osStaggerW1 = 0;
         await Promise.all(
           wave1Idx.map(async (i) => {
+            if (deduped[i].source === "OS-V3") {
+              const delay = (osStaggerW1++) * DOWNLOAD_STAGGER_MS;
+              if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+            }
             analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix);
           })
         );
@@ -1621,8 +1654,13 @@ export default {
         if (wave2Idx.length > 0 && w1Ms <= WAVE2_MAX_W1_MS && remainingMs >= 1000) {
           wave2Ran = true;
           const tWave2 = Date.now();
+          let osStaggerW2 = 0;
           await Promise.all(
             wave2Idx.map(async (i) => {
+              if (deduped[i].source === "OS-V3") {
+                const delay = (osStaggerW2++) * DOWNLOAD_STAGGER_MS;
+                if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+              }
               analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, remainingMs);
             })
           );
@@ -1662,6 +1700,31 @@ export default {
           subtitles.push(s);
           if (s[SCORE]) scoreLog.push(`${source}:${s[SCORE]}`);
         }
+
+        // Ranking de calidad v1.4.21:
+        // 1º Subtítulos de plataforma oficial ([PLAT]: NF, AMZN, DSNP, ATVP, HMAX, HULU).
+        // 2º Ripeos WEB-DL / WEBRip.
+        // 3º Ediciones de disco (BluRay / BDRip / UHD).
+        // 4º Resto de pistas.
+        // Se preservan todas las pistas válidas del pool sin descartar ninguna;
+        // orden estable dentro de cada nivel.
+        subtitles.sort((a, b) => {
+          const platA = a[IS_PLATFORM] ? 1 : 0;
+          const platB = b[IS_PLATFORM] ? 1 : 0;
+          if (platB !== platA) return platB - platA;
+
+          const sourceWeight = (s) => {
+            const rel = s[RELEASE_SOURCE];
+            if (rel === "web") return 2;
+            if (rel === "disco") return 1;
+            return 0;
+          };
+          const wA = sourceWeight(a);
+          const wB = sourceWeight(b);
+          if (wB !== wA) return wB - wA;
+
+          return 0;
+        });
 
         // TTL según fiabilidad (v1.4.5/1.4.6, por fuente): una fuente se
         // considera degradada si rechazó entera (`sourceFailed`), si tuvo >=1

@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.20
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.21
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -11,11 +11,18 @@
 //  - Bloqueo de IPs privadas / loopback (SSRF) en el origen y en CADA salto
 //    de redirección (1.0.2 seguía el segundo salto con redirect:"follow"
 //    sin validarlo -> bypass de la allowlist).
-//  - Tamaño máximo descargable: 4 MB (Vercel limita la respuesta de la
-//    función a 4,5 MB; 10 MB devolvía 413 de plataforma).
+//  - Tamaño máximo descargable: 10 MB (v1.4.21: ampliado desde 4 MB para
+//    soportar season packs completos de series; la respuesta de la función
+//    sigue siendo un único .srt extraído de <500 KB, muy por debajo de los
+//    4,5 MB de límite de salida de Vercel).
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
+//
+// v1.4.21 (26/10/2026):
+//  - [LÍMITE ZIP] MAX_BYTES ampliado de 4 MB a 10 MB para evitar HTTP 413 en
+//    packs de temporada completos (season packs) de SubDL.
+//  - Compatibilidad de versión con el Worker v1.4.21.
 //
 // v1.4.20 (25/10/2026):
 //  - Compatibilidad de versión con el Worker v1.4.20.
@@ -167,9 +174,10 @@ const ALLOWED_HOSTS = [
 
 const ALLOWED_PORTS = new Set(["", "443"]);
 
-// Vercel devuelve 413 FUNCTION_PAYLOAD_TOO_LARGE por encima de 4,5 MB en la
-// respuesta: el límite real de este proxy es 4 MB, no 10.
-const MAX_BYTES = 4 * 1024 * 1024;
+// v1.4.21: Límite de descarga ampliado a 10 MB para soportar season packs.
+// La respuesta de la función es un único .srt extraído (< 500 KB), muy por
+// debajo del límite de respuesta de Vercel (4,5 MB).
+const MAX_BYTES = 10 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_REDIRECTS = 2; // cada salto se vuelve a validar (host+puerto+IP)
 const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
@@ -177,7 +185,7 @@ const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
 // quien sube el zip, así que se ignoran las entradas con nombres más largos: defensa en
 // profundidad contra ReDoS en TODOS los regex de episodio (no solo SE_HEAD/EP_NEXT).
 const MAX_ENTRY_NAME = 512;
-const USER_AGENT = "HispaSubs/1.4.20";
+const USER_AGENT = "HispaSubs/1.4.21";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
 

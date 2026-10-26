@@ -551,18 +551,19 @@ section("5c. v1.4.1: readCapped, .sub UTF-16 y zipUrl duplicado");
     `${res.statusCode}`);
 }
 {
-  // Origen malicioso que OMITE content-length y manda >4 MB: antes lo
-  // cargaba entero con arrayBuffer(); ahora readCapped corta y pide 413.
+  // Origen malicioso que OMITE content-length y supera MAX_BYTES: readCapped
+  // corta y devuelve 413.
+  const chunksNeeded = Math.ceil(MAX_BYTES / (1024 * 1024)) + 1;
   const body = new ReadableStream({
     start(c) {
       const chunk = new Uint8Array(1024 * 1024).fill(0x50);
-      for (let i = 0; i < 5; i++) c.enqueue(chunk); // 5 MB sin content-length
+      for (let i = 0; i < chunksNeeded; i++) c.enqueue(chunk);
       c.close();
     },
   });
   fetchImpl = () => new Response(body, { status: 200 });
   const res = await call("/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/sub.zip"));
-  check("sin content-length y >4 MB por streaming -> 413", res.statusCode === 413,
+  check(`sin content-length y >${MAX_BYTES / 1024 / 1024} MB por streaming -> 413`, res.statusCode === 413,
     `${res.statusCode} ${String(res.body).slice(0, 80)}`);
 }
 {

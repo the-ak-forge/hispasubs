@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.20", m10.version === "1.4.20", m10.version);
+  check("manifest version 1.4.21", m10.version === "1.4.21", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2113,6 +2113,111 @@ try {
     check("v1.4.20 vacío: la clave falsa repetida da HIT (sin recomputar)", atacante2.hit === "HIT" && atacante.n === 0);
     check("v1.4.20 vacío: el usuario legítimo NO recibe la lista vacía del atacante",
       legitimo.hit === "MISS" && legitimo.n === 1, JSON.stringify(legitimo));
+  }
+}
+
+// 28) v1.4.21: Ranking de calidad activo, SubDL 'not found' sin envenenamiento y mitigación 429
+{
+  // A. SubDL "can't find movie or tv": resultado vacío utilizable, escribe en k_subdl
+  {
+    const store = new Map();
+    const prevC = mockGlobal("caches", {
+      default: {
+        match: async (req) => {
+          const e = store.get(req.url);
+          return e ? e.clone() : undefined;
+        },
+        put: async (req, resp) => {
+          store.set(req.url, resp.clone());
+        },
+      },
+    });
+    const prevF = globalThis.fetch;
+    const origLog = console.log;
+    const origErr = console.error;
+    let logMsg = "";
+    let errCalled = false;
+    console.log = (msg, ...args) => {
+      logMsg += (msg || "") + args.join(" ");
+    };
+    console.error = (msg, ...args) => {
+      if (String(msg).includes("SubDL")) errCalled = true;
+    };
+    try {
+      globalThis.fetch = (input) => {
+        const u = String(input && input.url ? input.url : input);
+        if (u.includes("opensubtitles-v3")) {
+          return Promise.resolve(new Response(JSON.stringify({
+            subtitles: [{ id: "os1", url: "https://subs5.strem.io/os1.srt", lang: "spa" }],
+          }), { status: 200 }));
+        }
+        if (u.includes("api.subdl.com")) {
+          return Promise.resolve(new Response(JSON.stringify({
+            status: false,
+            error: "can't find movie or tv",
+          }), { status: 200 }));
+        }
+        if (u.includes("subs5.strem.io")) {
+          return Promise.resolve(new Response("1\n00:00:01,000 --> 00:00:04,000\nHola chaval, ¿cómo estás?\n", { status: 200 }));
+        }
+        return Promise.resolve(new Response("ok", { status: 200 }));
+      };
+
+      const res = await worker.fetch(
+        new Request(`${base}/${b64url({ subdlKey: "VALID_KEY_12345" })}/subtitles/movie/tt9876543.json`),
+        {},
+        {}
+      );
+      const data = await res.json();
+      const keys = [...store.keys()];
+
+      check("v1.4.21 SubDL 'not found': no emite console.error", errCalled === false);
+      check("v1.4.21 SubDL 'not found': emite log informativo", logMsg.includes("[SubDL] 0 resultados para tt9876543"));
+      check("v1.4.21 SubDL 'not found': sirve subtítulos de OS-V3", data.subtitles && data.subtitles.length === 1);
+      check("v1.4.21 SubDL 'not found': se cachea en k_subdl compartido", keys.some((k) => k.includes("/k_subdl/subtitles/movie/tt9876543.json")));
+    } finally {
+      console.log = origLog;
+      console.error = origErr;
+      globalThis.fetch = prevF;
+      restoreGlobal("caches", prevC);
+    }
+  }
+
+  // B. Ranking de calidad: [PLAT] > web > disco > resto
+  {
+    const prevF = globalThis.fetch;
+    try {
+      globalThis.fetch = (input) => {
+        const u = String(input && input.url ? input.url : input);
+        if (u.includes("opensubtitles-v3")) {
+          return Promise.resolve(new Response(JSON.stringify({
+            subtitles: [
+              { id: "s_generic", url: "https://subs5.strem.io/generic.srt", lang: "spa", subtitleFileName: "Movie.srt" },
+              { id: "s_disco", url: "https://subs5.strem.io/disco.srt", lang: "spa", subtitleFileName: "Movie.1080p.BluRay.x264.srt" },
+              { id: "s_plat", url: "https://subs5.strem.io/plat.srt", lang: "spa", subtitleFileName: "Movie.1080p.NF.WEB-DL.srt" },
+              { id: "s_web", url: "https://subs5.strem.io/web.srt", lang: "spa", subtitleFileName: "Movie.1080p.WEB-DL.srt" },
+            ],
+          }), { status: 200 }));
+        }
+        if (u.includes("subs5.strem.io")) {
+          const num = u.includes("plat") ? "1" : u.includes("web") ? "2" : u.includes("disco") ? "3" : "4";
+          return Promise.resolve(new Response(`1\n00:00:01,000 --> 00:00:04,000\nHola amigo ${num}, ¿cómo estás?\n`, { status: 200 }));
+        }
+        return Promise.resolve(new Response("ok", { status: 200 }));
+      };
+
+      const res = await worker.fetch(new Request(`${base}/subtitles/movie/tt8888999.json`), {}, {});
+      const data = await res.json();
+      const ids = (data.subtitles || []).map((s) => s.id);
+
+      check("v1.4.21 ranking: plataforma oficial se sirve de primero", ids[0] === "s_plat");
+      check("v1.4.21 ranking: web se sirve de segundo", ids[1] === "s_web");
+      check("v1.4.21 ranking: disco se sirve de tercero", ids[2] === "s_disco");
+      check("v1.4.21 ranking: genérico se sirve al final", ids[3] === "s_generic");
+      check("v1.4.21 ranking: todas las pistas del pool están presentes", ids.length === 4);
+    } finally {
+      globalThis.fetch = prevF;
+    }
   }
 }
 
