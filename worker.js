@@ -1,6 +1,17 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.22
+// HispaSubs — Cloudflare Worker v1.4.23
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.23 (26/10/2026):
+//  - [ANTI-SPAM CRÉDITOS] Preservación de créditos de comunidades de traducción
+//    (Argenteam, SubDivX, subtitulos.es, AllSubs, asia-team, TuSubtitulo, etc.):
+//    se introduce SPAM_CREDIT_LINE para evitar que bloques legítimos de 2 líneas
+//    (ej. "Subtítulos por" + "www.argenteam.net") se descarten por señales débiles.
+//    El descarte exige al menos una señal débil ajena a créditos comunitarios.
+//    Recupera listas que antes quedaban vacías en frío (0 resultados).
+//  - [OS-V3 429 JITTER RETRY] Reintento único ante HTTP 429 en descargas directas
+//    de OpenSubtitles V3 con backoff + jitter (300-700 ms, respetando Retry-After
+//    corto <=800 ms) dentro del presupuesto de 2000 ms.
 //
 // v1.4.22 (26/10/2026):
 //  - [SUBDL NOT FOUND / CACHE] Corrección de regex en SubDL: se acota estrictamente
@@ -516,14 +527,36 @@ const fetchJSON = async (url, ms = 2500) => {
 // CPU por petición holgadamente por debajo del límite de 10 ms en Workers Free.
 const MAX_ANALYZE_BYTES = 300 * 1024;
 
-const fetchSubtitle = async (url, ms = 2000) => {
+// Un 429 del CDN de OS-V3 (subs5.strem.io) dejaba la pista como FALLO y,
+// con ello, el TTL en 60 s: en producción, 24 errores 429 en 13 de 98
+// respuestas en frío (el escalonado de 25 ms no los redujo). Se reintenta UNA
+// vez, dentro del mismo timeout total, con una espera corta y con jitter para
+// que las descargas simultáneas no vuelvan a coincidir. Solo en descargas
+// directas (no en el proxy, cuyo 429 es su propio límite por IP).
+const RETRY_429_BASE_MS = 300;
+const RETRY_429_JITTER_MS = 400;
+const RETRY_429_MAX_WAIT_MS = 800;
+
+const fetchSubtitle = async (url, ms = 2000, retry429 = false) => {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   try {
-    const res = await fetch(url, {
+    const doFetch = () => fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       signal: controller.signal,
     });
+    let res = await doFetch();
+    if (res.status === 429 && retry429) {
+      // Retry-After en segundos si viene (una fecha HTTP o un valor largo => sin reintento).
+      const ra = Number(res.headers && res.headers.get && res.headers.get("retry-after"));
+      const wait = Number.isFinite(ra) && ra > 0 ? ra * 1000 : RETRY_429_BASE_MS + Math.random() * RETRY_429_JITTER_MS;
+      if (wait <= RETRY_429_MAX_WAIT_MS) {
+        try { await res.body?.cancel(); } catch { /* sin cuerpo que liberar */ }
+        await new Promise((r) => setTimeout(r, wait));
+        res = await doFetch();
+        console.log(`[classify] HTTP 429: reintento tras ${Math.round(wait)}ms -> HTTP ${res.status}`);
+      }
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     // Si el subtítulo supera 300 KB (con o sin Content-Length), readCapped lee
     // únicamente los primeros 300 KB y cancela el stream: basta para clasificar
@@ -748,7 +781,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.22",
+  version: "1.4.23",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1193,6 +1226,17 @@ const SPAM_STRONG_EDGE = /(?<![\p{L}\p{N}_])(?:(?:casino|bingo|poker|ruleta|trag
 // ("no.Me importa", "todo.Es posible"). `mx`/`yts` cubren el watermark YTS.
 const SPAM_WEAK_LINE = /(?<![\p{L}\p{N}_])(?:(?:https?:\/\/|www\.)[^\s<>"']+|(?:[a-z0-9][a-z0-9-]{0,62}\.)+(?:com|net|org|es|mx|tv|info|xyz|top|link|site|online|app|club|cc|io|biz|name|live|vip|bet)(?![\p{L}\p{N}_])|(?:opensubtitles|subdivx|tusubtitulo|argenteam|subtitulamos|elrincondelsub|podnapisi|subs4free|yts)(?![\p{L}\p{N}_])|(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])|(?:canal|grupo)\s+de\s+telegram(?![\p{L}\p{N}_])|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/iu;
 
+// Créditos de comunidades de traducción CONOCIDAS (y la fórmula "Subtítulos
+// por …"). Una línea débil de este tipo es un crédito, no publicidad: el bloque
+// típico "Subtítulos por / www.argenteam.net" son DOS líneas débiles y descartaba
+// la pista entera (en producción, 11 de 98 respuestas en frío quedaron con 0
+// pistas por esto; 34 de los 38 descartes eran Argenteam, subtitulos.es,
+// AllSubs, SubDivX o asia-team). Ahora hacen falta >=2 líneas débiles Y al
+// menos una que NO sea crédito (dominio/email desconocido, opensubtitles, yts…).
+// OpenSubtitles y YTS siguen fuera de esta lista a propósito: su marca de agua
+// SÍ es publicidad.
+const SPAM_CREDIT_LINE = /(?<![\p{L}\p{N}_])(?:argenteam|subdivx|tusubtitulo|subtitulamos|elrincondelsub|allsubs|asia-team|subtitulos\.es)(?![\p{L}\p{N}_])|(?<![\p{L}\p{N}_])(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])/iu;
+
 // Veredicto puro (exportado para tests). Devuelve { discard, reason, match }.
 // Si `truncated` es true (el archivo superó MAX_ANALYZE_BYTES y se cortó a
 // mitad), solo se extrae la cabeza: las últimas líneas del buffer truncado
@@ -1246,11 +1290,14 @@ const spamVerdict = (text, truncated = false) => {
   if (mEdge) return { discard: true, reason: "fuerte", match: mEdge[0].slice(0, 60) };
 
   const weakMatches = [];
+  let weakNonCredit = 0;
   for (const line of edgeLines) {
     const mWeak = SPAM_WEAK_LINE.exec(line);
     if (mWeak) {
       weakMatches.push(mWeak[0].slice(0, 40));
-      if (weakMatches.length >= 2) {
+      // ¿La línea es solo un crédito de comunidad conocida? (ver SPAM_CREDIT_LINE)
+      if (!SPAM_CREDIT_LINE.test(line)) weakNonCredit += 1;
+      if (weakMatches.length >= 2 && weakNonCredit >= 1) {
         return {
           discard: true,
           reason: `${weakMatches.length} líneas débiles`,
@@ -1305,7 +1352,7 @@ const classifySubtitle = async (
     // acotado al presupuesto restante cuando se invoca desde la 2ª oleada.
     const defaultTimeout = isZip ? 6000 : 2000;
     const timeoutMs = maxTimeoutMs > 0 ? Math.min(defaultTimeout, maxTimeoutMs) : defaultTimeout;
-    const { text, truncated } = await fetchSubtitle(finalUrl, timeoutMs);
+    const { text, truncated } = await fetchSubtitle(finalUrl, timeoutMs, !isZip);
 
     // Validación del CONTENIDO antes de etiquetar. "🌎 Neutro" significaba
     // "vocabulario equilibrado", pero con HTML de error, binario (un zip sin

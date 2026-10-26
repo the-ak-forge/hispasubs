@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.22", m10.version === "1.4.22", m10.version);
+  check("manifest version 1.4.23", m10.version === "1.4.23", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -693,10 +693,11 @@ try {
   check("v1.4.3: 'no.Me' + 'todo.Es' ya no son 2 líneas débiles",
     spamVerdict("no.Me importa lo que digas\ntodo.Es posible").discard === false,
     JSON.stringify(spamVerdict("no.Me importa lo que digas\ntodo.Es posible")));
-  // ...pero los créditos/URLs reales siguen descartando en pareja.
+  // ...pero los créditos/URLs reales de dominios DESCONOCIDOS siguen descartando en pareja.
+  // (v1.4.23: el par crédito + web de Argenteam ya NO descarta; ver sección 30.)
   check("v1.4.3: 2 créditos/URL reales siguen descartando",
-    spamVerdict("Subtitulado por Argenteam\nwww.argenteam.net").discard === true,
-    JSON.stringify(spamVerdict("Subtitulado por Argenteam\nwww.argenteam.net")));
+    spamVerdict("Subtitulado por Leo\nwww.bet-win.com").discard === true,
+    JSON.stringify(spamVerdict("Subtitulado por Leo\nwww.bet-win.com")));
 
   // --- Léxico: fuera raíces abiertas; el dialecto exige término fuerte ---
   for (const w of ["conducta", "conductor", "conductividad", "estaciones", "estacionario", "Jodie", "Jodorowsky", "Ching-whatever"]) {
@@ -893,12 +894,12 @@ try {
     !spamVerdict(midOnly).discard, JSON.stringify(spamVerdict(midOnly)));
 
   // Límite de longitud sin el \r del CRLF: 300 car. cuentan, 301 no.
-  const weak1 = "www.argenteam.net".padEnd(300, "x");
-  const weak2 = "www.subdivx.com".padEnd(300, "y");
+  const weak1 = "www.bet-win.com".padEnd(300, "x");
+  const weak2 = "www.darkville.mx".padEnd(300, "y");
   const crlfHead = [weak1, weak2].join("\r\n");
   check("v1.4.4: CRLF — línea de 300 car. en la cabeza sí cuenta (el \\r no suma)",
     spamVerdict(crlfHead).discard, JSON.stringify(spamVerdict(crlfHead)));
-  const weak1b = "www.argenteam.net".padEnd(301, "x");
+  const weak1b = "www.bet-win.com".padEnd(301, "x");
   check("v1.4.4: CRLF — línea de 301 car. se salta (máx. 300)",
     !spamVerdict([weak1b, weak2].join("\r\n")).discard);
   check("v1.4.4: LF puro con las mismas líneas también descarta",
@@ -2277,6 +2278,103 @@ try {
       !keys.some((k) => k.includes("/k_subdl/")), JSON.stringify(keys));
     check(`v1.4.22 SubDL error "${msg}": el usuario legítimo no hereda la respuesta del atacante`,
       legitimo.hit === "MISS" && legitimo.n === 2, JSON.stringify({ atacante, legitimo }));
+  }
+}
+
+// 30) v1.4.23: créditos de comunidades conocidas no son spam; un reintento ante 429 de OS-V3
+{
+  const srtWith = (head) =>
+    `1\n00:00:01,000 --> 00:00:02,000\n${head}\n\n2\n00:00:03,000 --> 00:00:04,000\nHola chaval, ¿cómo estás?\n\n` +
+    "3\n00:00:05,000 --> 00:00:06,000\nVamos a por el coche.\n\n".repeat(40);
+  const cases = [
+    // [descripción, cabecera, ¿se descarta?]  — los 5 primeros son los bloques REALES vistos en producción
+    ["Argenteam: 'Subtítulos por' + web", "Subtítulos por\nwww.argenteam.net", false],
+    ["subtitulos.es duplicado", "www.SUBTITULOS.es\nwww.SUBTITULOS.es", false],
+    ["AllSubs + 'Subtítulos por'", "www.AllSubs.org\nSubtítulos por", false],
+    ["asia-team + 'traducidos por'", "traducidos por\nhttp://www.asia-team.net", false],
+    ["SubDivX + 'corregido por'", "corregido por\nwww.subdivx.com", false],
+    ["solo créditos sin web", "Traducido por Juan\nCorregido por Ana", false],
+    // lo que SIGUE siendo spam
+    ["dominio desconocido + crédito", "Subtítulos por\nwww.bet-win.com", true],
+    ["dominio desconocido + comunidad", "wWw.Darkville.Com.Mx\nwww.SUBTITULOS.es", true],
+    ["correo personal + crédito", "Subtitulado por\nLeoFN123@hotmail.com", true],
+    ["OpenSubtitles dos líneas (marca de agua)", "www.OpenSubtitles.org\nwww.OpenSubtitles.org", true],
+    ["YTS", "YTS\nwww.yts.mx", true],
+    ["comunidad + anuncio desconocido", "www.argenteam.net\nwww.casino-gratis.top", true],
+  ];
+  for (const [name, head, expected] of cases) {
+    const v = spamVerdict(srtWith(head));
+    check(`v1.4.23 spam débil: ${name} -> ${expected ? "descarta" : "conserva"}`, v.discard === expected, JSON.stringify(v));
+  }
+  check("v1.4.23 spam fuerte intacto: casa de apuestas sigue descartando",
+    spamVerdict(srtWith("Subtítulos por\nApuesta en bet365 ahora")).discard === true);
+
+  const jsonR = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
+  const quiet = async (fn) => {
+    const l = console.log, e = console.error;
+    console.log = () => {}; console.error = () => {};
+    try { return await fn(); } finally { console.log = l; console.error = e; }
+  };
+
+  // Integración: una pista con créditos de Argenteam se SIRVE (antes: lista vacía)
+  {
+    const prevC = mockGlobal("caches", { default: { match: async () => undefined, put: async () => {} } });
+    const prevF = globalThis.fetch;
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) return Promise.resolve(jsonR({ subtitles: [{ id: "a1", url: "https://subs5.strem.io/a1.srt", lang: "spa" }] }));
+      return Promise.resolve(textResp(srtWith("Subtítulos por\nwww.argenteam.net") + TXT_CAST));
+    };
+    let j, r;
+    try { r = await quiet(() => worker.fetch(new Request(`${base}/subtitles/movie/tt7770101.json`), {}, { waitUntil: () => {} })); j = await r.json(); }
+    finally { globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
+    check("v1.4.23 integración: pista con créditos de Argenteam se sirve y la lista cachea 7200 s",
+      j.subtitles.length === 1 && r.headers.get("cache-control") === "public, max-age=7200", JSON.stringify(j));
+  }
+
+  // 429 de OS-V3: reintento
+  const run429 = async (id, firstHeaders, secondStatus) => {
+    const prevC = mockGlobal("caches", { default: { match: async () => undefined, put: async () => {} } });
+    const prevF = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) return Promise.resolve(jsonR({ subtitles: [{ id: "r1", url: "https://subs5.strem.io/r1.srt", lang: "spa" }] }));
+      calls += 1;
+      if (calls === 1) return Promise.resolve(new Response("slow down", { status: 429, headers: firstHeaders }));
+      return Promise.resolve(secondStatus === 200 ? textResp(TXT_CAST) : new Response("slow down", { status: secondStatus }));
+    };
+    let j, r;
+    try { r = await quiet(() => worker.fetch(new Request(`${base}/subtitles/movie/${id}.json`), {}, { waitUntil: () => {} })); j = await r.json(); }
+    finally { globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
+    return { calls, n: j.subtitles.length, ttl: r.headers.get("cache-control") };
+  };
+  {
+    const a = await run429("tt7770102", {}, 200);
+    check("v1.4.23 429: un 429 seguido de 200 se recupera (2 llamadas, pista servida)", a.calls === 2 && a.n === 1, JSON.stringify(a));
+    const b = await run429("tt7770103", {}, 429);
+    check("v1.4.23 429: dos 429 seguidos siguen siendo fallo (2 llamadas, sin pista, TTL 60)",
+      b.calls === 2 && b.n === 0 && b.ttl === "public, max-age=60", JSON.stringify(b));
+    const c = await run429("tt7770104", { "retry-after": "5" }, 200);
+    check("v1.4.23 429: Retry-After largo (5 s) no se reintenta (1 llamada)", c.calls === 1 && c.n === 0, JSON.stringify(c));
+    const d = await run429("tt7770105", { "retry-after": "0.2" }, 200);
+    check("v1.4.23 429: Retry-After corto se respeta y se reintenta", d.calls === 2 && d.n === 1, JSON.stringify(d));
+  }
+  // El 429 del proxy (zip de SubDL) NO se reintenta
+  {
+    const prevC = mockGlobal("caches", { default: { match: async () => undefined, put: async () => {} } });
+    const prevF = globalThis.fetch;
+    let zipCalls = 0;
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) return Promise.resolve(jsonR({ subtitles: [] }));
+      if (u.includes("api.subdl.com")) return Promise.resolve(jsonR({ status: true, subtitles: [{ url: "/subtitle/1-2.zip", file_id: 1 }] }));
+      zipCalls += 1;
+      return Promise.resolve(new Response("rate limited", { status: 429 }));
+    };
+    try { await quiet(() => worker.fetch(new Request(`${base}/${b64url({ subdlKey: "clave_valida_123" })}/subtitles/movie/tt7770106.json`), {}, { waitUntil: () => {} })); }
+    finally { globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
+    check("v1.4.23 429: el 429 del proxy (zip) no se reintenta (1 llamada)", zipCalls === 1, String(zipCalls));
   }
 }
 
