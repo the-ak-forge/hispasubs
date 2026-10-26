@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.23", m10.version === "1.4.23", m10.version);
+  check("manifest version 1.4.24", m10.version === "1.4.24", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2301,6 +2301,12 @@ try {
     ["OpenSubtitles dos líneas (marca de agua)", "www.OpenSubtitles.org\nwww.OpenSubtitles.org", true],
     ["YTS", "YTS\nwww.yts.mx", true],
     ["comunidad + anuncio desconocido", "www.argenteam.net\nwww.casino-gratis.top", true],
+    // Elusión cerrada: crédito/comunidad + dominio ajeno EN LA MISMA línea no se exime
+    ["crédito + dominio ajeno en la misma línea (x2)", "Subtitulado por www.casino-ya.top\nTraducido por www.casino-ya.top", true],
+    ["comunidad + dominio ajeno en la misma línea (x2)", "www.argenteam.net www.bet-win.com\nwww.argenteam.net www.bet-win.com", true],
+    ["crédito + correo ajeno en la misma línea (x2)", "Subtitulado por juan@gmail.com\nCorregido por pepe@gmail.com", true],
+    ["crédito con la web de la comunidad en la misma línea (x2)", "Subtítulos por www.argenteam.net\nCorregidos por www.subdivx.com", false],
+    ["solo fórmulas 'por' con nombres", "Subtítulos por Juan\nTraducción por Ana", false],
   ];
   for (const [name, head, expected] of cases) {
     const v = spamVerdict(srtWith(head));

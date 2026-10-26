@@ -1,6 +1,13 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.23
+// HispaSubs — Cloudflare Worker v1.4.24
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.24 (26/10/2026):
+//  - [ANTI-SPAM / VECTOR DE ELUSIÓN] Cierre de fuga en exención de créditos:
+//    una línea solo se clasifica como crédito comunitario (isCreditOnlyLine) si,
+//    tras retirar la frase de autoría y el token de comunidad reconocida, no
+//    contiene ninguna otra señal débil. Evita que líneas mixtas (ej. "Subtitulado
+//    por www.casino-ya.top" o dominios ajenos en la misma línea) eludan el filtro.
 //
 // v1.4.23 (26/10/2026):
 //  - [ANTI-SPAM CRÉDITOS] Preservación de créditos de comunidades de traducción
@@ -547,7 +554,8 @@ const fetchSubtitle = async (url, ms = 2000, retry429 = false) => {
     });
     let res = await doFetch();
     if (res.status === 429 && retry429) {
-      // Retry-After en segundos si viene (una fecha HTTP o un valor largo => sin reintento).
+      // Retry-After en segundos si viene (un valor > 800 ms => sin reintento). Si es una
+      // fecha HTTP no se interpreta (NaN) y se usa la espera por defecto con jitter.
       const ra = Number(res.headers && res.headers.get && res.headers.get("retry-after"));
       const wait = Number.isFinite(ra) && ra > 0 ? ra * 1000 : RETRY_429_BASE_MS + Math.random() * RETRY_429_JITTER_MS;
       if (wait <= RETRY_429_MAX_WAIT_MS) {
@@ -781,7 +789,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.23",
+  version: "1.4.24",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1237,6 +1245,16 @@ const SPAM_WEAK_LINE = /(?<![\p{L}\p{N}_])(?:(?:https?:\/\/|www\.)[^\s<>"']+|(?:
 // SÍ es publicidad.
 const SPAM_CREDIT_LINE = /(?<![\p{L}\p{N}_])(?:argenteam|subdivx|tusubtitulo|subtitulamos|elrincondelsub|allsubs|asia-team|subtitulos\.es)(?![\p{L}\p{N}_])|(?<![\p{L}\p{N}_])(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])/iu;
 
+// Una línea es "solo crédito" si, quitando las frases de crédito y los tokens
+// que contienen el nombre de una comunidad conocida, ya no queda NINGUNA señal
+// débil. Así "Subtitulado por www.casino-ya.top" NO se exime: tras quitar la
+// frase sigue quedando un dominio ajeno.
+const SPAM_CREDIT_NAME_TOKEN = /\S*(?<![\p{L}\p{N}_])(?:argenteam|subdivx|tusubtitulo|subtitulamos|elrincondelsub|allsubs|asia-team|subtitulos\.es)(?![\p{L}\p{N}_])\S*/giu;
+const SPAM_CREDIT_PHRASE = /(?<![\p{L}\p{N}_])(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])/giu;
+const isCreditOnlyLine = (line) =>
+  SPAM_CREDIT_LINE.test(line) &&
+  !SPAM_WEAK_LINE.test(line.replace(SPAM_CREDIT_NAME_TOKEN, " ").replace(SPAM_CREDIT_PHRASE, " "));
+
 // Veredicto puro (exportado para tests). Devuelve { discard, reason, match }.
 // Si `truncated` es true (el archivo superó MAX_ANALYZE_BYTES y se cortó a
 // mitad), solo se extrae la cabeza: las últimas líneas del buffer truncado
@@ -1296,7 +1314,7 @@ const spamVerdict = (text, truncated = false) => {
     if (mWeak) {
       weakMatches.push(mWeak[0].slice(0, 40));
       // ¿La línea es solo un crédito de comunidad conocida? (ver SPAM_CREDIT_LINE)
-      if (!SPAM_CREDIT_LINE.test(line)) weakNonCredit += 1;
+      if (!isCreditOnlyLine(line)) weakNonCredit += 1;
       if (weakMatches.length >= 2 && weakNonCredit >= 1) {
         return {
           discard: true,
