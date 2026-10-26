@@ -705,7 +705,7 @@ const parseConfig = (configStr) => {
 
 const getConfigureHTML = (existingConfig = {}) => `
 <!DOCTYPE html>
-<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Configuración | HispaSubs</title><style>body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background-color: #121212; color: #ffffff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; } .container { background-color: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); max-width: 500px; width: 100%; text-align: center; } h1 { margin-top: 10px; color: #00d2ff; font-size: 28px; } p { color: #aaaaaa; font-size: 14px; margin-bottom: 24px; line-height: 1.5; } .form-group { text-align: left; margin-bottom: 20px; } label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 14px; } input { width: 100%; padding: 12px; border: 1px solid #333; border-radius: 6px; background-color: #2a2a2a; color: #fff; box-sizing: border-box; font-family: monospace; } input:focus { outline: none; border-color: #00d2ff; } .btn-container { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; } button { font-size: 16px; font-weight: bold; border-radius: 6px; cursor: pointer; width: 100%; padding: 14px 24px; transition: all 0.3s; } .btn-primary { background-color: #00d2ff; color: #121212; border: none; } .btn-primary:hover { background-color: #00a8cc; transform: translateY(-2px); } .btn-secondary { background-color: transparent; color: #00d2ff; border: 2px solid #00d2ff; } </style></head><body><div class="container"><div>${LOGO_SVG}</div><h1>HispaSubs</h1><p>Clasificación léxica en tiempo real para Stremio.<br>Detecta automáticamente modismos en español y los divide en <strong>🇲🇽 Latino</strong>, <strong>🇪🇸 Castellano</strong> y <strong>🌎 Neutro</strong>.</p><div class="form-group"><label>SubDL API Key (Recomendado — Subtítulos oficiales)</label><input type="password" id="subdlKey" placeholder="ej: abc123def456..." value="${esc(existingConfig.subdlKey || "")}"><small style="display:block;margin-top:6px;color:#888;font-size:12px;line-height:1.4;">Obtén tu clave gratis en <a href="https://subdl.com" target="_blank" style="color:#00d2ff;text-decoration:none;">subdl.com</a> (toma 30 s) para desbloquear subtítulos oficiales de <strong>Netflix, Prime Video, Disney+, Max y Apple TV+</strong> marcados con <code>[PLAT]</code>.</small></div><div class="btn-container"><button class="btn-primary" onclick="installAddon()">Instalar en Stremio</button><button class="btn-secondary" id="copyBtn" onclick="copyManifest()">Copiar URL del Manifest</button></div></div>
+<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Configuración | HispaSubs</title><style>body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background-color: #121212; color: #ffffff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; } .container { background-color: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); max-width: 500px; width: 100%; text-align: center; } h1 { margin-top: 10px; color: #00d2ff; font-size: 28px; } p { color: #aaaaaa; font-size: 14px; margin-bottom: 24px; line-height: 1.5; } .form-group { text-align: left; margin-bottom: 20px; } label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 14px; } input { width: 100%; padding: 12px; border: 1px solid #333; border-radius: 6px; background-color: #2a2a2a; color: #fff; box-sizing: border-box; font-family: monospace; } input:focus { outline: none; border-color: #00d2ff; } .btn-container { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; } button { font-size: 16px; font-weight: bold; border-radius: 6px; cursor: pointer; width: 100%; padding: 14px 24px; transition: all 0.3s; } .btn-primary { background-color: #00d2ff; color: #121212; border: none; } .btn-primary:hover { background-color: #00a8cc; transform: translateY(-2px); } .btn-secondary { background-color: transparent; color: #00d2ff; border: 2px solid #00d2ff; } </style></head><body><div class="container"><div>${LOGO_SVG}</div><h1>HispaSubs</h1><p>Clasificación léxica en tiempo real para Stremio.<br>Detecta automáticamente modismos en español y los divide en <strong>🇲🇽 Latino</strong>, <strong>🇪🇸 Castellano</strong> y <strong>🌎 Neutro</strong>.</p><div class="form-group"><label>SubDL API Key (Opcional — Mayor catálogo)</label><input type="password" id="subdlKey" placeholder="ej: abc123def456..." value="${esc(existingConfig.subdlKey || "")}"><small style="display:block;margin-top:6px;color:#888;font-size:12px;line-height:1.4;">Obtén una clave gratis en <a href="https://subdl.com" target="_blank" style="color:#00d2ff;text-decoration:none;">subdl.com</a> para ampliar la búsqueda y priorizar versiones sincronizadas de alta calidad.</small></div><div class="btn-container"><button class="btn-primary" onclick="installAddon()">Instalar en Stremio</button><button class="btn-secondary" id="copyBtn" onclick="copyManifest()">Copiar URL del Manifest</button></div></div>
 <script>
 // NOTA: se usa split/join en vez de .replace(/.../) para no depender de
 // escapes anidados dentro del template literal del Worker (el bug ///g de 1.0.0).
@@ -1702,10 +1702,11 @@ export default {
         }
 
         // Ranking de calidad v1.4.21:
-        // 1º Subtítulos de plataforma oficial ([PLAT]: NF, AMZN, DSNP, ATVP, HMAX, HULU).
-        // 2º Ripeos WEB-DL / WEBRip.
+        // 1º Subtítulos de plataforma oficial (señal fuerte de release oficial).
+        // 2º Ripeos WEB-DL / WEBRip (sincronizados con la mayoría de streams).
         // 3º Ediciones de disco (BluRay / BDRip / UHD).
-        // 4º Resto de pistas.
+        // 4º Dialecto verificado (🇲🇽/🇪🇸/🌎) sobre sin clasificar (📄).
+        // 5º Resto de pistas en orden natural del proveedor.
         // Se preservan todas las pistas válidas del pool sin descartar ninguna;
         // orden estable dentro de cada nivel.
         subtitles.sort((a, b) => {
@@ -1722,6 +1723,11 @@ export default {
           const wA = sourceWeight(a);
           const wB = sourceWeight(b);
           if (wB !== wA) return wB - wA;
+
+          const isClassified = (s) => (s.label && !s.label.startsWith("📄") ? 1 : 0);
+          const cA = isClassified(a);
+          const cB = isClassified(b);
+          if (cB !== cA) return cB - cA;
 
           return 0;
         });

@@ -2195,12 +2195,19 @@ try {
               { id: "s_generic", url: "https://subs5.strem.io/generic.srt", lang: "spa", subtitleFileName: "Movie.srt" },
               { id: "s_disco", url: "https://subs5.strem.io/disco.srt", lang: "spa", subtitleFileName: "Movie.1080p.BluRay.x264.srt" },
               { id: "s_plat", url: "https://subs5.strem.io/plat.srt", lang: "spa", subtitleFileName: "Movie.1080p.NF.WEB-DL.srt" },
+              { id: "s_web_unclass", url: "https://subs5.strem.io/web_unclass.srt", lang: "spa", subtitleFileName: "Movie.720p.WEB-DL.srt" },
               { id: "s_web", url: "https://subs5.strem.io/web.srt", lang: "spa", subtitleFileName: "Movie.1080p.WEB-DL.srt" },
             ],
           }), { status: 200 }));
         }
         if (u.includes("subs5.strem.io")) {
-          const num = u.includes("plat") ? "1" : u.includes("web") ? "2" : u.includes("disco") ? "3" : "4";
+          if (u.includes("web_unclass")) {
+            return Promise.resolve(new Response("1\n00:00:01,000 --> 00:00:04,000\nOK. 1 2 3.\n", { status: 200 }));
+          }
+          if (u.includes("web.srt")) {
+            return Promise.resolve(new Response("1\n00:00:01,000 --> 00:00:04,000\nUstedes tienen un carro lindo.\n", { status: 200 }));
+          }
+          const num = u.includes("plat") ? "1" : u.includes("disco") ? "3" : "4";
           return Promise.resolve(new Response(`1\n00:00:01,000 --> 00:00:04,000\nHola amigo ${num}, ¿cómo estás?\n`, { status: 200 }));
         }
         return Promise.resolve(new Response("ok", { status: 200 }));
@@ -2211,10 +2218,11 @@ try {
       const ids = (data.subtitles || []).map((s) => s.id);
 
       check("v1.4.21 ranking: plataforma oficial se sirve de primero", ids[0] === "s_plat");
-      check("v1.4.21 ranking: web se sirve de segundo", ids[1] === "s_web");
-      check("v1.4.21 ranking: disco se sirve de tercero", ids[2] === "s_disco");
-      check("v1.4.21 ranking: genérico se sirve al final", ids[3] === "s_generic");
-      check("v1.4.21 ranking: todas las pistas del pool están presentes", ids.length === 4);
+      check("v1.4.21 ranking: web con dialecto verificado se sirve de segundo", ids[1] === "s_web");
+      check("v1.4.21 ranking: web sin clasificar se sirve tras el verificado", ids[2] === "s_web_unclass");
+      check("v1.4.21 ranking: disco se sirve de cuarto", ids[3] === "s_disco");
+      check("v1.4.21 ranking: genérico se sirve al final", ids[4] === "s_generic");
+      check("v1.4.21 ranking: todas las pistas del pool están presentes", ids.length === 5);
     } finally {
       globalThis.fetch = prevF;
     }
