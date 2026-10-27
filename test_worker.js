@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.27", m10.version === "1.4.27", m10.version);
+  check("manifest version 1.4.28", m10.version === "1.4.28", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2435,6 +2435,78 @@ try {
   check("v1.4.26 muestreo sin solapamiento (50 KB): 1 término en byte 20.000 cuenta 1 sola vez (Neutro, no Castellano)",
     resOverlap?.esMatches === 1 && resOverlap?.strongTotal === 1 && resOverlap?.flag === "🌎 Neutro",
     JSON.stringify(resOverlap));
+}
+
+// 32) Créditos reales de producción (27/10), log sin ruido por petición sin clave y tamaño en `resumen`
+{
+  const srtWith = (head) =>
+    `1\n00:00:01,000 --> 00:00:02,000\n${head}\n\n2\n00:00:03,000 --> 00:00:04,000\nHola chaval, ¿cómo estás?\n\n` +
+    "3\n00:00:05,000 --> 00:00:06,000\nVamos a por el coche.\n\n".repeat(40);
+  const cases = [
+    // créditos legítimos vistos en producción: se conservan
+    ["Asia-Team.tv (x2)", "wWw.Asia-Team.Tv\nwWw.Asia-Team.Tv", false],
+    ["Subs-Team.tv (x2)", "wWw.Subs-Team.Tv\nwWw.Subs-Team.Tv", false],
+    ["YYeTs + Addic7ed", "www.YYeTs.com\nwww.addic7ed.com", false],
+    ["Traducido por + ForoMiniSeries.Net", "Traducido por\nwww.ForoMiniSeries.Net", false],
+    ["Asia-Team.net oficial sigue valiendo", "traducidos por\nhttp://www.asia-team.net/", false],
+    // los mismos nombres con dominio ajeno / compuesto siguen siendo spam
+    ["Asia-Team con TLD ajeno (.top)", "Subtítulos por www.asia-team.top\nCorregido por www.asia-team.top", true],
+    ["Addic7ed con TLD ajeno (.bet)", "www.addic7ed.bet\nwww.addic7ed.bet", true],
+    ["YYeTs compuesto (yyets.com.bet-win.top)", "Subtítulos por www.yyets.com.bet-win.top\nCorregido por www.yyets.com.bet-win.top", true],
+    ["Subs-Team con TLD ajeno (.vip)", "www.subs-team.vip\nwww.subs-team.vip", true],
+    // publicidad real vista en producción: sigue descartando
+    ["Instagram (x2)", "https://www.instagram.com/vishal_sahani2\nhttps://www.instagram.com/vishal_sahani2", true],
+    ["dos correos personales", "moviecollector@hotmail.com\ntuxedomex@hotmail.com", true],
+    ["crédito + blogspot ajeno", "Traducido por\nTranslatorsIncSubs.blogspot.com.es", true],
+  ];
+  for (const [name, head, expected] of cases) {
+    const v = spamVerdict(srtWith(head));
+    check(`27/10 spam créditos: ${name} -> ${expected ? "descarta" : "conserva"}`, v.discard === expected, JSON.stringify(v));
+  }
+
+  const jsonR = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
+  const withLogs = async (fn) => {
+    const l = console.log, e = console.error, lines = [];
+    console.log = (...a) => lines.push(a.join(" ")); console.error = (...a) => lines.push(a.join(" "));
+    try { await fn(); } finally { console.log = l; console.error = e; }
+    return lines;
+  };
+  const runReq = async (id, { key = "", body = TXT_CAST } = {}) => {
+    const prevC = mockGlobal("caches", { default: { match: async () => undefined, put: async () => {} } });
+    const prevF = globalThis.fetch;
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) return Promise.resolve(jsonR({ subtitles: [{ id: "z1", url: "https://subs5.strem.io/z1.srt", lang: "spa" }] }));
+      if (u.includes("api.subdl.com")) return Promise.resolve(jsonR({ status: true, subtitles: [] }));
+      return Promise.resolve(textResp(body));
+    };
+    const pre = key ? `/${b64url({ subdlKey: key })}` : "";
+    let lines = [];
+    try { lines = await withLogs(async () => { const r = await worker.fetch(new Request(`${base}${pre}/subtitles/movie/${id}.json`), {}, { waitUntil: () => {} }); await r.json(); }); }
+    finally { globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
+    return lines;
+  };
+
+  // Sin clave: ya no hay una línea por petición, pero el diagnóstico lo indica.
+  {
+    const lines = await runReq("tt7780201");
+    check("27/10 sin clave: no se emite el log '[SubDL] sin api_key'", !lines.some((l) => l.includes("sin api_key")), JSON.stringify(lines.filter((l) => l.includes("SubDL"))));
+    check("27/10 sin clave: la línea por título marca 'SubDL=0 (sin clave)'", lines.some((l) => /OS-V3=1 SubDL=0 \(sin clave\)/.test(l)), JSON.stringify(lines.filter((l) => l.startsWith("[subtitles]"))));
+    const conClave = await runReq("tt7780202", { key: "clave_valida_123" });
+    check("27/10 con clave: la línea por título NO lleva '(sin clave)'",
+      conClave.some((l) => /OS-V3=1 SubDL=0$/.test(l)) && !conClave.some((l) => l.includes("(sin clave)")), JSON.stringify(conClave.filter((l) => l.startsWith("[subtitles]"))));
+  }
+
+  // len= en la línea resumen
+  {
+    const padTo = (n) => TXT_CAST + " ".repeat(Math.max(0, n - TXT_CAST.length));
+    const l100 = await runReq("tt7780203", { body: padTo(100 * 1024) });
+    check("27/10 resumen: archivo de 100 KB -> len=100k (sin '+')", l100.some((l) => /resumen .* len=100k(?!\+)/.test(l)), JSON.stringify(l100.filter((l) => l.includes("resumen")).map((l) => l.slice(-120))));
+    const small = await runReq("tt7780204");
+    check("27/10 resumen: archivo pequeño -> len=1k como mínimo", small.some((l) => /resumen .* len=\d+k(?!\+)/.test(l)), JSON.stringify(small.filter((l) => l.includes("resumen")).map((l) => l.slice(-120))));
+    const big = await runReq("tt7780205", { body: padTo(400 * 1024) });
+    check("27/10 resumen: archivo >300 KB -> len=...k+ (truncado)", big.some((l) => /resumen .* len=\d+k\+/.test(l)), JSON.stringify(big.filter((l) => l.includes("resumen")).map((l) => l.slice(-120))));
+  }
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

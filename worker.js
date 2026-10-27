@@ -1,6 +1,17 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.27
+// HispaSubs — Cloudflare Worker v1.4.28
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.28 (27/10/2026):
+//  - [ANTI-SPAM / CRÉDITOS] Ampliación de comunidades legítimas con dominios
+//    exactos vistos en producción: Asia-Team (.tv), Subs-Team (.tv y .net),
+//    Addic7ed (.com), YYeTs (.com) y ForoMiniSeries (.net).
+//  - [TELEMETRÍA / RESUMEN] Se añade métrica `len=Xk` (o `len=Xk+` si truncado)
+//    en la línea de resumen de cada pista analizada, permitiendo correlacionar
+//    el tamaño del archivo con el muestreo léxico en futuros exports.
+//  - [LOGS / RUIDO] Se elimina la línea repetitiva "[SubDL] sin api_key" (ahorrando
+//    el 14% de eventos en Cloudflare), integrándola en la línea por título como
+//    "SubDL=0 (sin clave)".
 //
 // v1.4.27 (26/10/2026):
 //  - [ANTI-SPAM / CRÉDITOS] Corrección de punto final en `SPAM_CREDIT_NAME_TOKEN`:
@@ -817,7 +828,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.27",
+  version: "1.4.28",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -895,12 +906,11 @@ const getOpenSubtitlesV3 = async (type, fullId) => {
 // status:false): el router NO lo cachea en el namespace compartido `k_subdl`.
 const unusableSubDL = () => Object.assign([], { unusable: true });
 const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") => {
-  // Sin clave no se consulta nada (pero se deja constancia en el log para
-  // que "SubDL no aparece nunca" sea diagnosticable).
-  if (!apiKey) {
-    console.log("[SubDL] sin api_key en la config: se omite la fuente");
-    return [];
-  }
+  // Sin clave no se consulta nada. Antes se escribía un log por petición
+  // ("sin api_key"): en producción ocupaba el 14 % de los 1000 eventos
+  // exportables (ventana de 46 min). Ahora la línea de diagnóstico por título
+  // lleva "SubDL=0 (sin clave)", así que sigue siendo diagnosticable sin ruido.
+  if (!apiKey) return [];
   if (!/^tt\d+$/i.test(imdbId)) return [];
   try {
     const subdlType = mediaType === "series" ? "tv" : "movie";
@@ -1293,15 +1303,17 @@ const SPAM_WEAK_LINE = /(?<![\p{L}\p{N}_])(?:(?:https?:\/\/|www\.)[^\s<>"']+|(?:
 // menos una que NO sea crédito (dominio/email desconocido, opensubtitles, yts…).
 // OpenSubtitles y YTS siguen fuera de esta lista a propósito: su marca de agua
 // SÍ es publicidad.
-const SPAM_CREDIT_LINE = /(?<![\p{L}\p{N}_])(?:argenteam|subdivx|tusubtitulo|subtitulamos|elrincondelsub|allsubs|asia-team|subtitulos\.es)(?![\p{L}\p{N}_])|(?<![\p{L}\p{N}_])(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])/iu;
+const SPAM_CREDIT_LINE = /(?<![\p{L}\p{N}_])(?:argenteam|subdivx|tusubtitulo|subtitulamos|elrincondelsub|allsubs|asia-team|subs-team|addic7ed|yyets|forominiseries|subtitulos\.es)(?![\p{L}\p{N}_])|(?<![\p{L}\p{N}_])(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])/iu;
 
+// Lista ampliada con créditos reales vistos en producción (27/10): Asia-Team (.tv),
+// Subs-Team, Addic7ed, YYeTs y ForoMiniSeries; cada uno solo con su dominio exacto.
 // Una línea es "solo crédito" si, quitando las frases de crédito y los tokens
 // exactos de una comunidad conocida (su nombre o su dominio oficial, nunca un
 // dominio compuesto o query ajena como `www.casino-argenteam.top` o
 // `https://bet.top/?ref=argenteam`), ya no queda NINGUNA señal débil.
 // Un punto FINAL de frase tras el nombre/dominio ("Traducido por Argenteam.", "www.subtitulos.es.")
 // no impide la exención; un punto seguido de letra/número ("www.argenteam.net.bet-win.top") sí.
-const SPAM_CREDIT_NAME_TOKEN = /(?<![\p{L}\p{N}_.-])(?:https?:\/\/)?(?:www\.)?(?:(?:argenteam|asia-team)(?:\.net)?|(?:subdivx|tusubtitulo|elrincondelsub)(?:\.com)?|subtitulamos(?:\.tv)?|allsubs(?:\.org)?|subtitulos\.es)(?:\/[a-z0-9/_-]*)?(?![\p{L}\p{N}_?=&-]|\.[\p{L}\p{N}])/giu;
+const SPAM_CREDIT_NAME_TOKEN = /(?<![\p{L}\p{N}_.-])(?:https?:\/\/)?(?:www\.)?(?:argenteam(?:\.net)?|(?:asia-team|subs-team)(?:\.(?:net|tv))?|(?:subdivx|tusubtitulo|elrincondelsub|addic7ed|yyets)(?:\.com)?|forominiseries(?:\.net)?|subtitulamos(?:\.tv)?|allsubs(?:\.org)?|subtitulos\.es)(?:\/[a-z0-9/_-]*)?(?![\p{L}\p{N}_?=&-]|\.[\p{L}\p{N}])/giu;
 const SPAM_CREDIT_PHRASE = /(?<![\p{L}\p{N}_])(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])/giu;
 const isCreditOnlyLine = (line) =>
   SPAM_CREDIT_LINE.test(line) &&
@@ -1460,8 +1472,12 @@ const classifySubtitle = async (
 
     const diag = {};
     const scored = scoreText(text, diag);
+    // len = tamaño del texto analizado en KB (caracteres/1024, redondeado hacia
+    // arriba); "+" si se cortó en MAX_ANALYZE_BYTES. Permite separar en los logs
+    // los archivos <=48 KB (se puntúan enteros) de los >48 KB (muestreo 3 ventanas).
+    const lenTag = `${Math.ceil(text.length / 1024)}k${truncated ? "+" : ""}`;
     const brief = (flag) =>
-      `${flag}${isPlatform ? " [PLAT]" : ""}${sdh ? " SDH" : ""} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0}${
+      `${flag}${isPlatform ? " [PLAT]" : ""}${sdh ? " SDH" : ""} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0} len=${lenTag}${
         diag.reason ? ` (${diag.reason})` : ""
       }`;
     if (!scored) {
@@ -1677,7 +1693,8 @@ export default {
         console.log(
           `[subtitles] ${type}/${fullId}: ` +
             `OS-V3=${osSubs.status === "fulfilled" ? osSubs.value.length : "ERROR " + osSubs.reason?.message} ` +
-            `SubDL=${sdlSubs.status === "fulfilled" ? sdlSubs.value.length : "ERROR " + sdlSubs.reason?.message}`
+            `SubDL=${sdlSubs.status === "fulfilled" ? sdlSubs.value.length : "ERROR " + sdlSubs.reason?.message}` +
+            (config.subdlKey ? "" : " (sin clave)")
         );
 
         const rawSubs = [
