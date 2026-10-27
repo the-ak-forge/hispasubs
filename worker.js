@@ -1,6 +1,13 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.26
+// HispaSubs — Cloudflare Worker v1.4.27
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.27 (26/10/2026):
+//  - [ANTI-SPAM / CRÉDITOS] Corrección de punto final en `SPAM_CREDIT_NAME_TOKEN`:
+//    un punto gramatical al cierre de frase (ej. "Traducido por Argenteam." o
+//    "www.subtitulos.es.") se distingue de un punto de dominio compuesto (ej.
+//    "argenteam.net.bet-win.top"), evitando que créditos legítimos con punto
+//    se descarten por señales débiles.
 //
 // v1.4.26 (26/10/2026):
 //  - [LÉXICO / FIX SOLAPAMIENTO] Corrección matemática en `sampleScoreText`:
@@ -810,7 +817,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.26",
+  version: "1.4.27",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1292,7 +1299,9 @@ const SPAM_CREDIT_LINE = /(?<![\p{L}\p{N}_])(?:argenteam|subdivx|tusubtitulo|sub
 // exactos de una comunidad conocida (su nombre o su dominio oficial, nunca un
 // dominio compuesto o query ajena como `www.casino-argenteam.top` o
 // `https://bet.top/?ref=argenteam`), ya no queda NINGUNA señal débil.
-const SPAM_CREDIT_NAME_TOKEN = /(?<![\p{L}\p{N}_.-])(?:https?:\/\/)?(?:www\.)?(?:(?:argenteam|asia-team)(?:\.net)?|(?:subdivx|tusubtitulo|elrincondelsub)(?:\.com)?|subtitulamos(?:\.tv)?|allsubs(?:\.org)?|subtitulos\.es)(?:\/[a-z0-9/_-]*)?(?![\p{L}\p{N}_.?=&-])/giu;
+// Un punto FINAL de frase tras el nombre/dominio ("Traducido por Argenteam.", "www.subtitulos.es.")
+// no impide la exención; un punto seguido de letra/número ("www.argenteam.net.bet-win.top") sí.
+const SPAM_CREDIT_NAME_TOKEN = /(?<![\p{L}\p{N}_.-])(?:https?:\/\/)?(?:www\.)?(?:(?:argenteam|asia-team)(?:\.net)?|(?:subdivx|tusubtitulo|elrincondelsub)(?:\.com)?|subtitulamos(?:\.tv)?|allsubs(?:\.org)?|subtitulos\.es)(?:\/[a-z0-9/_-]*)?(?![\p{L}\p{N}_?=&-]|\.[\p{L}\p{N}])/giu;
 const SPAM_CREDIT_PHRASE = /(?<![\p{L}\p{N}_])(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])/giu;
 const isCreditOnlyLine = (line) =>
   SPAM_CREDIT_LINE.test(line) &&

@@ -382,7 +382,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.26", m10.version === "1.4.26", m10.version);
+  check("manifest version 1.4.27", m10.version === "1.4.27", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2398,6 +2398,10 @@ try {
     ["TLD falso de comunidad (www.argenteam.bet)", "Subtítulos por\nwww.argenteam.bet", true],
     ["ruta legítima de comunidad (https://www.subdivx.com/usuarios/juan)", "Subtítulos por\nhttps://www.subdivx.com/usuarios/juan", false],
     ["nombre de comunidad entre paréntesis ([Argenteam] / (SubDivX))", "Subtítulos por [Argenteam]\nSincronizado por (SubDivX)", false],
+    // El punto final de frase tras el nombre/dominio no rompe la exención
+    ["crédito con punto final (Argenteam. / SubDivX.)", "Traducido por Argenteam.\nCorregido por SubDivX.", false],
+    ["dominio oficial con punto final (www.subtitulos.es.)", "www.subtitulos.es.\nSubtítulos por", false],
+    ["punto final NO exime un dominio compuesto (argenteam.net.bet-win.top)", "Subtítulos por www.argenteam.net.bet-win.top\nCorregido por www.argenteam.net.bet-win.top", true],
   ];
   for (const [desc, head, expected] of spoofCases) {
     const v = spamVerdict(srtWith(head));
