@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf } from "./worker.js";
+import worker, { FULL_SHADOW_EVERY, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.29", m10.version === "1.4.29", m10.version);
+  check("manifest version 1.4.30", m10.version === "1.4.30", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2554,7 +2554,7 @@ try {
       if (u.includes("opensubtitles-v3.strem.io")) return Promise.resolve(osStatus === 200 ? jsonR({ subtitles: os }) : new Response("x", { status: osStatus }));
       if (u.includes("api.subdl.com")) return Promise.resolve(jsonR(subdl || { status: true, subtitles: [] }));
       if (dl) return Promise.resolve(new Response("gone", { status: dl }));
-      return Promise.resolve(textResp(body ?? TXT_CAST));
+      return Promise.resolve(textResp(typeof body === "function" ? body(u) : (body ?? TXT_CAST)));
     };
     const l = console.log, e = console.error, lines = [];
     console.log = (...a) => lines.push(a.join(" ")); console.error = (...a) => lines.push(a.join(" "));
@@ -2599,6 +2599,57 @@ try {
     check("log sombra: archivo >48 KB con el MISMO veredicto -> sin 'pref48='", r.lines.some((l) => /resumen .* len=\d+k/.test(l)) && !r.lines.some((l) => l.includes("pref48=")), JSON.stringify(r.lines.filter((l) => l.includes("resumen")).map((l) => l.slice(-110))));
     r = await run("tt7790009", { os: [two[0]] });
     check("log sombra: archivo pequeño -> sin 'pref48='", !r.lines.some((l) => l.includes("pref48=")));
+  }
+
+  // Telemetría v1.4.30: `full=`, `rl=` y línea `langs`
+  {
+    const neutral = "1\n00:00:01,000 --> 00:00:03,000\nHola, buenos días a todos en la casa.\n\n";
+    const es = "1\n00:00:01,000 --> 00:00:03,000\nVosotros tenéis el coche aparcado y el ordenador está roto, tío.\n\n";
+    // ~227 KB: el castellano queda en ~53-55 KB, FUERA de las 3 ventanas (0-24, ~113±6, últimos 12 KB)
+    const mkBig = (salt) => neutral.repeat(800) + es.repeat(30) + neutral.repeat(2600) + `salt ${salt}\n`;
+    const sel = (b) => parseInt((hashContent(b).split(":")[1] || "0"), 36) % FULL_SHADOW_EVERY === 0;
+    let selBody = null, offBody = null;
+    for (let i = 0; i < 200 && (!selBody || !offBody); i++) { const b = mkBig(i); if (sel(b)) selBody ||= b; else offBody ||= b; }
+    check("premisa: el muestreo no ve el castellano y el texto completo sí", scoreText(selBody) === null && scoreText(selBody, {}, true)?.flag === "🇪🇸 Castellano", JSON.stringify([scoreText(selBody), scoreText(selBody, {}, true)?.flag]));
+    check("scoreText(whole=true) coincide con el muestreo en archivos <=48 KB", scoreText(TXT_CAST, {}, true)?.flag === scoreText(TXT_CAST)?.flag);
+    let r = await run("tt7790020", { os: [two[0]], body: selBody });
+    const rs = r.lines.filter((l) => l.includes("resumen"));
+    check("full=: archivo grande elegido por hash -> 'full=🇪🇸' y el veredicto servido sigue siendo el del muestreo (📄)", rs.some((l) => /📄[^|]*len=\d+k[^|]* full=🇪🇸/.test(l)) && !rs.some((l) => /Castellano[^|]*full=/.test(l)), JSON.stringify(rs.map((l) => l.slice(-120))));
+    r = await run("tt7790021", { os: [two[0]], body: offBody });
+    check("full=: archivo grande NO elegido por hash -> sin 'full='", r.lines.some((l) => /resumen .* len=\d+k/.test(l)) && !r.lines.some((l) => l.includes("full=")), JSON.stringify(r.lines.filter((l) => l.includes("resumen")).map((l) => l.slice(-100))));
+    r = await run("tt7790022", { os: [two[0]] });
+    check("full=: archivo <=48 KB -> nunca 'full='", !r.lines.some((l) => l.includes("full=")));
+
+    // línea `langs` + `rl=` (OS-V3)
+    const per = (u) => TXT_CAST + " " + u.slice(-8);
+    r = await run("tt7790023", { os: [
+      { id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" },
+      { id: "b", url: "https://subs5.strem.io/b.srt", lang: "es-419" },
+      { id: "c", url: "https://subs5.strem.io/c.srt", lang: "spl" },
+      { id: "d", url: "https://subs5.strem.io/d.srt", lang: "eng" },
+      { id: "e", url: "https://subs5.strem.io/e.srt", lang: "est" },
+    ], body: per });
+    const lg = r.lines.find((l) => l.startsWith("[subtitles] langs ")) || "";
+    check("langs: lista los idiomas crudos aceptados de OS-V3", /OS-V3 .*spa×1/.test(lg) && /OS-V3 .*es-419×1/.test(lg), lg);
+    check("langs: 'spl' (parece español, el filtro lo descarta) aparece en 'descartados'", /\(descartados: spl×1\)/.test(lg), lg);
+    check("langs: idiomas ajenos (eng, est) no ensucian el log", !/eng|est/.test(lg), lg);
+    check("langs: sin SubDL -> 'SubDL -'", /\| SubDL -$/.test(lg), lg);
+    check("rl=: solo las pistas con idioma crudo distinto de spa/es llevan 'rl='", r.lines.some((l) => l.includes("resumen") && l.includes(" rl=es-419")) && !r.lines.some((l) => l.includes(" rl=spa")), JSON.stringify(r.lines.filter((l) => l.includes("resumen")).map((l) => l.slice(-160))));
+    check("los códigos descartados siguen sin servirse (comportamiento intacto)", r.n === 2, String(r.n));
+
+    // SubDL: `language` o, en su defecto, `lang`
+    r = await run("tt7790024", { key: "clave_valida_123", subdl: { status: true, subtitles: [
+      { url: "/subtitle/1-1.zip", release_name: "A", language: "ES", file_id: 1 },
+      { url: "/subtitle/2-2.zip", release_name: "B", lang: "spanish", file_id: 2 },
+      { url: "/subtitle/3-3.zip", release_name: "C", language: "ES-LA", file_id: 3 },
+    ] }, body: per });
+    const lg2 = r.lines.find((l) => l.startsWith("[subtitles] langs ")) || "";
+    check("langs: SubDL registra language/lang crudos en minúsculas", /OS-V3 - \| SubDL /.test(lg2) && /es×1/.test(lg2) && /spanish×1/.test(lg2) && /es-la×1/.test(lg2), lg2);
+    check("rl=: SubDL 'es-la' se anota y 'es'/'spanish' no", r.lines.some((l) => l.includes("resumen") && l.includes(" rl=es-la")) && !r.lines.some((l) => / rl=(?:es|spanish)(?![-\w])/.test(l)), JSON.stringify(r.lines.filter((l) => l.includes("resumen")).map((l) => l.slice(-160))));
+    r = await run("tt7790025");
+    check("langs: sin pistas ni descartes -> no se emite la línea", !r.lines.some((l) => l.startsWith("[subtitles] langs ")));
+    const NEAR = [["spl", true], ["spn", true], ["ea", true], ["lat", true], ["mx", true], ["cast", true], ["es", true], ["est", false], ["eng", false], ["por", false], ["pob", false], ["fra", false]];
+    for (const [c, exp] of NEAR) check(`NEAR_ES_LANG_RE: '${c}' -> ${exp}`, NEAR_ES_LANG_RE.test(c) === exp);
   }
 }
 

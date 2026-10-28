@@ -1,6 +1,17 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.29
+// HispaSubs — Cloudflare Worker v1.4.30
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.30 (28/10/2026):
+//  - [TELEMETRÍA / FULL TEXT SHADOW SCORING] En 1 de cada 5 archivos >48 KB
+//    (muestreo determinista basado en hash de contenido), se ejecuta un análisis
+//    léxico del texto completo (`full=<emoji>`) en segundo plano sin alterar
+//    el veredicto servido al usuario. Permite comparar objetivamente la precisión
+//    del muestreo estratificado (3 ventanas) vs prefijo 48 KB vs archivo completo.
+//  - [TELEMETRÍA / IDIOMAS DE PROVEEDOR] Registro consolidado `[subtitles] langs`
+//    con los idiomas declarados por OpenSubtitles V3 y SubDL (incluyendo códigos
+//    descartados como `spl`), y etiqueta `rl=<lang>` en el resumen cuando el proveedor
+//    envía un código no estándar.
 //
 // v1.4.29 (27/10/2026):
 //  - [ANTI-SPAM / POLÍTICA POR FRASE DE CRÉDITO] Cambio de criterio en líneas débiles:
@@ -842,7 +853,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.29",
+  version: "1.4.30",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -877,13 +888,33 @@ const getManifest = (host) => ({
 // peor caso. SubDL —API comercial, más rápida— se queda en 2500 ms.
 const OS_V3_TIMEOUT_MS = 4500;
 
+// Idioma crudo que declara cada proveedor para una pista (solo TELEMETRÍA: el
+// router sigue sirviendo todo como `spa`). OS-V3 y SubDL agrupan el español en
+// un único cubo; estos helpers registran qué mandan de verdad para medir si su
+// etiqueta (p. ej. "es-419") aportaría algo frente al léxico.
+const OS_V3_ES_LANG_RE = /^(?:spa|esp|span|es)(?:[-_][a-z0-9]{2,8})?$/;
+// Códigos que PARECEN español pero el filtro descarta ("spl", "spn", "ea",
+// "lat…", "mx…", "cast…"; "est" = estonio, se excluye). Si OS-V3 enviara un
+// código latino propio, hoy se perdería en silencio: así queda a la vista.
+const NEAR_ES_LANG_RE = /^(?:sp[a-z]*|es(?!t$)[-_a-z0-9]*|ea|lat\w*|mx\w*|cast\w*)$/;
+const RAW_LANG_DEFAULTS = new Set(["", "spa", "es", "spanish", "español", "espanol"]);
+const normRawLang = (v) => String(v ?? "").toLowerCase().trim().slice(0, 16);
+const langTally = (subs) => {
+  const t = {};
+  for (const s of subs || []) { const k = s?.rawLang || "(vacío)"; t[k] = (t[k] || 0) + 1; }
+  return Object.entries(t).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}×${n}`).join(" ");
+};
+const tallyToString = (o) =>
+  Object.entries(o || {}).sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k}×${n}`).join(" ");
+
 const getOpenSubtitlesV3 = async (type, fullId) => {
   try {
     const data = await fetchJSON(
       `https://opensubtitles-v3.strem.io/subtitles/${type}/${encodeURIComponent(fullId)}.json`,
       OS_V3_TIMEOUT_MS
     );
-    return (data.subtitles || [])
+    const nearMiss = {};
+    const out = (data.subtitles || [])
       // Guard por entrada: una sub sin URL ya no invalida toda la fuente.
       .filter((sub) => sub && isHttpUrl(sub.url))
       .filter((sub) => {
@@ -891,12 +922,15 @@ const getOpenSubtitlesV3 = async (type, fullId) => {
         // "esp", "span"): el resto de idiomas se descarta. Antes solo
         // aceptaba includes("spa") o "es" exacto.
         const l = (sub.lang || "").toLowerCase().trim();
-        return /^(?:spa|esp|span|es)(?:[-_][a-z0-9]{2,8})?$/.test(l);
+        if (OS_V3_ES_LANG_RE.test(l)) return true;
+        if (NEAR_ES_LANG_RE.test(l)) nearMiss[l] = (nearMiss[l] || 0) + 1;
+        return false;
       })
       .map((sub) => ({
         id: sub.id || `os_${hashStr(sub.url)}`,
         url: sub.url,
         lang: "spa",
+        rawLang: normRawLang(sub.lang),
         source: "OS-V3",
         // `movieReleaseName` es el TÍTULO ("Inception (2010)"), no el release: las
         // etiquetas (AMZN, WEB-DL…) viven en el nombre del fichero. Con el título
@@ -905,6 +939,10 @@ const getOpenSubtitlesV3 = async (type, fullId) => {
         releaseGroup: sub.releaseGroup || "",
         releaseFormat: sub.releaseFormat || "",
       }));
+    // Propiedad auxiliar de la lista (mismo patrón que `unusable` en SubDL):
+    // no es un elemento, así que el spread del router la ignora.
+    out.nearMiss = nearMiss;
+    return out;
   } catch (e) {
     console.error("[OS-V3]", e.message);
     // Se propaga el error: promesa RECHAZADA en allSettled. Antes se devolvía
@@ -1003,6 +1041,7 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
           id: sub.file_id ? `sdl_${sub.file_id}` : `sdl_${hashStr(dlUrl)}_${i}`,
           url: dlUrl,
           lang: "spa",
+          rawLang: normRawLang(sub.language ?? sub.lang),
           source: "SubDL",
           releaseName: sub.release_name || sub.name || "",
           releaseGroup: "",
@@ -1178,6 +1217,8 @@ const MAX_SCORE_BYTES = 48 * 1024; // 48 KB (24 KB cabeza + 12 KB centro + 12 KB
 const SCORE_HEAD_BYTES = 24 * 1024;
 const SCORE_MID_BYTES = 12 * 1024;
 const SCORE_TAIL_BYTES = 12 * 1024;
+// Telemetría `full=`: 1 de cada N archivos >48 KB se puntúa también entero.
+const FULL_SHADOW_EVERY = 5;
 
 // Extrae una muestra representativa de hasta 48 KB repartida en 3 ventanas
 // disjuntas (cabeza, centro y cola) separadas por salto de línea para no unir
@@ -1205,9 +1246,12 @@ const sampleScoreText = (rawText) => {
 //
 // Optimización v1.4.16 / v1.4.25: se acota a MAX_SCORE_BYTES (48 KB) mediante
 // muestreo estratificado cabeza+centro+cola, evitando recorrer 300 KB con 5 regexes globales.
-const scoreText = (rawText, diag = {}) => {
+//
+// `whole = true` (solo telemetría `full=`): puntúa el texto COMPLETO sin
+// muestrear. El servidor nunca lo usa para decidir qué sirve.
+const scoreText = (rawText, diag = {}, whole = false) => {
   if (typeof rawText !== "string" || !rawText) return null;
-  const text = sampleScoreText(rawText);
+  const text = whole ? rawText : sampleScoreText(rawText);
 
   // Guarda contra portugués mal etiquetado como español: ≥10 "ã"/"õ" Y ≥0,2 %
   // de los caracteres (un nombre como "João"/"São Paulo" no debe tumbar un
@@ -1521,15 +1565,30 @@ const classifySubtitle = async (
     // Log SOMBRA del muestreo (3 ventanas) en archivos >48 KB: si leer solo los
     // primeros 48 KB (lo que hacía la v1.4.24) habría dado OTRO veredicto, se anota
     // `pref48=<emoji>`. Mide en producción cuántas pistas cambian por el muestreo
-    // (coste ~0,3 ms por archivo grande); no afecta al veredicto servido.
+    // (coste ~0,5 ms por archivo grande); no afecta al veredicto servido.
     let pref48Tag = "";
     if (text.length > MAX_SCORE_BYTES) {
       const prefFlag = scoreText(text.slice(0, MAX_SCORE_BYTES), {})?.flag ?? "📄";
       const servedFlag = scored?.flag ?? "📄";
       if (prefFlag !== servedFlag) pref48Tag = ` pref48=${prefFlag.split(" ")[0]}`;
     }
+    // Log sombra `full=<emoji>`: en 1 de cada FULL_SHADOW_EVERY archivos >48 KB
+    // (elegidos por hash del contenido: determinista, sin Math.random) se puntúa
+    // el texto COMPLETO (<=300 KiB) y se anota su veredicto. Permite comparar el
+    // veredicto servido (muestreo) y el del prefijo 48 KB (`pref48=`, ausente =
+    // igual que el servido) contra el del archivo entero. Solo telemetría.
+    const contentHash = hashContent(text);
+    let fullTag = "";
+    if (text.length > MAX_SCORE_BYTES && parseInt(contentHash.split(":")[1] || "0", 36) % FULL_SHADOW_EVERY === 0) {
+      const fullFlag = scoreText(text, {}, true)?.flag ?? "📄";
+      fullTag = ` full=${fullFlag.split(" ")[0]}`;
+    }
+    // `rl=<idioma crudo>` solo si el proveedor declara algo distinto de "spa"/"es":
+    // permite cruzar su etiqueta con el veredicto léxico de la misma pista.
+    const rawLang = typeof sub.rawLang === "string" ? sub.rawLang : "";
+    const rlTag = RAW_LANG_DEFAULTS.has(rawLang) ? "" : ` rl=${rawLang}`;
     const brief = (flag) =>
-      `${flag}${isPlatform ? " [PLAT]" : ""}${sdh ? " SDH" : ""} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0} len=${lenTag}${pref48Tag}${
+      `${flag}${isPlatform ? " [PLAT]" : ""}${sdh ? " SDH" : ""} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0} len=${lenTag}${pref48Tag}${fullTag}${rlTag}${
         diag.reason ? ` (${diag.reason})` : ""
       }`;
     if (!scored) {
@@ -1537,7 +1596,7 @@ const classifySubtitle = async (
       // el texto llegó y se analizó sin error → no es fallo transitorio → TTL normal.
       const u = unclassified(sub, finalUrl, false, sdh);
       u[SCORE] = brief("📄");
-      u[CONTENT_HASH] = hashContent(text);
+      u[CONTENT_HASH] = contentHash;
       return u;
     }
 
@@ -1547,7 +1606,7 @@ const classifySubtitle = async (
       lang: LANG_ISO_ES,
       label: `${scored.flag}${sdhTag} (${sub.source})`,
       [SCORE]: brief(scored.flag),
-      [CONTENT_HASH]: hashContent(text),
+      [CONTENT_HASH]: contentHash,
       [IS_PLATFORM]: isPlatform,
       [RELEASE_SOURCE]: releaseSourceOf(sub),
     };
@@ -1584,7 +1643,7 @@ const getCanonicalConfigStr = (config) =>
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf };
+export { FULL_SHADOW_EVERY, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1753,6 +1812,21 @@ export default {
           ...(osSubs.status === "fulfilled" ? osSubs.value : []),
           ...(sdlSubs.status === "fulfilled" ? sdlSubs.value : []),
         ];
+
+        // Telemetría de idiomas: qué declara cada proveedor para sus pistas
+        // (`rawLang`) y qué códigos "parecidos a español" descartó el filtro de
+        // OS-V3 ("descartados"). Solo se emite si hay pistas o descartes.
+        {
+          const osList = osSubs.status === "fulfilled" ? osSubs.value : [];
+          const sdlList = sdlSubs.status === "fulfilled" ? sdlSubs.value : [];
+          const near = tallyToString(osList.nearMiss);
+          if (osList.length || sdlList.length || near) {
+            console.log(
+              `[subtitles] langs ${type}/${fullId}: OS-V3 ${langTally(osList) || "-"}${near ? ` (descartados: ${near})` : ""}` +
+                ` | SubDL ${langTally(sdlList) || "-"}`
+            );
+          }
+        }
 
         // Descarte de entradas que no se pueden SERVIR: formatos que nadie
         // descomprime (.rar y cía) y .zip cuyo host no está en la allowlist
