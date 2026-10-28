@@ -366,10 +366,11 @@ try {
   check("v1.3.1: lista con clasificación fallida -> TTL corto 60s (no 2h)",
     res.headers.get("cache-control") === "public, max-age=60", res.headers.get("cache-control"));
 
-  // 10b) Caché negativa: la lista vacía lleva TTL corto (60 s).
+  // 10b) Caché negativa: la lista vacía SIN fallos (ambas fuentes respondieron) lleva
+  // TTL de 300 s (EMPTY_TTL_S); con cualquier fallo sigue siendo 60 s (ver 10c y 33).
   res = await get("/subtitles/movie/tt8888888.json"); // ambas fuentes -> []
-  check("v1.3.1: lista vacía con Cache-Control 60s (caché negativa)",
-    res.headers.get("cache-control") === "public, max-age=60", res.headers.get("cache-control"));
+  check("v1.3.1: lista vacía limpia con Cache-Control 300s (caché negativa)",
+    res.headers.get("cache-control") === "public, max-age=300", res.headers.get("cache-control"));
 
   // 10c-lote2) Fallo de RED bajando una sub -> respuesta degradada -> 60 s
   // (antes se cacheaba 2 h con la entrada rota).
@@ -382,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.28", m10.version === "1.4.28", m10.version);
+  check("manifest version 1.4.29", m10.version === "1.4.29", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -590,9 +591,14 @@ try {
   check("v1.4.2 spam débil (2 líneas distintas) -> descarta",
     spamVerdict("Traducido por Argenteam\nwww.opensubtitles.org").discard === true,
     JSON.stringify(spamVerdict("Traducido por Argenteam\nwww.opensubtitles.org")));
-  check("v1.4.2 spam débil (crédito + email, 2 líneas) -> descarta",
-    spamVerdict("Subtítulos por MrX\nEscríbenos a promo@casino-gana.com").discard === true,
+  // Política de créditos: frase de crédito + UNA línea con correo/sitio ajeno es un
+  // crédito normal (se conserva); sin frase de crédito, correo + sitio descarta.
+  check("v1.4.2 spam débil (crédito + email, 2 líneas) -> se conserva (crédito de traductor)",
+    spamVerdict("Subtítulos por MrX\nEscríbenos a promo@casino-gana.com").discard === false,
     JSON.stringify(spamVerdict("Subtítulos por MrX\nEscríbenos a promo@casino-gana.com")));
+  check("v1.4.2 spam débil (correo + sitio sin frase de crédito) -> descarta",
+    spamVerdict("Escríbenos a promo@casino-gana.com\nwww.casino-gana.com").discard === true,
+    JSON.stringify(spamVerdict("Escríbenos a promo@casino-gana.com\nwww.casino-gana.com")));
 
   // --- Guard anti-falsos-positivos: diálogo legítimo con palabras "peligrosas" ---
   const limpios = [
@@ -693,11 +699,11 @@ try {
   check("v1.4.3: 'no.Me' + 'todo.Es' ya no son 2 líneas débiles",
     spamVerdict("no.Me importa lo que digas\ntodo.Es posible").discard === false,
     JSON.stringify(spamVerdict("no.Me importa lo que digas\ntodo.Es posible")));
-  // ...pero los créditos/URLs reales de dominios DESCONOCIDOS siguen descartando en pareja.
-  // (v1.4.23: el par crédito + web de Argenteam ya NO descarta; ver sección 30.)
-  check("v1.4.3: 2 créditos/URL reales siguen descartando",
-    spamVerdict("Subtitulado por Leo\nwww.bet-win.com").discard === true,
-    JSON.stringify(spamVerdict("Subtitulado por Leo\nwww.bet-win.com")));
+  // ...pero dos URLs de dominios DESCONOCIDOS sin frase de crédito siguen descartando.
+  // (El par "Subtitulado por" + UNA web ya no descarta; ver sección 33.)
+  check("v1.4.3: 2 URLs ajenas sin crédito siguen descartando",
+    spamVerdict("www.bet-win.com\nwww.darkville.mx").discard === true,
+    JSON.stringify(spamVerdict("www.bet-win.com\nwww.darkville.mx")));
 
   // --- Léxico: fuera raíces abiertas; el dialecto exige término fuerte ---
   for (const w of ["conducta", "conductor", "conductividad", "estaciones", "estacionario", "Jodie", "Jodorowsky", "Ching-whatever"]) {
@@ -1166,8 +1172,8 @@ try {
   try {
     res = await get("/subtitles/movie/tt7770023.json");
     const allSpam = (await res.json()).subtitles || [];
-    check("v1.4.6 todos spam (0 pistas resultantes) -> caché negativa 60s (no 7200s)",
-      allSpam.length === 0 && res.headers.get("cache-control") === "public, max-age=60",
+    check("v1.4.6 todos spam (0 pistas, sin fallos) -> caché negativa 300s (no 7200s)",
+      allSpam.length === 0 && res.headers.get("cache-control") === "public, max-age=300",
       `len=${allSpam.length} cc=${res.headers.get("cache-control")}`);
   } finally {
     globalThis.fetch = origFetch17;
@@ -2295,9 +2301,9 @@ try {
     ["SubDivX + 'corregido por'", "corregido por\nwww.subdivx.com", false],
     ["solo créditos sin web", "Traducido por Juan\nCorregido por Ana", false],
     // lo que SIGUE siendo spam
-    ["dominio desconocido + crédito", "Subtítulos por\nwww.bet-win.com", true],
+    ["dominio desconocido + crédito (UNA web: crédito normal)", "Subtítulos por\nwww.bet-win.com", false],
     ["dominio desconocido + comunidad", "wWw.Darkville.Com.Mx\nwww.SUBTITULOS.es", true],
-    ["correo personal + crédito", "Subtitulado por\nLeoFN123@hotmail.com", true],
+    ["correo personal + crédito (UNA línea: crédito normal)", "Subtitulado por\nLeoFN123@hotmail.com", false],
     ["OpenSubtitles dos líneas (marca de agua)", "www.OpenSubtitles.org\nwww.OpenSubtitles.org", true],
     ["YTS", "YTS\nwww.yts.mx", true],
     ["comunidad + anuncio desconocido", "www.argenteam.net\nwww.casino-gratis.top", true],
@@ -2394,8 +2400,8 @@ try {
   const spoofCases = [
     ["dominio compuesto con guion (www.casino-argenteam.top)", "Subtitulado por www.casino-argenteam.top\nTraducido por www.casino-argenteam.top", true],
     ["subdominio falso (argenteam.casino-ya.top)", "Subtítulos por argenteam.casino-ya.top\nCorregido por subdivx.apuestas.vip", true],
-    ["query/afiliado con nombre de comunidad (https://bet-win.top/?ref=argenteam)", "Subtítulos por\nhttps://bet-win.top/?ref=argenteam", true],
-    ["TLD falso de comunidad (www.argenteam.bet)", "Subtítulos por\nwww.argenteam.bet", true],
+    ["query/afiliado con nombre de comunidad (x2)", "Subtítulos por https://bet-win.top/?ref=argenteam\nCorregido por https://bet-win.top/?ref=argenteam", true],
+    ["TLD falso de comunidad (x2)", "Subtítulos por www.argenteam.bet\nCorregido por www.argenteam.bet", true],
     ["ruta legítima de comunidad (https://www.subdivx.com/usuarios/juan)", "Subtítulos por\nhttps://www.subdivx.com/usuarios/juan", false],
     ["nombre de comunidad entre paréntesis ([Argenteam] / (SubDivX))", "Subtítulos por [Argenteam]\nSincronizado por (SubDivX)", false],
     // El punto final de frase tras el nombre/dominio no rompe la exención
@@ -2457,7 +2463,7 @@ try {
     // publicidad real vista en producción: sigue descartando
     ["Instagram (x2)", "https://www.instagram.com/vishal_sahani2\nhttps://www.instagram.com/vishal_sahani2", true],
     ["dos correos personales", "moviecollector@hotmail.com\ntuxedomex@hotmail.com", true],
-    ["crédito + blogspot ajeno", "Traducido por\nTranslatorsIncSubs.blogspot.com.es", true],
+    ["crédito + blogspot ajeno (UNA línea: caso real de producción, se conserva)", "Traducido por\nTranslatorsIncSubs.blogspot.com.es", false],
   ];
   for (const [name, head, expected] of cases) {
     const v = spamVerdict(srtWith(head));
@@ -2506,6 +2512,93 @@ try {
     check("27/10 resumen: archivo pequeño -> len=1k como mínimo", small.some((l) => /resumen .* len=\d+k(?!\+)/.test(l)), JSON.stringify(small.filter((l) => l.includes("resumen")).map((l) => l.slice(-120))));
     const big = await runReq("tt7780205", { body: padTo(400 * 1024) });
     check("27/10 resumen: archivo >300 KB -> len=...k+ (truncado)", big.some((l) => /resumen .* len=\d+k\+/.test(l)), JSON.stringify(big.filter((l) => l.includes("resumen")).map((l) => l.slice(-120))));
+  }
+}
+
+// 33) Política de créditos por frase, TTL de respuestas sin pistas y log sombra del muestreo (datos de producción 27/10)
+{
+  const srtWith = (head) =>
+    `1\n00:00:01,000 --> 00:00:02,000\n${head}\n\n2\n00:00:03,000 --> 00:00:04,000\nHola chaval, ¿cómo estás?\n\n` +
+    "3\n00:00:05,000 --> 00:00:06,000\nVamos a por el coche.\n\n".repeat(40);
+  const cases = [
+    // bloques REALES descartados por error en producción: ahora se conservan
+    ["Sincronizado por + TranslatorsIncSubs", "sincronizado por\nTranslatorsIncSubs.blogspot.com.es", false],
+    ["SubAdictos + 'sincronizado por'", "Www.SubAdictos.Net\nsincronizado por", false],
+    ["tres líneas: dos créditos + sitio (darkalien.tk)", "Traducido por\nCorregido por\nwww.darkalien.tk", false],
+    ["crédito + comunidad + otro sitio (tvsubtitles)", "Subtítulos por\nwww.argenteam.net\nwww.tvsubtitles.net", false],
+    ["crédito + correo de traductor (hotmail)", "Sincronizado por\ndamian_nohales@hotmail.com", false],
+    ["crédito + correo de traductor (gmail)", "Subtitulos por\ntelgeorge@gmail.com", false],
+    ["crédito oficial WGBH Access", "Subtitulado por\naccess.wgbh.org", false],
+    // lo que SIGUE descartando
+    ["dos URLs iguales sin crédito (sfile.ydy.com)", "http://sfile.ydy.com\nhttp://sfile.ydy.com", true],
+    ["marca de agua OpenSubtitles (x2)", "www.OpenSubtitles.org\nwww.OpenSubtitles.org", true],
+    ["marca de agua OpenSubtitles dentro de un crédito", "Subtítulos por\nwww.OpenSubtitles.org", true],
+    ["marca de agua YTS dentro de un crédito", "Subtitulado por\nYTS.MX", true],
+    ["Instagram (x2)", "https://www.instagram.com/vishal_sahani2\nhttps://www.instagram.com/vishal_sahani2", true],
+    ["dos líneas con frase de crédito Y dominio ajeno", "Subtitulado por www.casino-ya.top\nTraducido por www.casino-ya.top", true],
+    ["crédito + DOS sitios ajenos", "Subtítulos por\nwww.pelis-gratis.top\nwww.series-gratis.top", true],
+    ["comunidad + anuncio sin frase de crédito", "www.argenteam.net\nwww.casino-gratis.top", true],
+    ["término fuerte dentro de un crédito", "Subtítulos por\nApuesta en bet365 ahora", true],
+  ];
+  for (const [name, head, expected] of cases) {
+    const v = spamVerdict(srtWith(head));
+    check(`política créditos: ${name} -> ${expected ? "descarta" : "conserva"}`, v.discard === expected, JSON.stringify(v));
+  }
+
+  const jsonR = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
+  const run = async (id, { os = [], osStatus = 200, subdl = null, dl = null, key = "", body = null } = {}) => {
+    const prevC = mockGlobal("caches", { default: { match: async () => undefined, put: async () => {} } });
+    const prevF = globalThis.fetch;
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) return Promise.resolve(osStatus === 200 ? jsonR({ subtitles: os }) : new Response("x", { status: osStatus }));
+      if (u.includes("api.subdl.com")) return Promise.resolve(jsonR(subdl || { status: true, subtitles: [] }));
+      if (dl) return Promise.resolve(new Response("gone", { status: dl }));
+      return Promise.resolve(textResp(body ?? TXT_CAST));
+    };
+    const l = console.log, e = console.error, lines = [];
+    console.log = (...a) => lines.push(a.join(" ")); console.error = (...a) => lines.push(a.join(" "));
+    let r, j;
+    try {
+      const pre = key ? `/${b64url({ subdlKey: key })}` : "";
+      r = await worker.fetch(new Request(`${base}${pre}/subtitles/movie/${id}.json`), {}, { waitUntil: () => {} });
+      j = await r.json();
+    } finally { console.log = l; console.error = e; globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
+    return { ttl: r.headers.get("cache-control"), n: j.subtitles.length, lines };
+  };
+  const two = [{ id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" }, { id: "b", url: "https://subs5.strem.io/b.srt", lang: "spa" }];
+
+  // TTL de respuestas sin pistas
+  {
+    let r = await run("tt7790001");
+    check("TTL vacía: ambas fuentes responden [] -> 300 s", r.n === 0 && r.ttl === "public, max-age=300", JSON.stringify(r.ttl));
+    r = await run("tt7790002", { osStatus: 500 });
+    check("TTL vacía: OS-V3 falla (HTTP 500) -> 60 s", r.n === 0 && r.ttl === "public, max-age=60", JSON.stringify(r.ttl));
+    r = await run("tt7790003", { key: "clave_valida_123", subdl: { status: false, error: "Invalid API key" } });
+    check("TTL vacía: SubDL con clave rechazada (no utilizable) -> 60 s", r.n === 0 && r.ttl === "public, max-age=60", JSON.stringify(r.ttl));
+    r = await run("tt7790004", { os: two, dl: 404 });
+    check("TTL sin pistas: todas las candidatas con enlace muerto (404), sin fallos -> 300 s", r.n === 0 && r.ttl === "public, max-age=300", JSON.stringify([r.n, r.ttl]));
+    r = await run("tt7790005", { os: two, dl: 500 });
+    check("TTL sin pistas: descargas con HTTP 500 (fallo transitorio) -> 60 s", r.n === 0 && r.ttl === "public, max-age=60", JSON.stringify([r.n, r.ttl]));
+    r = await run("tt7790006", { os: two });
+    check("TTL con pistas servidas sigue siendo 7200 s", r.n >= 1 && r.ttl === "public, max-age=7200", JSON.stringify([r.n, r.ttl]));
+  }
+
+  // Log sombra pref48=
+  {
+    const neutral = "1\n00:00:01,000 --> 00:00:03,000\nHola, buenos días a todos en la casa.\n\n";
+    const es = "1\n00:00:01,000 --> 00:00:03,000\nVosotros tenéis el coche aparcado y el ordenador está roto, tío.\n\n";
+    const diff = neutral.repeat(800) + es.repeat(8); // ~54 KB: el prefijo de 48 KB no ve el castellano de la cola
+    const prefFlag = scoreText(diff.slice(0, 48 * 1024))?.flag ?? "📄";
+    const servedFlag = scoreText(diff)?.flag ?? "📄";
+    check("premisa del test: el muestreo cambia el veredicto frente al prefijo de 48 KB", prefFlag !== servedFlag, `${prefFlag} vs ${servedFlag}`);
+    let r = await run("tt7790007", { os: [two[0]], body: diff });
+    check("log sombra: archivo >48 KB con veredicto distinto -> 'pref48=' en resumen", r.lines.some((l) => /resumen .* len=\d+k pref48=\S+/.test(l)), JSON.stringify(r.lines.filter((l) => l.includes("resumen")).map((l) => l.slice(-110))));
+    const same = TXT_CAST + " ".repeat(60 * 1024); // los términos están al principio: mismo veredicto
+    r = await run("tt7790008", { os: [two[0]], body: same });
+    check("log sombra: archivo >48 KB con el MISMO veredicto -> sin 'pref48='", r.lines.some((l) => /resumen .* len=\d+k/.test(l)) && !r.lines.some((l) => l.includes("pref48=")), JSON.stringify(r.lines.filter((l) => l.includes("resumen")).map((l) => l.slice(-110))));
+    r = await run("tt7790009", { os: [two[0]] });
+    check("log sombra: archivo pequeño -> sin 'pref48='", !r.lines.some((l) => l.includes("pref48=")));
   }
 }
 

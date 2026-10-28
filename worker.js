@@ -1,6 +1,20 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.28
+// HispaSubs — Cloudflare Worker v1.4.29
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.29 (27/10/2026):
+//  - [ANTI-SPAM / POLÍTICA POR FRASE DE CRÉDITO] Cambio de criterio en líneas débiles:
+//    cuando una pista incluye una fórmula de autoría ("Traducido por", "Sincronizado por"...),
+//    una única línea con dominio o correo ajeno se considera crédito de traductor legítimo
+//    y se conserva. Solo se descarta si hay 2 o más líneas ajenas, marcas de agua comerciales
+//    (OpenSubtitles / YTS) o términos de spam fuerte (apuestas, Telegram). Rescata 21 de cada
+//    23 descartes en producción (TranslatorsIncSubs, SubAdictos, darkalien, correos, etc.).
+//  - [TTL / RESPUESTAS VACÍAS SIN FALLOS] Se incrementa a 300 s (5 min) el TTL de caché
+//    negativa para respuestas sin subtítulos cuando ambas fuentes respondieron bien o cuando
+//    todas las pistas eran 404/duplicadas sin fallos de red. Evita el 27% de recálculos y
+//    ráfagas de 8 descargas muertas repetidas cada minuto.
+//  - [TELEMETRÍA / LOG SOMBRA PREF48] Registro `pref48=<emoji>` en la línea `resumen`
+//    cuando el muestreo estratificado en archivos >48 KB difiere del prefijo de 48 KB.
 //
 // v1.4.28 (27/10/2026):
 //  - [ANTI-SPAM / CRÉDITOS] Ampliación de comunidades legítimas con dominios
@@ -828,7 +842,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.28",
+  version: "1.4.29",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1315,6 +1329,10 @@ const SPAM_CREDIT_LINE = /(?<![\p{L}\p{N}_])(?:argenteam|subdivx|tusubtitulo|sub
 // no impide la exención; un punto seguido de letra/número ("www.argenteam.net.bet-win.top") sí.
 const SPAM_CREDIT_NAME_TOKEN = /(?<![\p{L}\p{N}_.-])(?:https?:\/\/)?(?:www\.)?(?:argenteam(?:\.net)?|(?:asia-team|subs-team)(?:\.(?:net|tv))?|(?:subdivx|tusubtitulo|elrincondelsub|addic7ed|yyets)(?:\.com)?|forominiseries(?:\.net)?|subtitulamos(?:\.tv)?|allsubs(?:\.org)?|subtitulos\.es)(?:\/[a-z0-9/_-]*)?(?![\p{L}\p{N}_?=&-]|\.[\p{L}\p{N}])/giu;
 const SPAM_CREDIT_PHRASE = /(?<![\p{L}\p{N}_])(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])/giu;
+// Versiones NO globales para .test() (las /g guardan lastIndex entre llamadas).
+const SPAM_CREDIT_PHRASE_TEST = new RegExp(SPAM_CREDIT_PHRASE.source, "iu");
+// Marca de agua comercial: nunca se exime, ni siquiera dentro de un crédito.
+const SPAM_WATERMARK = /(?<![\p{L}\p{N}_])(?:opensubtitles|yts)(?![\p{L}\p{N}_])/iu;
 const isCreditOnlyLine = (line) =>
   SPAM_CREDIT_LINE.test(line) &&
   !SPAM_WEAK_LINE.test(line.replace(SPAM_CREDIT_NAME_TOKEN, " ").replace(SPAM_CREDIT_PHRASE, " "));
@@ -1371,22 +1389,36 @@ const spamVerdict = (text, truncated = false) => {
   const mEdge = SPAM_STRONG_EDGE.exec(edgeLines.join("\n"));
   if (mEdge) return { discard: true, reason: "fuerte", match: mEdge[0].slice(0, 60) };
 
+  // Política de líneas débiles (v. datos de producción 27/10, ~1900 descargas en
+  // 3 ventanas): casi todos los descartes eran créditos de traductores
+  // ("Sincronizado por" + su web o su correo; 21 de 23 en la última ventana,
+  // con una cola larga de sitios que ninguna lista de nombres cubre) y solo
+  // ~1 de cada 8 parecía publicidad real. Por eso:
+  //  - SIN frase de crédito: >=2 líneas débiles y alguna que no sea crédito de
+  //    comunidad conocida -> descarta (URL+URL, URL+correo, Instagram, enlaces).
+  //  - CON frase de crédito ("Traducido por", "Sincronizado por"…): una sola
+  //    línea con sitio/correo ajeno es un crédito normal y se conserva; hacen
+  //    falta >=2 líneas ajenas para descartar.
+  //  - Marca de agua de OpenSubtitles/YTS: descarta siempre que haya >=2 líneas débiles.
+  // Los términos FUERTES (apuestas, Telegram…) se evalúan antes y no cambian.
   const weakMatches = [];
-  let weakNonCredit = 0;
+  let adLines = 0; // líneas débiles que NO son solo crédito de comunidad conocida
+  let hasCreditPhrase = false;
+  let hasWatermark = false;
   for (const line of edgeLines) {
     const mWeak = SPAM_WEAK_LINE.exec(line);
-    if (mWeak) {
-      weakMatches.push(mWeak[0].slice(0, 40));
-      // ¿La línea es solo un crédito de comunidad conocida? (ver SPAM_CREDIT_LINE)
-      if (!isCreditOnlyLine(line)) weakNonCredit += 1;
-      if (weakMatches.length >= 2 && weakNonCredit >= 1) {
-        return {
-          discard: true,
-          reason: `${weakMatches.length} líneas débiles`,
-          match: weakMatches.join(" + "),
-        };
-      }
-    }
+    if (!mWeak) continue;
+    weakMatches.push(mWeak[0].slice(0, 40));
+    if (!isCreditOnlyLine(line)) adLines += 1;
+    if (SPAM_CREDIT_PHRASE_TEST.test(line)) hasCreditPhrase = true;
+    if (SPAM_WATERMARK.test(line)) hasWatermark = true;
+  }
+  if (weakMatches.length >= 2 && (hasWatermark || (hasCreditPhrase ? adLines >= 2 : adLines >= 1))) {
+    return {
+      discard: true,
+      reason: `${weakMatches.length} líneas débiles`,
+      match: weakMatches.slice(0, 4).join(" + "),
+    };
   }
   return { discard: false, reason: "", match: "" };
 };
@@ -1396,6 +1428,16 @@ const spamVerdict = (text, truncated = false) => {
 // candidatos para poder rellenar el cupo cuando los primeros son spam (ver
 // bucle del router). Ver también SPAM_FILTER=log para medir sin descartar.
 const ANALYSIS_BUDGET_PER_SOURCE = 5;
+
+// TTL de una respuesta SIN pistas cuando no hubo ningún fallo (ambas fuentes
+// respondieron bien y no hay clave rechazada): "no hay subtítulos" es el
+// resultado normal para muchos capítulos. En producción (3 h): el 43 % de las
+// respuestas en frío estaban vacías y el 48 % de esas eran el mismo título
+// recalculado (mediana de 174 s entre repeticiones); además hubo títulos cuyas
+// 8 candidatas eran enlaces muertos (404) y se volvían a descargar las 8 en cada
+// petición. Con 300 s se evita ~27 % de esos recálculos. Con CUALQUIER fallo se
+// mantiene 60 s para recuperarse rápido.
+const EMPTY_TTL_S = 300;
 const ANALYSIS_FETCH_PER_SOURCE = 8;
 
 // Presupuesto temporal compartido entre las 2 oleadas de clasificación
@@ -1476,8 +1518,18 @@ const classifySubtitle = async (
     // arriba); "+" si se cortó en MAX_ANALYZE_BYTES. Permite separar en los logs
     // los archivos <=48 KB (se puntúan enteros) de los >48 KB (muestreo 3 ventanas).
     const lenTag = `${Math.ceil(text.length / 1024)}k${truncated ? "+" : ""}`;
+    // Log SOMBRA del muestreo (3 ventanas) en archivos >48 KB: si leer solo los
+    // primeros 48 KB (lo que hacía la v1.4.24) habría dado OTRO veredicto, se anota
+    // `pref48=<emoji>`. Mide en producción cuántas pistas cambian por el muestreo
+    // (coste ~0,3 ms por archivo grande); no afecta al veredicto servido.
+    let pref48Tag = "";
+    if (text.length > MAX_SCORE_BYTES) {
+      const prefFlag = scoreText(text.slice(0, MAX_SCORE_BYTES), {})?.flag ?? "📄";
+      const servedFlag = scored?.flag ?? "📄";
+      if (prefFlag !== servedFlag) pref48Tag = ` pref48=${prefFlag.split(" ")[0]}`;
+    }
     const brief = (flag) =>
-      `${flag}${isPlatform ? " [PLAT]" : ""}${sdh ? " SDH" : ""} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0} len=${lenTag}${
+      `${flag}${isPlatform ? " [PLAT]" : ""}${sdh ? " SDH" : ""} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0} len=${lenTag}${pref48Tag}${
         diag.reason ? ` (${diag.reason})` : ""
       }`;
     if (!scored) {
@@ -1734,11 +1786,13 @@ export default {
         // petición del mismo título.
         if (deduped.length === 0) {
           console.log(`[subtitles] 0 resultados para ${type}/${fullId}`);
-          const empty = jsonResponse({ subtitles: [] }, 60);
+          const emptyUnusable = sdlSubs.status === "fulfilled" && sdlSubs.value?.unusable === true;
+          // Vacía "limpia" (ambas fuentes respondieron y SubDL no está rechazado): TTL largo.
+          const answeredOk = osSubs.status === "fulfilled" && sdlSubs.status === "fulfilled" && !emptyUnusable;
+          const empty = jsonResponse({ subtitles: [] }, answeredOk ? EMPTY_TTL_S : 60);
           // Igual que el `put` final: con SubDL "no utilizable" (clave falsa o
           // rechazada) la lista vacía es culpa de ESA clave; escribirla en el
           // `k_subdl` compartido dejaba sin SubDL a los demás durante 60 s.
-          const emptyUnusable = sdlSubs.status === "fulfilled" && sdlSubs.value?.unusable === true;
           cachePut(ctx, canonicalConfigStr && emptyUnusable ? new Request(keyCacheUrl) : cacheReq, empty);
           return empty;
         }
@@ -1876,9 +1930,15 @@ export default {
           (src) => failed[src] > 0 && kept[src] < ANALYSIS_BUDGET_PER_SOURCE
         );
         const sourceFailed = osSubs.status === "rejected" || sdlSubs.status === "rejected";
-        const ttl = anyDegradedSource || sourceFailed || subtitles.length === 0 ? 60 : 7200;
-        if (ttl !== 7200) {
+        // Sin pistas Y sin fallos (todo descartado por spam/404/duplicado): TTL largo,
+        // salvo que SubDL esté "no utilizable" (clave rechazada: puede arreglarse antes).
+        const sdlUnusableLate = sdlSubs.status === "fulfilled" && sdlSubs.value?.unusable === true;
+        const degraded = anyDegradedSource || sourceFailed;
+        const ttl = degraded ? 60 : subtitles.length === 0 ? (sdlUnusableLate ? 60 : EMPTY_TTL_S) : 7200;
+        if (ttl === 60) {
           console.log(`[subtitles] respuesta degradada (fallo de clasificación o fuente): TTL ${ttl}s`);
+        } else if (ttl !== 7200) {
+          console.log(`[subtitles] sin pistas tras analizar y sin fallos: TTL ${ttl}s`);
         }
         const platformCount = subtitles.filter((s) => s[IS_PLATFORM]).length;
         const webCount = subtitles.filter((s) => s[RELEASE_SOURCE] === "web").length;
