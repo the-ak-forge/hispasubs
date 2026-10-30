@@ -1,6 +1,24 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.30
+// HispaSubs — Cloudflare Worker v1.4.31
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.31 (29/10/2026):
+//  - [OS-V3 / spl, spn] Se aceptan los códigos regionales `spl` y `spn` (antes se
+//    descartaban en silencio: 176 entradas frente a 945 `spa` en producción; el 6,7 %
+//    de los títulos con pistas quedaba vacío). Se clasifican por texto como siempre y
+//    llevan `rl=spl` / `rl=spn` en el resumen para medir la etiqueta frente al léxico.
+//    Red de seguridad: si el texto no parece español (<15 % de palabras funcionales
+//    en las primeras ~12 KB) la pista se descarta (`looksSpanish`, ~0,12 ms).
+//  - [SubDL / IDIOMA] Se descartan las entradas cuyo idioma declarado (`language` o
+//    `lang`) no es español (visto: `br_pt` servido como "Español" durante 28 h).
+//    Sin idioma declarado se conservan. Los descartes aparecen en la línea `langs`
+//    como `SubDL es×3 (descartados: br_pt×1)`.
+//  - [IDIOMA / PORTUGUÉS] La guarda de portugués de `scoreText` ahora descarta la
+//    pista (`[classify] descartado por idioma (portugués)`); antes se servía como
+//    "📄 Español (sin clasificar)".
+//  - [TELEMETRÍA] `resumen_stats.cjs` cruza `rl=` con el veredicto servido y con
+//    `full=`, mide la coincidencia de `spl` con Latino y de `spn` con Castellano,
+//    y suma los descartes de SubDL.
 //
 // v1.4.30 (28/10/2026):
 //  - [TELEMETRÍA / FULL TEXT SHADOW SCORING] En 1 de cada 5 archivos >48 KB
@@ -853,7 +871,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.30",
+  version: "1.4.31",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -892,7 +910,26 @@ const OS_V3_TIMEOUT_MS = 4500;
 // router sigue sirviendo todo como `spa`). OS-V3 y SubDL agrupan el español en
 // un único cubo; estos helpers registran qué mandan de verdad para medir si su
 // etiqueta (p. ej. "es-419") aportaría algo frente al léxico.
-const OS_V3_ES_LANG_RE = /^(?:spa|esp|span|es)(?:[-_][a-z0-9]{2,8})?$/;
+// `spl` y `spn` son los códigos con que OS-V3 separa variantes regionales del
+// español (en producción: 165 y 11 entradas frente a 945 `spa` en el mismo
+// período; hasta ahora se descartaban en silencio y el 6,7 % de los títulos con
+// pistas quedaba vacío por ello). Su significado exacto no está confirmado en
+// documentación, así que se aceptan con `verifyEs` (ver `looksSpanish`).
+const OS_V3_ES_LANG_RE = /^(?:spa|esp|span|spl|spn|es)(?:[-_][a-z0-9]{2,8})?$/;
+const OS_V3_VERIFY_LANG_RE = /^(?:spl|spn)(?:[-_][a-z0-9]{2,8})?$/;
+// SubDL: idioma declarado que se considera español (campo `language` o `lang`).
+// Vacío/ausente se conserva; cualquier otro (p. ej. "br_pt") se descarta.
+const SUBDL_ES_LANG_RE = /^(?:es|esp|spa|spanish|español|espanol)(?:[-_][a-z0-9]{2,8})?$/;
+// Comprobación barata de que un texto es español (palabras funcionales sobre
+// las primeras ~12 KB). Un español real da ~0,35-0,45; inglés o francés ~0.
+const ES_STOPWORDS = new Set(["que", "el", "la", "de", "no", "y", "en", "es", "un", "una", "los", "las", "se", "lo", "me", "te", "por", "con", "para", "del", "al", "mi", "tu", "su", "yo", "qué", "está"]);
+const looksSpanish = (text) => {
+  const words = text.slice(0, 12288).toLowerCase().match(/\p{L}+/gu) || [];
+  if (words.length < 20) return true; // texto demasiado corto para juzgar: no se descarta
+  let hits = 0;
+  for (const w of words) if (ES_STOPWORDS.has(w)) hits += 1;
+  return hits / words.length >= 0.15;
+};
 // Códigos que PARECEN español pero el filtro descarta ("spl", "spn", "ea",
 // "lat…", "mx…", "cast…"; "est" = estonio, se excluye). Si OS-V3 enviara un
 // código latino propio, hoy se perdería en silencio: así queda a la vista.
@@ -931,6 +968,7 @@ const getOpenSubtitlesV3 = async (type, fullId) => {
         url: sub.url,
         lang: "spa",
         rawLang: normRawLang(sub.lang),
+        verifyEs: OS_V3_VERIFY_LANG_RE.test(normRawLang(sub.lang)),
         source: "OS-V3",
         // `movieReleaseName` es el TÍTULO ("Inception (2010)"), no el release: las
         // etiquetas (AMZN, WEB-DL…) viven en el nombre del fichero. Con el título
@@ -1001,9 +1039,19 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
       console.log(`[SubDL] 0 resultados para ${imdbId} (${subdlType}${season ? ` s${season}e${episode}` : ""})`);
     }
 
+    const droppedLang = {};
     const out = data.subtitles
       .map((sub, i) => {
         if (!sub || typeof sub.url !== "string" || !sub.url.trim()) return null;
+        // Idioma declarado por SubDL: con `languages=ES` a veces llegan entradas de
+        // otro idioma (visto en producción: `br_pt`, portugués brasileño, servido
+        // como español). Si declara un idioma que no es español se descarta; si no
+        // declara ninguno, se conserva.
+        const declared = normRawLang(sub.language ?? sub.lang);
+        if (declared && !SUBDL_ES_LANG_RE.test(declared)) {
+          droppedLang[declared] = (droppedLang[declared] || 0) + 1;
+          return null;
+        }
         // SubDL devuelve URLs RELATIVAS ("/subtitle/111-222.zip", según la doc
         // oficial). El guard de seguridad iba ANTES de absolutizar, así que
         // descartaba TODAS las entradas de SubDL en silencio. Orden correcto:
@@ -1052,9 +1100,11 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
     // Caso que antes quedaba mudo: la API devuelve subs pero ninguno con url
     // descargable (p.ej. solo referencias a página web). Sin este log, "SubDL=0"
     // sería indistinguible de "0 resultados".
-    if (data.subtitles.length > 0 && out.length === 0) {
+    if (data.subtitles.length > 0 && out.length === 0 && Object.keys(droppedLang).length === 0) {
       console.error(`[SubDL] ${data.subtitles.length} subs en la respuesta pero ninguno con url descargable`);
     }
+    // Propiedad auxiliar de la lista (igual que `nearMiss` en OS-V3).
+    out.droppedLang = droppedLang;
     return out;
   } catch (e) {
     // 401/403 en SubDL es clave rechazada/caducada o cuota agotada del
@@ -1536,6 +1586,13 @@ const classifySubtitle = async (
       return unclassified(sub, finalUrl, true);
     }
 
+    // Pistas de códigos regionales no confirmados (OS-V3 `spl`/`spn`): si el texto
+    // no parece español, se descartan en vez de servirlas como "📄 Español".
+    if (sub.verifyEs && !looksSpanish(text)) {
+      console.log(`[classify] descartado por idioma (no parece español; código ${sub.rawLang}) [${sub.source}]`);
+      return null;
+    }
+
     // Anti-spam: se descarta la pista entera con el texto que ya está en
     // memoria (publicidad incrustada). null = fuera de la lista; un descarte
     // deliberado NO es una respuesta degradada, así que no marca FAILED ni
@@ -1587,6 +1644,12 @@ const classifySubtitle = async (
     // permite cruzar su etiqueta con el veredicto léxico de la misma pista.
     const rawLang = typeof sub.rawLang === "string" ? sub.rawLang : "";
     const rlTag = RAW_LANG_DEFAULTS.has(rawLang) ? "" : ` rl=${rawLang}`;
+    // Texto en portugués (guarda de `scoreText`): no es español, se descarta. Antes se
+    // servía como "📄 Español (sin clasificar)" (visto: SubDL `br_pt` durante 28 h).
+    if (!scored && diag.reason === "portugués") {
+      console.log(`[classify] descartado por idioma (portugués) [${sub.source}]`);
+      return null;
+    }
     const brief = (flag) =>
       `${flag}${isPlatform ? " [PLAT]" : ""}${sdh ? " SDH" : ""} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0} len=${lenTag}${pref48Tag}${fullTag}${rlTag}${
         diag.reason ? ` (${diag.reason})` : ""
@@ -1643,7 +1706,7 @@ const getCanonicalConfigStr = (config) =>
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { FULL_SHADOW_EVERY, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf };
+export { looksSpanish, FULL_SHADOW_EVERY, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1820,10 +1883,11 @@ export default {
           const osList = osSubs.status === "fulfilled" ? osSubs.value : [];
           const sdlList = sdlSubs.status === "fulfilled" ? sdlSubs.value : [];
           const near = tallyToString(osList.nearMiss);
-          if (osList.length || sdlList.length || near) {
+          const sdlDrop = tallyToString(sdlList.droppedLang);
+          if (osList.length || sdlList.length || near || sdlDrop) {
             console.log(
               `[subtitles] langs ${type}/${fullId}: OS-V3 ${langTally(osList) || "-"}${near ? ` (descartados: ${near})` : ""}` +
-                ` | SubDL ${langTally(sdlList) || "-"}`
+                ` | SubDL ${langTally(sdlList) || "-"}${sdlDrop ? ` (descartados: ${sdlDrop})` : ""}`
             );
           }
         }

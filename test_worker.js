@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { FULL_SHADOW_EVERY, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf } from "./worker.js";
+import worker, { looksSpanish, FULL_SHADOW_EVERY, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.30", m10.version === "1.4.30", m10.version);
+  check("manifest version 1.4.31", m10.version === "1.4.31", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2625,13 +2625,13 @@ try {
     r = await run("tt7790023", { os: [
       { id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" },
       { id: "b", url: "https://subs5.strem.io/b.srt", lang: "es-419" },
-      { id: "c", url: "https://subs5.strem.io/c.srt", lang: "spl" },
+      { id: "c", url: "https://subs5.strem.io/c.srt", lang: "ea" },
       { id: "d", url: "https://subs5.strem.io/d.srt", lang: "eng" },
       { id: "e", url: "https://subs5.strem.io/e.srt", lang: "est" },
     ], body: per });
     const lg = r.lines.find((l) => l.startsWith("[subtitles] langs ")) || "";
     check("langs: lista los idiomas crudos aceptados de OS-V3", /OS-V3 .*spa×1/.test(lg) && /OS-V3 .*es-419×1/.test(lg), lg);
-    check("langs: 'spl' (parece español, el filtro lo descarta) aparece en 'descartados'", /\(descartados: spl×1\)/.test(lg), lg);
+    check("langs: 'ea' (parece español, el filtro lo descarta) aparece en 'descartados'", /\(descartados: ea×1\)/.test(lg), lg);
     check("langs: idiomas ajenos (eng, est) no ensucian el log", !/eng|est/.test(lg), lg);
     check("langs: sin SubDL -> 'SubDL -'", /\| SubDL -$/.test(lg), lg);
     check("rl=: solo las pistas con idioma crudo distinto de spa/es llevan 'rl='", r.lines.some((l) => l.includes("resumen") && l.includes(" rl=es-419")) && !r.lines.some((l) => l.includes(" rl=spa")), JSON.stringify(r.lines.filter((l) => l.includes("resumen")).map((l) => l.slice(-160))));
@@ -2650,6 +2650,52 @@ try {
     check("langs: sin pistas ni descartes -> no se emite la línea", !r.lines.some((l) => l.startsWith("[subtitles] langs ")));
     const NEAR = [["spl", true], ["spn", true], ["ea", true], ["lat", true], ["mx", true], ["cast", true], ["es", true], ["est", false], ["eng", false], ["por", false], ["pob", false], ["fra", false]];
     for (const [c, exp] of NEAR) check(`NEAR_ES_LANG_RE: '${c}' -> ${exp}`, NEAR_ES_LANG_RE.test(c) === exp);
+
+    // ---- v1.4.31: spl/spn aceptados, SubDL con idioma no español, guardas de idioma ----
+    const ES_LINE = "1\n00:00:01,000 --> 00:00:03,000\nNo sé qué hacer con el coche de mi padre en la ciudad, pero vosotros tenéis la nevera.\n\n";
+    const perEs = (u) => ES_LINE.repeat(8) + `x${u.slice(-8)}\n`;
+    const ENG = "I don't know what to do with the car and the computer in the city, but we have to go to the house now. ".repeat(10);
+    const PT = "Não, ações e informações são importantes. Você não sabe? ".repeat(30);
+    check("looksSpanish: español -> true", looksSpanish(ES_LINE.repeat(8)));
+    check("looksSpanish: inglés -> false", !looksSpanish(ENG));
+    check("looksSpanish: texto demasiado corto -> true (no se juzga)", looksSpanish("hello there friend"));
+
+    r = await run("tt7790030", { os: [
+      { id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" },
+      { id: "b", url: "https://subs5.strem.io/b.srt", lang: "spl" },
+      { id: "c", url: "https://subs5.strem.io/c.srt", lang: "spn" },
+    ], body: perEs });
+    const lg3 = r.lines.find((l) => l.startsWith("[subtitles] langs ")) || "";
+    check("spl/spn: ya se aceptan y se sirven junto a spa", r.n === 3, String(r.n));
+    check("spl/spn: aparecen como aceptados en 'langs' y NO como descartados", /spl×1/.test(lg3) && /spn×1/.test(lg3) && !/descartados/.test(lg3), lg3);
+    check("spl/spn: 'rl=spl' y 'rl=spn' en el resumen", r.lines.some((l) => l.includes("resumen") && l.includes(" rl=spl") && l.includes(" rl=spn")), JSON.stringify(r.lines.filter((l) => l.includes("resumen")).map((l) => l.slice(-200))));
+
+    r = await run("tt7790031", { os: [
+      { id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" },
+      { id: "b", url: "https://subs5.strem.io/b.srt", lang: "spl" },
+    ], body: (u) => (u.includes("/b.srt") ? ENG : perEs(u)) });
+    check("spl con texto que no parece español -> se descarta (red de seguridad)", r.n === 1 && r.lines.some((l) => l.includes("descartado por idioma (no parece español; código spl) [OS-V3]")), JSON.stringify([r.n, r.lines.filter((l) => l.includes("[classify]"))]));
+    r = await run("tt7790032", { os: [{ id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" }], body: ENG });
+    check("spa con texto en inglés: comportamiento intacto (se sirve como 📄)", r.n === 1 && !r.lines.some((l) => l.includes("descartado por idioma")), JSON.stringify([r.n]));
+
+    r = await run("tt7790033", { os: [{ id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" }], body: PT });
+    check("portugués (guarda de scoreText) -> se descarta en vez de servirse como 📄 español", r.n === 0 && r.lines.some((l) => l.includes("descartado por idioma (portugués) [OS-V3]")), JSON.stringify([r.n, r.lines.filter((l) => l.includes("[classify]"))]));
+    check("portugués descartado sin fallos: caché negativa de 300 s", r.ttl === "public, max-age=300", String(r.ttl));
+
+    r = await run("tt7790034", { key: "clave_valida_123", subdl: { status: true, subtitles: [
+      { url: "/subtitle/1-1.zip", release_name: "A", language: "BR_PT", file_id: 1 },
+      { url: "/subtitle/2-2.zip", release_name: "B", language: "ES", file_id: 2 },
+      { url: "/subtitle/3-3.zip", release_name: "C", file_id: 3 },
+      { url: "/subtitle/4-4.zip", release_name: "D", lang: "english", file_id: 4 },
+      { url: "/subtitle/5-5.zip", release_name: "E", language: "ES-LA", file_id: 5 },
+    ] }, body: perEs });
+    const lg4 = r.lines.find((l) => l.startsWith("[subtitles] langs ")) || "";
+    check("SubDL: se descartan 'br_pt' y 'english'; se conservan 'ES', sin idioma y 'ES-LA'", r.n === 3, String(r.n));
+    check("SubDL: la línea langs informa los descartados", /SubDL .*\(descartados: .*br_pt×1/.test(lg4) && /english×1/.test(lg4) && /es×1/.test(lg4), lg4);
+
+    r = await run("tt7790035", { key: "clave_valida_123", subdl: { status: true, subtitles: [{ url: "/subtitle/1-1.zip", release_name: "A", language: "br_pt", file_id: 1 }] }, body: perEs });
+    check("SubDL: si TODO es de otro idioma -> vacía limpia (300 s) y sin el error 'ninguno con url descargable'",
+      r.n === 0 && r.ttl === "public, max-age=300" && !r.lines.some((l) => l.includes("ninguno con url descargable")), JSON.stringify([r.n, r.ttl]));
   }
 }
 

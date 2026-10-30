@@ -59,18 +59,26 @@ if (withFull.length) {
 // ---- v1.4.30: idioma crudo del proveedor (rl=) y líneas `langs` -------------
 const rl = rows.filter((r) => r.rl);
 console.log(`\n== rl= (idioma crudo distinto de spa/es): ${rl.length} de ${rows.length} pistas ==`);
-if (rl.length) { const t = {}; for (const r of rl) { t[r.rl] ??= {}; t[r.rl][emo(r.f)] = (t[r.rl][emo(r.f)] || 0) + 1; } console.table(t); }
+if (rl.length) {
+  const t = {}; for (const r of rl) { t[r.rl] ??= {}; t[r.rl][emo(r.f)] = (t[r.rl][emo(r.f)] || 0) + 1; } console.log("veredicto servido (muestreo) por idioma crudo:"); console.table(t);
+  const rf = rl.filter((r) => r.full);
+  if (rf.length) { const tf = {}; for (const r of rf) { tf[r.rl] ??= {}; tf[r.rl][r.full] = (tf[r.rl][r.full] || 0) + 1; } console.log("veredicto del archivo completo (full=) por idioma crudo:"); console.table(tf); }
+  // acuerdo etiqueta<->léxico: spl se espera Latino y spn Castellano (supuesto NO confirmado; se mide)
+  const exp = { spl: "🇲🇽", spn: "🇪🇸" };
+  for (const k of Object.keys(exp)) { const g = rl.filter((r) => r.rl === k); if (g.length) { const a = g.filter((r) => emo(r.f) === exp[k]).length; const o = g.filter((r) => (emo(r.f) === "🇪🇸" || emo(r.f) === "🇲🇽") && emo(r.f) !== exp[k]).length; console.log(`${k}: ${g.length} pistas | léxico coincide con ${exp[k]} en ${a} (${(100 * a / g.length).toFixed(0)} %) | dialecto contrario ${o} | neutro/📄 ${g.length - a - o}`); } }
+}
 const langLines = msgs.filter((m) => m.startsWith("[subtitles] langs "));
 if (langLines.length) {
-  const os = {}, sd = {}, near = {};
+  const os = {}, sd = {}, near = {}, sdDrop = {};
   const add = (o, str) => { for (const m of str.matchAll(/(\S+)×(\d+)/g)) o[m[1]] = (o[m[1]] || 0) + +m[2]; };
   for (const m of langLines) {
-    const x = m.match(/: OS-V3 (.*?)(?: \(descartados: (.*?)\))? \| SubDL (.*)$/);
+    const x = m.match(/: OS-V3 (.*?)(?: \(descartados: (.*?)\))? \| SubDL (.*?)(?: \(descartados: (.*?)\))?$/);
     if (!x) continue;
-    add(os, x[1]); if (x[2]) add(near, x[2]); add(sd, x[3]);
+    add(os, x[1]); if (x[2]) add(near, x[2]); add(sd, x[3]); if (x[4]) add(sdDrop, x[4]);
   }
   console.log(`\n== líneas langs: ${langLines.length} títulos con pistas/descartes ==`);
   console.log("OS-V3 aceptados (idioma crudo):", os);
   console.log("OS-V3 descartados que parecen español:", Object.keys(near).length ? near : "ninguno");
   console.log("SubDL (language/lang crudo):", sd);
+  console.log("SubDL descartados por idioma no español:", Object.keys(sdDrop).length ? sdDrop : "ninguno");
 } else console.log("(sin líneas langs en este export: es anterior a la v1.4.30)");
