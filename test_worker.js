@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { looksSpanish, FULL_SHADOW_EVERY, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf } from "./worker.js";
+import worker, { looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.31", m10.version === "1.4.31", m10.version);
+  check("manifest version 1.4.32", m10.version === "1.4.32", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2415,20 +2415,20 @@ try {
       v.discard === expected, JSON.stringify(v));
   }
 
-  // B. Muestreo léxico estratificado (24 KB cabeza + 12 KB centro + 12 KB cola) en archivos >48 KB
+  // B. Archivos >48 KB: desde v1.4.32 se puntúa el texto completo (antes: muestreo de 48 KB)
   const neutralLine = "1\n00:00:01,000 --> 00:00:03,000\nHola, buenos días a todos en la casa.\n\n"; // 65 bytes
   const pad40KB = neutralLine.repeat(640); // ~41.6 KB de diálogo neutro
 
   // Caso 1: Modismos exclusivamente en el centro (~60 KB) de un subtítulo de ~100 KB
   const midCastellano = pad40KB + "\n" + "Vosotros tenéis el coche aparcado frente al ordenador.\n".repeat(6) + "\n" + pad40KB;
   const resMidEs = scoreText(midCastellano);
-  check("v1.4.25 muestreo léxico: detecta Castellano en el centro de un archivo de ~85 KB",
+  check("texto completo: detecta Castellano en el centro de un archivo de ~85 KB",
     resMidEs?.flag === "🇪🇸 Castellano", JSON.stringify(resMidEs));
 
   // Caso 2: Modismos exclusivamente al final (últimos 8 KB) de un subtítulo de ~90 KB
   const tailLatino = pad40KB + pad40KB + "\n" + "Oye wey, prende el celular y estaciona el carro ahorita.\n".repeat(6);
   const resTailLat = scoreText(tailLatino);
-  check("v1.4.25 muestreo léxico: detecta Latino en la cola de un archivo de ~85 KB",
+  check("texto completo: detecta Latino en la cola de un archivo de ~85 KB",
     resTailLat?.flag === "🇲🇽 Latino", JSON.stringify(resTailLat));
 
   // Caso 3 (v1.4.26): Sin solapamiento entre cabeza y centro en archivos de 48–60 KB (~50.000 bytes).
@@ -2438,7 +2438,7 @@ try {
   const suffix30k = "a".repeat(50000 - prefix20k.length);
   const overlapProbe50k = prefix20k + suffix30k;
   const resOverlap = scoreText(overlapProbe50k);
-  check("v1.4.26 muestreo sin solapamiento (50 KB): 1 término en byte 20.000 cuenta 1 sola vez (Neutro, no Castellano)",
+  check("texto completo (50 KB): 1 término en byte 20.000 cuenta 1 sola vez (Neutro, no Castellano)",
     resOverlap?.esMatches === 1 && resOverlap?.strongTotal === 1 && resOverlap?.flag === "🌎 Neutro",
     JSON.stringify(resOverlap));
 }
@@ -2584,42 +2584,9 @@ try {
     check("TTL con pistas servidas sigue siendo 7200 s", r.n >= 1 && r.ttl === "public, max-age=7200", JSON.stringify([r.n, r.ttl]));
   }
 
-  // Log sombra pref48=
+  // Telemetría v1.4.30: `rl=` y línea `langs`
   {
-    const neutral = "1\n00:00:01,000 --> 00:00:03,000\nHola, buenos días a todos en la casa.\n\n";
-    const es = "1\n00:00:01,000 --> 00:00:03,000\nVosotros tenéis el coche aparcado y el ordenador está roto, tío.\n\n";
-    const diff = neutral.repeat(800) + es.repeat(8); // ~54 KB: el prefijo de 48 KB no ve el castellano de la cola
-    const prefFlag = scoreText(diff.slice(0, 48 * 1024))?.flag ?? "📄";
-    const servedFlag = scoreText(diff)?.flag ?? "📄";
-    check("premisa del test: el muestreo cambia el veredicto frente al prefijo de 48 KB", prefFlag !== servedFlag, `${prefFlag} vs ${servedFlag}`);
-    let r = await run("tt7790007", { os: [two[0]], body: diff });
-    check("log sombra: archivo >48 KB con veredicto distinto -> 'pref48=' en resumen", r.lines.some((l) => /resumen .* len=\d+k pref48=\S+/.test(l)), JSON.stringify(r.lines.filter((l) => l.includes("resumen")).map((l) => l.slice(-110))));
-    const same = TXT_CAST + " ".repeat(60 * 1024); // los términos están al principio: mismo veredicto
-    r = await run("tt7790008", { os: [two[0]], body: same });
-    check("log sombra: archivo >48 KB con el MISMO veredicto -> sin 'pref48='", r.lines.some((l) => /resumen .* len=\d+k/.test(l)) && !r.lines.some((l) => l.includes("pref48=")), JSON.stringify(r.lines.filter((l) => l.includes("resumen")).map((l) => l.slice(-110))));
-    r = await run("tt7790009", { os: [two[0]] });
-    check("log sombra: archivo pequeño -> sin 'pref48='", !r.lines.some((l) => l.includes("pref48=")));
-  }
-
-  // Telemetría v1.4.30: `full=`, `rl=` y línea `langs`
-  {
-    const neutral = "1\n00:00:01,000 --> 00:00:03,000\nHola, buenos días a todos en la casa.\n\n";
-    const es = "1\n00:00:01,000 --> 00:00:03,000\nVosotros tenéis el coche aparcado y el ordenador está roto, tío.\n\n";
-    // ~227 KB: el castellano queda en ~53-55 KB, FUERA de las 3 ventanas (0-24, ~113±6, últimos 12 KB)
-    const mkBig = (salt) => neutral.repeat(800) + es.repeat(30) + neutral.repeat(2600) + `salt ${salt}\n`;
-    const sel = (b) => parseInt((hashContent(b).split(":")[1] || "0"), 36) % FULL_SHADOW_EVERY === 0;
-    let selBody = null, offBody = null;
-    for (let i = 0; i < 200 && (!selBody || !offBody); i++) { const b = mkBig(i); if (sel(b)) selBody ||= b; else offBody ||= b; }
-    check("premisa: el muestreo no ve el castellano y el texto completo sí", scoreText(selBody) === null && scoreText(selBody, {}, true)?.flag === "🇪🇸 Castellano", JSON.stringify([scoreText(selBody), scoreText(selBody, {}, true)?.flag]));
-    check("scoreText(whole=true) coincide con el muestreo en archivos <=48 KB", scoreText(TXT_CAST, {}, true)?.flag === scoreText(TXT_CAST)?.flag);
-    let r = await run("tt7790020", { os: [two[0]], body: selBody });
-    const rs = r.lines.filter((l) => l.includes("resumen"));
-    check("full=: archivo grande elegido por hash -> 'full=🇪🇸' y el veredicto servido sigue siendo el del muestreo (📄)", rs.some((l) => /📄[^|]*len=\d+k[^|]* full=🇪🇸/.test(l)) && !rs.some((l) => /Castellano[^|]*full=/.test(l)), JSON.stringify(rs.map((l) => l.slice(-120))));
-    r = await run("tt7790021", { os: [two[0]], body: offBody });
-    check("full=: archivo grande NO elegido por hash -> sin 'full='", r.lines.some((l) => /resumen .* len=\d+k/.test(l)) && !r.lines.some((l) => l.includes("full=")), JSON.stringify(r.lines.filter((l) => l.includes("resumen")).map((l) => l.slice(-100))));
-    r = await run("tt7790022", { os: [two[0]] });
-    check("full=: archivo <=48 KB -> nunca 'full='", !r.lines.some((l) => l.includes("full=")));
-
+    let r;
     // línea `langs` + `rl=` (OS-V3)
     const per = (u) => TXT_CAST + " " + u.slice(-8);
     r = await run("tt7790023", { os: [
@@ -2696,6 +2663,21 @@ try {
     r = await run("tt7790035", { key: "clave_valida_123", subdl: { status: true, subtitles: [{ url: "/subtitle/1-1.zip", release_name: "A", language: "br_pt", file_id: 1 }] }, body: perEs });
     check("SubDL: si TODO es de otro idioma -> vacía limpia (300 s) y sin el error 'ninguno con url descargable'",
       r.n === 0 && r.ttl === "public, max-age=300" && !r.lines.some((l) => l.includes("ninguno con url descargable")), JSON.stringify([r.n, r.ttl]));
+
+    // ---- v1.4.32: texto completo (sin muestreo) y sin logs sombra ----
+    const nL = "1\n00:00:01,000 --> 00:00:03,000\nHola, buenos días a todos en la casa.\n\n";
+    const eL = "1\n00:00:01,000 --> 00:00:03,000\nVosotros tenéis el coche aparcado y el ordenador está roto, tío.\n\n";
+    const bigMid = nL.repeat(800) + eL.repeat(30) + nL.repeat(2600); // ~227 KB; castellano en ~53-55 KB (fuera de las antiguas ventanas)
+    const rBig = scoreText(bigMid);
+    check("texto completo: el castellano de ~53 KB en un archivo de 227 KB cuenta (antes del muestreo: null)", rBig?.flag === "🇪🇸 Castellano", JSON.stringify(rBig));
+    const bigLat = nL.repeat(800) + "Oye wey, prende el celular y estaciona el carro ahorita.\n".repeat(30) + nL.repeat(2600);
+    check("texto completo: el latino de ~53 KB en un archivo de 227 KB cuenta", scoreText(bigLat)?.flag === "🇲🇽 Latino", JSON.stringify(scoreText(bigLat)));
+    const tMs = (() => { const t0 = performance.now(); scoreText(nL.repeat(800) + eL.repeat(100) + nL.repeat(4300)); return performance.now() - t0; })();
+    check("texto completo: 300 KB se puntúan en < 100 ms", tMs < 100, `${tMs.toFixed(1)} ms`);
+    r = await run("tt7790040", { os: [two[0]], body: bigMid });
+    check("servido: archivo grande con castellano fuera de las ventanas antiguas -> 🇪🇸 Castellano en el resumen y len=227k",
+      r.lines.some((l) => l.includes("resumen") && /🇪🇸 Castellano[^|]*len=2\d\dk/.test(l)), JSON.stringify(r.lines.filter((l) => l.includes("resumen")).map((l) => l.slice(-120))));
+    check("sin logs sombra: no aparecen 'pref48=' ni 'full='", !r.lines.some((l) => l.includes("pref48=") || l.includes("full=")));
   }
 }
 

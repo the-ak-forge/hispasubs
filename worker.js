@@ -1,6 +1,17 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.31
+// HispaSubs — Cloudflare Worker v1.4.32
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.32 (30/10/2026):
+//  - [LÉXICO / TEXTO COMPLETO] `scoreText` puntúa siempre el texto entero (hasta los
+//    300 KiB ya analizados) en lugar del muestreo de 48 KB (cabeza+centro+cola). Datos de
+//    producción: sobre 48 archivos `spl` y 161 sin etiqueta regional con `full=`, el
+//    completo solo convierte Neutro/📄 en dialecto (6 de 8 acuerdan con la etiqueta, igual
+//    precisión que antes: 77-79 %), con 0 saltos Castellano<->Latino. Coste estimado
+//    +0,34 ms de media por archivo grande (p90 0,68 ms; hasta ~2,8 ms a 300 KB), es decir
+//    ~+0,8 ms por respuesta en frío.
+//  - [TELEMETRÍA] Se retiran los logs sombra `pref48=` y `full=`, que ya cumplieron su
+//    función. Se mantienen `rl=` y la línea `[subtitles] langs`.
 //
 // v1.4.31 (29/10/2026):
 //  - [OS-V3 / spl, spn] Se aceptan los códigos regionales `spl` y `spn` (antes se
@@ -871,7 +882,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.31",
+  version: "1.4.32",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1263,45 +1274,19 @@ const unclassified = (sub, finalUrl, failed = false, sdh = false) => ({
   ...(failed ? { [FAILED]: true } : {}),
 });
 
-const MAX_SCORE_BYTES = 48 * 1024; // 48 KB (24 KB cabeza + 12 KB centro + 12 KB cola)
-const SCORE_HEAD_BYTES = 24 * 1024;
-const SCORE_MID_BYTES = 12 * 1024;
-const SCORE_TAIL_BYTES = 12 * 1024;
-// Telemetría `full=`: 1 de cada N archivos >48 KB se puntúa también entero.
-const FULL_SHADOW_EVERY = 5;
-
-// Extrae una muestra representativa de hasta 48 KB repartida en 3 ventanas
-// disjuntas (cabeza, centro y cola) separadas por salto de línea para no unir
-// palabras en los cortes. La ventana central se centra dentro del hueco libre
-// entre cabeza y cola (`SCORE_HEAD_BYTES + Math.floor((len - MAX_SCORE_BYTES) / 2)`),
-// garantizando matemáticamente `SCORE_HEAD_BYTES <= midStart` y
-// `midStart + SCORE_MID_BYTES <= len - SCORE_TAIL_BYTES` (cero solapamiento en
-// archivos de 48-60 KB, evitando duplicar apariciones léxicas).
-const sampleScoreText = (rawText) => {
-  if (rawText.length <= MAX_SCORE_BYTES) return rawText;
-  const midStart = SCORE_HEAD_BYTES + Math.floor((rawText.length - MAX_SCORE_BYTES) / 2);
-  return (
-    rawText.slice(0, SCORE_HEAD_BYTES) +
-    "\n" +
-    rawText.slice(midStart, midStart + SCORE_MID_BYTES) +
-    "\n" +
-    rawText.slice(-SCORE_TAIL_BYTES)
-  );
-};
-
 // Puntuación pura de un texto. Exportada para test_worker.js, que la ejercita
 // contra un corpus etiquetado (fronteras Unicode, conjugaciones y términos
 // ambiguos). Devuelve null cuando NO hay datos suficientes para afirmar nada
 // (📄 "sin clasificar"); nunca decide por defecto.
 //
-// Optimización v1.4.16 / v1.4.25: se acota a MAX_SCORE_BYTES (48 KB) mediante
-// muestreo estratificado cabeza+centro+cola, evitando recorrer 300 KB con 5 regexes globales.
-//
-// `whole = true` (solo telemetría `full=`): puntúa el texto COMPLETO sin
-// muestrear. El servidor nunca lo usa para decidir qué sirve.
-const scoreText = (rawText, diag = {}, whole = false) => {
+// Puntúa SIEMPRE el texto completo (<= MAX_ANALYZE_BYTES, 300 KiB). Entre v1.4.16 y
+// v1.4.31 se muestreaban 48 KB (cabeza+centro+cola) por CPU; los logs de producción
+// (209 archivos grandes comparados) mostraron que el texto completo solo convierte
+// veredictos Neutro/📄 en dialecto, sin saltos Castellano<->Latino y sin pérdida de
+// precisión frente a las etiquetas `spl`/`spn`, a ~0,34 ms de media por archivo grande.
+const scoreText = (rawText, diag = {}) => {
   if (typeof rawText !== "string" || !rawText) return null;
-  const text = whole ? rawText : sampleScoreText(rawText);
+  const text = rawText;
 
   // Guarda contra portugués mal etiquetado como español: ≥10 "ã"/"õ" Y ≥0,2 %
   // de los caracteres (un nombre como "João"/"São Paulo" no debe tumbar un
@@ -1616,30 +1601,9 @@ const classifySubtitle = async (
     const diag = {};
     const scored = scoreText(text, diag);
     // len = tamaño del texto analizado en KB (caracteres/1024, redondeado hacia
-    // arriba); "+" si se cortó en MAX_ANALYZE_BYTES. Permite separar en los logs
-    // los archivos <=48 KB (se puntúan enteros) de los >48 KB (muestreo 3 ventanas).
+    // arriba); "+" si se cortó en MAX_ANALYZE_BYTES.
     const lenTag = `${Math.ceil(text.length / 1024)}k${truncated ? "+" : ""}`;
-    // Log SOMBRA del muestreo (3 ventanas) en archivos >48 KB: si leer solo los
-    // primeros 48 KB (lo que hacía la v1.4.24) habría dado OTRO veredicto, se anota
-    // `pref48=<emoji>`. Mide en producción cuántas pistas cambian por el muestreo
-    // (coste ~0,5 ms por archivo grande); no afecta al veredicto servido.
-    let pref48Tag = "";
-    if (text.length > MAX_SCORE_BYTES) {
-      const prefFlag = scoreText(text.slice(0, MAX_SCORE_BYTES), {})?.flag ?? "📄";
-      const servedFlag = scored?.flag ?? "📄";
-      if (prefFlag !== servedFlag) pref48Tag = ` pref48=${prefFlag.split(" ")[0]}`;
-    }
-    // Log sombra `full=<emoji>`: en 1 de cada FULL_SHADOW_EVERY archivos >48 KB
-    // (elegidos por hash del contenido: determinista, sin Math.random) se puntúa
-    // el texto COMPLETO (<=300 KiB) y se anota su veredicto. Permite comparar el
-    // veredicto servido (muestreo) y el del prefijo 48 KB (`pref48=`, ausente =
-    // igual que el servido) contra el del archivo entero. Solo telemetría.
     const contentHash = hashContent(text);
-    let fullTag = "";
-    if (text.length > MAX_SCORE_BYTES && parseInt(contentHash.split(":")[1] || "0", 36) % FULL_SHADOW_EVERY === 0) {
-      const fullFlag = scoreText(text, {}, true)?.flag ?? "📄";
-      fullTag = ` full=${fullFlag.split(" ")[0]}`;
-    }
     // `rl=<idioma crudo>` solo si el proveedor declara algo distinto de "spa"/"es":
     // permite cruzar su etiqueta con el veredicto léxico de la misma pista.
     const rawLang = typeof sub.rawLang === "string" ? sub.rawLang : "";
@@ -1651,7 +1615,7 @@ const classifySubtitle = async (
       return null;
     }
     const brief = (flag) =>
-      `${flag}${isPlatform ? " [PLAT]" : ""}${sdh ? " SDH" : ""} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0} len=${lenTag}${pref48Tag}${fullTag}${rlTag}${
+      `${flag}${isPlatform ? " [PLAT]" : ""}${sdh ? " SDH" : ""} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0} len=${lenTag}${rlTag}${
         diag.reason ? ` (${diag.reason})` : ""
       }`;
     if (!scored) {
@@ -1706,7 +1670,7 @@ const getCanonicalConfigStr = (config) =>
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { looksSpanish, FULL_SHADOW_EVERY, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf };
+export { looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf };
 
 // ---------------------------------------------------------------------------
 // Router

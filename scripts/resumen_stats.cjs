@@ -16,53 +16,34 @@ const table = (rs) => { const by = {}; for (const r of rs) { by[r.f] ??= {}; by[
 const withLen = rows.filter((r) => r.len != null);
 if (withLen.length) {
   console.log(`\n== pistas con len= (${withLen.length}) ==`);
-  console.log("<=48 KB (se puntúan enteras):"); table(withLen.filter((r) => r.len <= 48));
-  console.log(">48 KB (muestreo de 3 ventanas):"); table(withLen.filter((r) => r.len > 48));
+  console.log("<=48 KB:"); table(withLen.filter((r) => r.len <= 48));
+  console.log(">48 KB (desde v1.4.32 también se puntúan enteras; las anteriores usaban muestreo):"); table(withLen.filter((r) => r.len > 48));
   console.log("truncadas a 300 KB (len=...k+):", withLen.filter((r) => r.trunc).length);
-  const big = withLen.filter((r) => r.len > 48);
-  const chg = big.filter((r) => r.pref);
-  console.log(`\n== log sombra pref48: de ${big.length} pistas >48 KB, ${chg.length} (${big.length ? (100 * chg.length / big.length).toFixed(1) : 0}%) cambian de veredicto por el muestreo`);
-  const m = {}; for (const r of chg) { const k = `${r.pref}(prefijo 48KB) -> ${r.f}(muestreo)`; m[k] = (m[k] || 0) + 1; }
-  console.table(m);
 } else { console.log("\n(sin len= en este export: es anterior al cambio de tamaño)"); table(rows); }
 console.log("clasificadas solo por el override de 2 términos:",
   rows.filter((r) => (r.f.includes("Castellano") && r.lat === 0 && r.es === 2) || (r.f.includes("Latino") && r.es === 0 && r.lat === 2)).length);
 const cnt = {}; for (const m of msgs) { const x = m.match(/^\[subtitles\] (?:movie|series)\/\S+: OS-V3=(\d+|ERROR[^ ]*) SubDL=(\d+|ERROR[^ ]*)( \(sin clave\))?/); if (x) { const k = `OS-V3=${x[1] === "0" ? "0" : /^\d/.test(x[1]) ? ">0" : "ERROR"} SubDL=${x[2] === "0" ? "0" : /^\d/.test(x[2]) ? ">0" : "ERROR"}${x[3] ? " (sin clave)" : ""}`; cnt[k] = (cnt[k] || 0) + 1; } }
 console.log("combinaciones OS-V3/SubDL por título:", cnt);
 
-// ---- v1.4.30: veredicto del archivo COMPLETO (full=) -------------------------
-// full= solo aparece en ~1 de cada 5 pistas >48 KB. Servido = veredicto del
-// muestreo (el que ve el usuario); prefijo = pref48= (ausente = igual que el
-// servido); completo = full=. Se compara cada uno contra el completo.
+// ---- Archivos únicos -----------------------------------------------------------
+// Las pistas se repiten (un título popular se recalcula decenas de veces por caché
+// por centro de datos y TTL): se agrupan por huella (veredicto, es, lat, s, len, rl).
+// Los porcentajes por archivo único evitan que dos títulos muy pedidos dominen todo.
 const emo = (f) => f.split(" ")[0];
-const withFull = rows.filter((r) => r.full);
-if (withFull.length) {
-  const ok = (a, b) => a === b;
-  const sOk = withFull.filter((r) => ok(emo(r.f), r.full)).length;
-  const pOk = withFull.filter((r) => ok(r.pref || emo(r.f), r.full)).length;
-  const pct = (n) => (100 * n / withFull.length).toFixed(1) + " %";
-  console.log(`\n== full= (archivo completo): ${withFull.length} pistas ==`);
-  console.log(`coincide con el completo: muestreo (servido) ${sOk} (${pct(sOk)}) | prefijo 48 KB ${pOk} (${pct(pOk)})`);
-  const dis = withFull.filter((r) => !ok(emo(r.f), r.full) || !ok(r.pref || emo(r.f), r.full));
-  const tab = {};
-  for (const r of dis) { const k = `muestreo ${emo(r.f)} | prefijo ${r.pref || emo(r.f)} | completo ${r.full}`; tab[k] = (tab[k] || 0) + 1; }
-  console.table(tab);
-  const dial = (e) => e === "🇪🇸" || e === "🇲🇽";
-  const opp = withFull.filter((r) => dial(emo(r.f)) && dial(r.full) && emo(r.f) !== r.full).length;
-  console.log(`saltos Castellano<->Latino del muestreo frente al completo: ${opp}`);
-  const bySize = {};
-  for (const r of withFull) { const b = r.len <= 96 ? "49-96k" : r.len <= 150 ? "97-150k" : ">150k"; bySize[b] ??= { n: 0, muestreo: 0, prefijo: 0 }; bySize[b].n++; if (ok(emo(r.f), r.full)) bySize[b].muestreo++; if (ok(r.pref || emo(r.f), r.full)) bySize[b].prefijo++; }
-  console.table(bySize);
-  if (withFull.length < 150) console.log("(muestra pequeña: conviene juntar >=150 pistas antes de decidir)");
-} else console.log("\n(sin full= en este export: es anterior a la v1.4.30)");
+{
+  const seen = new Set(); const uniq = [];
+  for (const r of rows) { const k = [r.f, r.es, r.lat, r.s, r.len, r.rl].join("|"); if (!seen.has(k)) { seen.add(k); uniq.push(r); } }
+  const dist = (rs) => { const n = rs.length || 1; const c = (e) => rs.filter((r) => emo(r.f) === e).length; const pc = (x) => (100 * x / n).toFixed(0) + "%"; return `n=${rs.length} | 🇲🇽 ${pc(c("🇲🇽"))} 🇪🇸 ${pc(c("🇪🇸"))} 🌎 ${pc(c("🌎"))} 📄 ${pc(c("📄"))}`; };
+  console.log(`\n== archivos únicos: ${uniq.length} de ${rows.length} pistas ==`);
+  console.log("sin etiqueta regional:", dist(uniq.filter((r) => !r.rl)));
+  for (const k of ["spl", "spn"]) { const g = uniq.filter((r) => r.rl === k); if (g.length) console.log(`${k}:`, dist(g)); }
+}
 
 // ---- v1.4.30: idioma crudo del proveedor (rl=) y líneas `langs` -------------
 const rl = rows.filter((r) => r.rl);
 console.log(`\n== rl= (idioma crudo distinto de spa/es): ${rl.length} de ${rows.length} pistas ==`);
 if (rl.length) {
-  const t = {}; for (const r of rl) { t[r.rl] ??= {}; t[r.rl][emo(r.f)] = (t[r.rl][emo(r.f)] || 0) + 1; } console.log("veredicto servido (muestreo) por idioma crudo:"); console.table(t);
-  const rf = rl.filter((r) => r.full);
-  if (rf.length) { const tf = {}; for (const r of rf) { tf[r.rl] ??= {}; tf[r.rl][r.full] = (tf[r.rl][r.full] || 0) + 1; } console.log("veredicto del archivo completo (full=) por idioma crudo:"); console.table(tf); }
+  const t = {}; for (const r of rl) { t[r.rl] ??= {}; t[r.rl][emo(r.f)] = (t[r.rl][emo(r.f)] || 0) + 1; } console.log("veredicto servido por idioma crudo:"); console.table(t);
   // acuerdo etiqueta<->léxico: spl se espera Latino y spn Castellano (supuesto NO confirmado; se mide)
   const exp = { spl: "🇲🇽", spn: "🇪🇸" };
   for (const k of Object.keys(exp)) { const g = rl.filter((r) => r.rl === k); if (g.length) { const a = g.filter((r) => emo(r.f) === exp[k]).length; const o = g.filter((r) => (emo(r.f) === "🇪🇸" || emo(r.f) === "🇲🇽") && emo(r.f) !== exp[k]).length; console.log(`${k}: ${g.length} pistas | léxico coincide con ${exp[k]} en ${a} (${(100 * a / g.length).toFixed(0)} %) | dialecto contrario ${o} | neutro/📄 ${g.length - a - o}`); } }
