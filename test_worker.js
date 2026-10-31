@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf } from "./worker.js";
+import worker, { looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.34", m10.version === "1.4.34", m10.version);
+  check("manifest version 1.4.35", m10.version === "1.4.35", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2852,6 +2852,230 @@ try {
     r = await call(mkCache(), "tt7800016", mk("spl"), () => textResp(mixed));
     check("v1.4.33 desacuerdo: spl + 🌎 Neutro (léxico empatado) no es desacuerdo",
       !disagree(r) && /🌎 Neutro/.test(resumenOf(r)), resumenOf(r).slice(-160));
+  }
+}
+
+// 23) v1.4.35: orden de dialecto según filename y preferencia en /configure (sin fragmentar caché)
+{
+  // A) Detección de tokens inequívocos en filename
+  const latFiles = [
+    "Dune.Part.Two.2024.1080p.WEB-DL.LATINO.H264.mkv",
+    "Deadpool.3.2024.2160p.LATAM.DDP5.1.mp4",
+    "[Peliculas] Serie_S01E02_latino_1080p.mkv",
+    "Movie.2024.es-419.WEB-DL.mkv",
+    "Movie.2024.ES_LA.1080p.mkv",
+    "Movie.2024.es-mx.1080p.mkv",
+  ];
+  for (const fn of latFiles) {
+    check(`v1.4.35 detectFilenameDialect LAT: "${fn}" -> "lat"`, detectFilenameDialect(fn) === "lat", String(detectFilenameDialect(fn)));
+  }
+
+  const esFiles = [
+    "Gladiator.II.2024.1080p.CASTELLANO.BluRay.mkv",
+    "The.Substance.2024.1080p.WEB-DL.Esp.AC3.mkv",
+    "Film_2024_ESP_1080p.mkv",
+    "Serie.S01E01.[ESP].1080p.mkv",
+    "Movie.2024.es-ES.WEB-DL.mkv",
+  ];
+  for (const fn of esFiles) {
+    check(`v1.4.35 detectFilenameDialect ES: "${fn}" -> "es"`, detectFilenameDialect(fn) === "es", String(detectFilenameDialect(fn)));
+  }
+
+  const neutralOrAmbiguousFiles = [
+    "",
+    null,
+    "Movie.2024.1080p.WEB-DL.Spanish.mkv",
+    "Movie.2024.1080p.MULTI.DUAL.mkv",
+    "Pelicula.2024.ESPAÑOL.1080p.mkv",
+    "Pelicula.2024.ESPANOL.1080p.mkv",
+    "Edicion.Especial.2024.1080p.mkv",
+    "Es.Por.Tu.Bien.2017.1080p.mkv",
+    "Disco.De.Platino.2024.1080p.mkv",
+    "Movie.2024.LATINO.CASTELLANO.DUAL.mkv",
+    "Movie.2024.LATAM.ESP.1080p.mkv",
+  ];
+  for (const fn of neutralOrAmbiguousFiles) {
+    check(`v1.4.35 detectFilenameDialect neutro/ambiguo: "${fn}" -> null`, detectFilenameDialect(fn) === null, String(detectFilenameDialect(fn)));
+  }
+
+  // B) Extracción de filename desde query string y desde segmento extra de ruta de Stremio
+  {
+    const uQuery = new URL(`${base}/subtitles/movie/tt1234567.json?filename=Dune.LATINO.mkv&videoSize=123`);
+    check("v1.4.35 extractFilename: desde query ?filename=",
+      extractFilename(uQuery, uQuery.pathname.split("/").filter(Boolean), 0) === "Dune.LATINO.mkv");
+
+    const uPath = new URL(`${base}/subtitles/movie/tt1234567/videoHash=abc&filename=Film.CASTELLANO.mkv&videoSize=999.json`);
+    check("v1.4.35 extractFilename: desde segmento extra /subtitles/:type/:id/:extra.json",
+      extractFilename(uPath, uPath.pathname.split("/").filter(Boolean), 0) === "Film.CASTELLANO.mkv");
+
+    const uCfgPath = new URL(`${base}/${b64url({ dialectOrder: "auto" })}/subtitles/series/tt1234567:1:2/filename=Show.S01E02.Esp.mkv.json`);
+    check("v1.4.35 extractFilename: con segmento de config y serie",
+      extractFilename(uCfgPath, uCfgPath.pathname.split("/").filter(Boolean), 1) === "Show.S01E02.Esp.mkv");
+  }
+
+  // C) Resolución de dialecto objetivo y ordenación estable preservando [IS_PLATFORM]
+  {
+    check("v1.4.35 resolveDialectTarget: auto + LATINO -> lat",
+      resolveDialectTarget({ dialectOrder: "auto" }, "Movie.LATINO.mkv") === "lat");
+    check("v1.4.35 resolveDialectTarget: auto + sin token -> null",
+      resolveDialectTarget({}, "Movie.1080p.mkv") === null);
+    check("v1.4.35 resolveDialectTarget: lat fijo ignora filename CASTELLANO",
+      resolveDialectTarget({ dialectOrder: "lat" }, "Movie.CASTELLANO.mkv") === "lat");
+    check("v1.4.35 resolveDialectTarget: es fijo ignora filename LATINO",
+      resolveDialectTarget({ dialectOrder: "es" }, "Movie.LATINO.mkv") === "es");
+    check("v1.4.35 resolveDialectTarget: none desactiva reordenación aunque haya LATINO",
+      resolveDialectTarget({ dialectOrder: "none" }, "Movie.LATINO.mkv") === null);
+
+    const sampleSubs = [
+      { id: "es_plat", label: "🇪🇸 Castellano (OS-V3)" },
+      { id: "lat_plat", label: "🇲🇽 Latino (OS-V3)" },
+      { id: "neu", label: "🌎 Neutro (OS-V3)" },
+      { id: "es_reg", label: "🇪🇸 Castellano (SubDL)" },
+      { id: "lat_sdh", label: "🇲🇽 Latino (SDH) (SubDL)" },
+    ];
+    const ordLat = orderSubtitlesByDialect(sampleSubs, "lat");
+    check("v1.4.35 orderSubtitlesByDialect('lat'): pone todas las 🇲🇽 primero respetando orden relativo ([PLAT] primero) y sin mutar el original",
+      JSON.stringify(ordLat.map((s) => s.id)) === JSON.stringify(["lat_plat", "lat_sdh", "es_plat", "neu", "es_reg"]) &&
+        sampleSubs[0].id === "es_plat",
+      JSON.stringify(ordLat.map((s) => s.id)));
+
+    const ordEs = orderSubtitlesByDialect(sampleSubs, "es");
+    check("v1.4.35 orderSubtitlesByDialect('es'): pone todas las 🇪🇸 primero respetando orden relativo",
+      JSON.stringify(ordEs.map((s) => s.id)) === JSON.stringify(["es_plat", "es_reg", "lat_plat", "neu", "lat_sdh"]),
+      JSON.stringify(ordEs.map((s) => s.id)));
+  }
+
+  // D) End-to-end con Cache API: 0 fragmentación entre peticiones con distinto filename o dialectOrder
+  {
+    const store = new Map();
+    const prevC = mockGlobal("caches", {
+      default: {
+        match: async (req) => { const r = store.get(req.url); return r ? r.clone() : undefined; },
+        put: async (req, res) => { store.set(req.url, res.clone()); },
+      },
+    });
+    const prevF = globalThis.fetch;
+    let srtDownloads = 0;
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) {
+        return Promise.resolve(new Response(JSON.stringify({
+          subtitles: [
+            { id: "s_es", url: "https://subs5.strem.io/s_es.srt", lang: "spa" },
+            { id: "s_lat", url: "https://subs5.strem.io/s_lat.srt", lang: "spa" },
+          ],
+        }), { status: 200, headers: { "content-type": "application/json" } }));
+      }
+      if (u.includes("s_es.srt")) { srtDownloads++; return Promise.resolve(textResp(TXT_CAST)); }
+      if (u.includes("s_lat.srt")) { srtDownloads++; return Promise.resolve(textResp(TXT_LAT)); }
+      return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }), { status: 200 }));
+    };
+    const origLog = console.log;
+    const logs = [];
+    console.log = (...a) => logs.push(a.join(" "));
+    try {
+      const pending = [];
+      const ctx = { waitUntil: (p) => pending.push(p) };
+
+      // 1ª petición (MISS) con filename LATINO en ruta extra de Stremio:
+      // El orden natural de OS-V3 es [🇪🇸, 🇲🇽], pero al cliente se le sirve [🇲🇽, 🇪🇸]
+      // mientras que en la caché se guarda el orden canónico [🇪🇸, 🇲🇽].
+      const r1 = await worker.fetch(
+        new Request(`${base}/subtitles/movie/tt7850001/filename=Movie.2024.LATINO.1080p.mkv.json`),
+        {},
+        ctx
+      );
+      const j1 = await r1.json();
+      await Promise.all(pending);
+
+      check("v1.4.35 E2E MISS con filename=LATINO: sirve 🇲🇽 primero y marca MISS",
+        r1.headers.get("x-cache") === "MISS" &&
+          j1.subtitles.length === 2 &&
+          j1.subtitles[0].label.startsWith("🇲🇽") &&
+          j1.subtitles[1].label.startsWith("🇪🇸"),
+        JSON.stringify(j1.subtitles.map((s) => s.label)));
+      check("v1.4.35 E2E MISS con filename=LATINO: registra fn=lat y orden=lat en resumen",
+        logs.some((l) => l.includes("resumen") && l.includes(" fn=lat orden=lat")),
+        logs.find((l) => l.includes("resumen")) || "");
+
+      // 2ª petición (HIT) sin filename para el mismo título: debe salir de caché en orden canónico [🇪🇸, 🇲🇽] sin descargar nada
+      const dlBefore = srtDownloads;
+      const r2 = await worker.fetch(new Request(`${base}/subtitles/movie/tt7850001.json`), {}, ctx);
+      const j2 = await r2.json();
+      check("v1.4.35 E2E HIT sin filename: comparte caché (0 descargas nuevas) y devuelve el orden canónico [🇪🇸, 🇲🇽]",
+        r2.headers.get("x-cache") === "HIT" &&
+          srtDownloads === dlBefore &&
+          j2.subtitles[0].label.startsWith("🇪🇸") &&
+          j2.subtitles[1].label.startsWith("🇲🇽"),
+        JSON.stringify(j2.subtitles.map((s) => s.label)));
+
+      // 3ª petición (HIT) con ?filename=...Esp... -> HIT con [🇪🇸, 🇲🇽]
+      const r3 = await worker.fetch(new Request(`${base}/subtitles/movie/tt7850001.json?filename=Movie.2024.Esp.mkv`), {}, ctx);
+      const j3 = await r3.json();
+      check("v1.4.35 E2E HIT con ?filename=Esp: HIT y 🇪🇸 primero",
+        r3.headers.get("x-cache") === "HIT" &&
+          srtDownloads === dlBefore &&
+          j3.subtitles[0].label.startsWith("🇪🇸"),
+        JSON.stringify(j3.subtitles.map((s) => s.label)));
+
+      // 4ª petición (HIT) con config dialectOrder="lat" y sin filename -> comparte la MISMA caché pública y reordena a [🇲🇽, 🇪🇸]
+      const r4 = await worker.fetch(
+        new Request(`${base}/${b64url({ dialectOrder: "lat" })}/subtitles/movie/tt7850001.json`),
+        {},
+        ctx
+      );
+      const j4 = await r4.json();
+      check("v1.4.35 E2E HIT con dialectOrder='lat': comparte la misma caché pública (HIT, 0 descargas) y reordena [🇲🇽, 🇪🇸]",
+        r4.headers.get("x-cache") === "HIT" &&
+          srtDownloads === dlBefore &&
+          j4.subtitles[0].label.startsWith("🇲🇽") &&
+          j4.subtitles[1].label.startsWith("🇪🇸"),
+        JSON.stringify(j4.subtitles.map((s) => s.label)));
+    } finally {
+      console.log = origLog;
+      globalThis.fetch = prevF;
+      restoreGlobal("caches", prevC);
+    }
+  }
+
+  // E) /configure: tarjetas de orden de dialecto, preselección y generación de URL
+  {
+    const resCfg = await get(`/${b64url({ dialectOrder: "lat", subdlKey: "myKey123" })}/configure`);
+    const htmlCfg = await resCfg.text();
+    check("v1.4.35 configure: preselecciona la tarjeta activa según dialectOrder en la URL",
+      htmlCfg.includes('id="dialectOrder" value="lat"') &&
+        htmlCfg.includes('class="opt-card active" data-order="lat"'));
+
+    const resXssOrd = await get(`/${b64url({ dialectOrder: '"><script>alert(1)</script>' })}/configure`);
+    const htmlXssOrd = await resXssOrd.text();
+    check("v1.4.35 configure: valor inválido/XSS en dialectOrder cae de forma segura a 'auto'",
+      htmlXssOrd.includes('id="dialectOrder" value="auto"') &&
+        !htmlXssOrd.includes("<script>alert(1)"));
+
+    const scriptBody = htmlCfg.split("<script>")[1].split("</script>")[0];
+    const runCfgUrl = (keyVal, ordVal) =>
+      new Function("document", "window", "navigator", "btoa", "TextEncoder",
+        scriptBody + "; return getManifestUrl('https');")(
+        { getElementById: (id) => ({ value: id === "subdlKey" ? keyVal : ordVal }) },
+        fakeWin,
+        { clipboard: {} },
+        (s) => btoa(s),
+        TextEncoder
+      );
+
+    const urlAutoNoKey = runCfgUrl("", "auto");
+    check("v1.4.35 configure JS: sin clave y con orden 'auto' devuelve /manifest.json limpio",
+      urlAutoNoKey === `${base}/manifest.json`, urlAutoNoKey);
+
+    const urlLatNoKey = runCfgUrl("", "lat");
+    const cfgLatNoKey = decodeCfg(urlLatNoKey);
+    check("v1.4.35 configure JS: sin clave y con orden 'lat' codifica solo { dialectOrder: 'lat' }",
+      cfgLatNoKey.dialectOrder === "lat" && !("subdlKey" in cfgLatNoKey), JSON.stringify(cfgLatNoKey));
+
+    const urlBoth = runCfgUrl("clave999", "es");
+    const cfgBoth = decodeCfg(urlBoth);
+    check("v1.4.35 configure JS: con clave y orden 'es' codifica ambos campos",
+      cfgBoth.subdlKey === "clave999" && cfgBoth.dialectOrder === "es", JSON.stringify(cfgBoth));
   }
 }
 

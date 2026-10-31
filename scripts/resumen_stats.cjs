@@ -97,4 +97,16 @@ if (langLines.length) {
     console.log("términos fuertes LAT más repetidos:", top(termCount.lat) || "-");
     console.log("términos débiles más repetidos:", top(termCount.deb) || "-");
   } else console.log("(sin líneas de desacuerdo en este export)");
+
+  // ---- v1.4.35: pista de dialecto en filename (fn=) y reordenación aplicada (orden=) ----
+  const fnCounts = {}, ordCounts = {};
+  for (const m of resumen) {
+    const f = (m.match(/ fn=(lat|es)\b/) || [])[1];
+    if (f) fnCounts[f] = (fnCounts[f] || 0) + 1;
+    const o = (m.match(/ orden=(lat|es)\b/) || [])[1];
+    if (o) ordCounts[o] = (ordCounts[o] || 0) + 1;
+  }
+  if (Object.keys(fnCounts).length || Object.keys(ordCounts).length) {
+    console.log(`\n== orden por dialecto: filename detectado=${JSON.stringify(fnCounts)} | reordenadas=${JSON.stringify(ordCounts)} ==`);
+  }
 }

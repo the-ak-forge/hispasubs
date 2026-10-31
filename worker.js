@@ -1,6 +1,21 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.34
+// HispaSubs — Cloudflare Worker v1.4.35
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.35 (31/10/2026):
+//  - [ORDEN POR ARCHIVO / PREFERENCIA] Reordenación inteligente de la lista de
+//    subtítulos según el nombre del archivo de video (`filename` enviado por
+//    Stremio en el 76 % de las peticiones en frío) o según la preferencia del
+//    usuario en `/configure` (`dialectOrder`: `auto`, `lat`, `es`, `none`).
+//    En modo `auto` (por defecto), tokens inequívocos como `LATINO` / `LATAM`
+//    priorizan las pistas `🇲🇽 Latino` al principio de la lista, y `CASTELLANO` /
+//    `Esp` priorizan las `🇪🇸 Castellano`, manteniendo el orden relativo y la
+//    prioridad `[PLAT]` dentro de cada grupo. Se aplica al servir (tanto en HIT
+//    como en MISS) sobre el JSON canónico, con fragmentación cero de la caché.
+//  - [UX / CONFIGURE] Rediseño integral de la página `/configure` con una
+//    interfaz más intuitiva: tarjetas interactivas para elegir el orden de
+//    dialecto, insignias visuales de clasificación, botón Mostrar/Ocultar para
+//    la clave opcional de SubDL y guía rápida de instalación.
 //
 // v1.4.34 (31/10/2026):
 //  - [LÉXICO / "carajo"] Pasa de término fuerte Latino a débil (0,25). Datos de producción
@@ -878,20 +893,159 @@ const parseConfig = (configStr) => {
 };
 
 // ---------------------------------------------------------------------------
+// Orden de dialecto según filename de Stremio y preferencia de usuario
+// ---------------------------------------------------------------------------
+
+const VALID_DIALECT_ORDERS = new Set(["auto", "lat", "es", "none"]);
+
+const normalizeDialectOrder = (val) => {
+  if (typeof val !== "string") return "auto";
+  const clean = val.trim().toLowerCase();
+  return VALID_DIALECT_ORDERS.has(clean) ? clean : "auto";
+};
+
+// Tokens inequívocos de dialecto en nombres de archivo (datos de producción:
+// el 76 % de peticiones en frío trae `filename`, y ~15 % contiene tokens
+// regionales claros como LATINO, LATAM, CASTELLANO o Esp).
+// Se exigen fronteras no alfanuméricas (incluyendo `_`, `.`, `-`, espacios y
+// corchetes) para que "ESP" no coincida dentro de "ESPAÑOL", "ESPANOL" o
+// "ESPECIAL". Si aparecen ambos bandos a la vez (dual), se considera ambiguo.
+const FILENAME_LAT_RE = /(?:^|[^a-z0-9ñáéíóúü])(?:latino|latam|es[-_](?:419|la|mx))(?=[^a-z0-9ñáéíóúü]|$)/i;
+const FILENAME_ES_RE = /(?:^|[^a-z0-9ñáéíóúü])(?:castellano|esp|es[-_]es)(?=[^a-z0-9ñáéíóúü]|$)/i;
+
+const detectFilenameDialect = (filename) => {
+  if (typeof filename !== "string" || !filename) return null;
+  const lat = FILENAME_LAT_RE.test(filename);
+  const es = FILENAME_ES_RE.test(filename);
+  if (lat && !es) return "lat";
+  if (es && !lat) return "es";
+  return null;
+};
+
+// Extrae `filename` tanto de query string (`?filename=...`) como del segmento
+// extra de ruta del protocolo de Stremio (`/subtitles/:type/:id/filename=....json`).
+const extractFilename = (url, pathParts = [], actionIndex = 0) => {
+  const q = url.searchParams.get("filename");
+  if (q && q.trim()) return q.trim();
+  const extraSeg = pathParts[actionIndex + 3];
+  if (!extraSeg) return "";
+  let clean = extraSeg.replace(/\.json$/i, "");
+  if (!clean.includes("=") && /%3d/i.test(clean)) {
+    try {
+      clean = decodeURIComponent(clean);
+    } catch {
+      /* segmento malformado */
+    }
+  }
+  const fn = new URLSearchParams(clean).get("filename");
+  return fn && fn.trim() ? fn.trim() : "";
+};
+
+const resolveDialectTarget = (config, filename = "") => {
+  const mode = normalizeDialectOrder(config?.dialectOrder ?? config?.order);
+  if (mode === "none") return null;
+  if (mode === "lat" || mode === "es") return mode;
+  return detectFilenameDialect(filename);
+};
+
+// Reordena de forma estable poniendo primero el dialecto objetivo (`🇲🇽` o `🇪🇸`)
+// y manteniendo intacto el orden relativo del resto (incluyendo la prioridad
+// `[PLAT]` dentro de cada bloque). No muta el array original.
+const orderSubtitlesByDialect = (subtitles, targetDialect) => {
+  if (!Array.isArray(subtitles) || subtitles.length <= 1) return subtitles;
+  if (targetDialect !== "lat" && targetDialect !== "es") return subtitles;
+  const flag = targetDialect === "lat" ? "🇲🇽" : "🇪🇸";
+  const match = (s) => (typeof s?.label === "string" && s.label.startsWith(flag) ? 1 : 0);
+  return [...subtitles].sort((a, b) => match(b) - match(a));
+};
+
+// ---------------------------------------------------------------------------
 // Página de configuración
 // ---------------------------------------------------------------------------
 
-const getConfigureHTML = (existingConfig = {}) => `
-<!DOCTYPE html>
-<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Configuración | HispaSubs</title><style>body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background-color: #121212; color: #ffffff; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; } .container { background-color: #1e1e1e; padding: 40px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.5); max-width: 500px; width: 100%; text-align: center; } h1 { margin-top: 10px; color: #00d2ff; font-size: 28px; } p { color: #aaaaaa; font-size: 14px; margin-bottom: 24px; line-height: 1.5; } .form-group { text-align: left; margin-bottom: 20px; } label { display: block; margin-bottom: 8px; font-weight: bold; font-size: 14px; } input { width: 100%; padding: 12px; border: 1px solid #333; border-radius: 6px; background-color: #2a2a2a; color: #fff; box-sizing: border-box; font-family: monospace; } input:focus { outline: none; border-color: #00d2ff; } .btn-container { display: flex; flex-direction: column; gap: 10px; margin-top: 15px; } button { font-size: 16px; font-weight: bold; border-radius: 6px; cursor: pointer; width: 100%; padding: 14px 24px; transition: all 0.3s; } .btn-primary { background-color: #00d2ff; color: #121212; border: none; } .btn-primary:hover { background-color: #00a8cc; transform: translateY(-2px); } .btn-secondary { background-color: transparent; color: #00d2ff; border: 2px solid #00d2ff; } </style></head><body><div class="container"><div>${LOGO_SVG}</div><h1>HispaSubs</h1><p>Clasificación léxica en tiempo real para Stremio.<br>Detecta automáticamente modismos en español y los divide en <strong>🇲🇽 Latino</strong>, <strong>🇪🇸 Castellano</strong> y <strong>🌎 Neutro</strong>.</p><div class="form-group"><label>SubDL API Key (Opcional — Mayor catálogo)</label><input type="password" id="subdlKey" placeholder="ej: abc123def456..." value="${esc(existingConfig.subdlKey || "")}"><small style="display:block;margin-top:6px;color:#888;font-size:12px;line-height:1.4;">Obtén una clave gratis en <a href="https://subdl.com" target="_blank" style="color:#00d2ff;text-decoration:none;">subdl.com</a> para ampliar la búsqueda con subtítulos adicionales de su catálogo.</small></div><div class="btn-container"><button class="btn-primary" onclick="installAddon()">Instalar en Stremio</button><button class="btn-secondary" id="copyBtn" onclick="copyManifest()">Copiar URL del Manifest</button></div></div>
+const getConfigureHTML = (existingConfig = {}) => {
+  const currentOrder = normalizeDialectOrder(existingConfig.dialectOrder ?? existingConfig.order);
+  const cardCls = (v) => (currentOrder === v ? "opt-card active" : "opt-card");
+  const cardAria = (v) => (currentOrder === v ? "true" : "false");
+  return `<!DOCTYPE html>
+<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Configuración | HispaSubs</title><style>
+:root { --bg: #0b0f17; --card: #151c28; --card-alt: #1c2536; --border: rgba(255,255,255,0.09); --accent: #00d2ff; --accent-hover: #38bdf8; --text: #f8fafc; --muted: #94a3b8; }
+* { box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: radial-gradient(circle at 50% 0%, #17253b 0%, var(--bg) 65%); color: var(--text); display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 24px 16px; }
+.container { background-color: var(--card); padding: 32px 28px; border-radius: 18px; border: 1px solid var(--border); box-shadow: 0 20px 50px rgba(0,0,0,0.55); max-width: 540px; width: 100%; }
+.header { text-align: center; margin-bottom: 22px; }
+.logo-wrap { display: inline-flex; align-items: center; justify-content: center; margin-bottom: 8px; }
+.title-row { display: flex; align-items: center; justify-content: center; gap: 10px; margin: 4px 0 8px; }
+h1 { margin: 0; color: var(--accent); font-size: 28px; letter-spacing: -0.4px; }
+.ver-badge { font-size: 11px; font-weight: 700; color: var(--accent); background: rgba(0,210,255,0.12); border: 1px solid rgba(0,210,255,0.28); padding: 3px 8px; border-radius: 999px; }
+.subtitle { color: var(--muted); font-size: 14px; margin: 0 0 14px; line-height: 1.5; }
+.pills { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin-bottom: 4px; }
+.pill { font-size: 12px; font-weight: 600; color: #e2e8f0; background: var(--card-alt); border: 1px solid var(--border); padding: 4px 10px; border-radius: 999px; }
+.section { background: rgba(11,15,23,0.45); border: 1px solid var(--border); border-radius: 14px; padding: 16px; margin-bottom: 16px; text-align: left; }
+.section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.section-title { font-weight: 700; font-size: 14px; color: var(--text); margin: 0; }
+.tag { font-size: 11px; font-weight: 600; color: #cbd5e1; background: rgba(255,255,255,0.07); padding: 2px 8px; border-radius: 999px; }
+.tag-accent { color: var(--accent); background: rgba(0,210,255,0.12); }
+.section-desc { color: var(--muted); font-size: 12.5px; margin: 0 0 12px; line-height: 1.45; }
+.opt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.opt-card { background: var(--card-alt); border: 1.5px solid var(--border); border-radius: 10px; padding: 10px 12px; cursor: pointer; transition: all 0.18s ease; user-select: none; display: flex; flex-direction: column; gap: 3px; }
+.opt-card:hover { border-color: rgba(0,210,255,0.45); transform: translateY(-1px); }
+.opt-card.active { border-color: var(--accent); background: rgba(0,210,255,0.1); box-shadow: 0 0 0 1px rgba(0,210,255,0.25); }
+.opt-title { font-size: 13px; font-weight: 700; color: var(--text); display: flex; align-items: center; justify-content: space-between; }
+.opt-dot { width: 8px; height: 8px; border-radius: 50%; background: transparent; border: 1.5px solid var(--muted); }
+.opt-card.active .opt-dot { background: var(--accent); border-color: var(--accent); }
+.opt-sub { font-size: 11.5px; color: var(--muted); line-height: 1.35; }
+.input-row { position: relative; display: flex; align-items: center; }
+input[type="password"], input[type="text"] { width: 100%; padding: 11px 78px 11px 12px; border: 1.5px solid var(--border); border-radius: 9px; background-color: var(--card-alt); color: #fff; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; transition: border-color 0.2s; }
+input[type="password"]:focus, input[type="text"]:focus { outline: none; border-color: var(--accent); }
+.toggle-btn { position: absolute; right: 6px; width: auto; padding: 6px 10px; font-size: 11.5px; font-weight: 600; color: var(--muted); background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; }
+.toggle-btn:hover { color: var(--text); border-color: rgba(255,255,255,0.2); }
+.help-text { display: block; margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+.help-text a { color: var(--accent); text-decoration: none; font-weight: 600; }
+.help-text a:hover { text-decoration: underline; }
+.btn-container { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
+.btn-action { font-size: 15px; font-weight: 700; border-radius: 10px; cursor: pointer; width: 100%; padding: 13px 20px; transition: all 0.2s ease; }
+.btn-primary { background: linear-gradient(135deg, #00d2ff 0%, #00a8cc 100%); color: #081018; border: none; box-shadow: 0 4px 14px rgba(0,210,255,0.25); }
+.btn-primary:hover { filter: brightness(1.08); transform: translateY(-1px); }
+.btn-secondary { background-color: transparent; color: var(--accent); border: 1.5px solid rgba(0,210,255,0.45); }
+.btn-secondary:hover { background-color: rgba(0,210,255,0.08); border-color: var(--accent); }
+@media (max-width: 480px) { .container { padding: 24px 18px; } .opt-grid { grid-template-columns: 1fr; } }
+</style></head><body><div class="container"><div class="header"><div class="logo-wrap">${LOGO_SVG}</div><div class="title-row"><h1>HispaSubs</h1><span class="ver-badge">v1.4.35</span></div><p class="subtitle">Clasificación léxica en tiempo real para Stremio.<br>Analiza cada subtítulo y lo etiqueta en <strong>🇲🇽 Latino</strong>, <strong>🇪🇸 Castellano</strong> o <strong>🌎 Neutro</strong>.</p><div class="pills"><span class="pill">🇲🇽 Latino</span><span class="pill">🇪🇸 Castellano</span><span class="pill">🌎 Neutro</span><span class="pill">🎧 SDH</span><span class="pill">🛡️ Anti-spam</span></div></div><div class="section"><div class="section-head"><label class="section-title" for="dialectOrder">1. Orden de dialecto</label><span class="tag tag-accent">Nuevo</span></div><p class="section-desc">Elige qué subtítulos aparecen primero en la lista del reproductor (sin ocultar los demás).</p><input type="hidden" id="dialectOrder" value="${esc(currentOrder)}"><div class="opt-grid" role="radiogroup" aria-label="Orden de dialecto"><div class="${cardCls("auto")}" data-order="auto" role="radio" aria-checked="${cardAria("auto")}" onclick="selectOrder('auto')"><div class="opt-title"><span>✨ Automático</span><span class="opt-dot"></span></div><div class="opt-sub">Según el nombre del archivo (LATINO / CASTELLANO)</div></div><div class="${cardCls("lat")}" data-order="lat" role="radio" aria-checked="${cardAria("lat")}" onclick="selectOrder('lat')"><div class="opt-title"><span>🇲🇽 Latino primero</span><span class="opt-dot"></span></div><div class="opt-sub">Prioriza siempre subtítulos en español latino</div></div><div class="${cardCls("es")}" data-order="es" role="radio" aria-checked="${cardAria("es")}" onclick="selectOrder('es')"><div class="opt-title"><span>🇪🇸 Castellano primero</span><span class="opt-dot"></span></div><div class="opt-sub">Prioriza siempre subtítulos de España</div></div><div class="${cardCls("none")}" data-order="none" role="radio" aria-checked="${cardAria("none")}" onclick="selectOrder('none')"><div class="opt-title"><span>📋 Sin preferencia</span><span class="opt-dot"></span></div><div class="opt-sub">Mantiene el orden original sin reordenar</div></div></div></div><div class="section"><div class="section-head"><label class="section-title" for="subdlKey">2. Clave API de SubDL</label><span class="tag">Opcional · Gratis</span></div><p class="section-desc">OpenSubtitles V3 ya funciona de serie. Añade tu clave de SubDL para sumar hasta 5 pistas verificadas extra por título.</p><div class="input-row"><input type="password" id="subdlKey" placeholder="Pega tu API Key (ej: abc123def456...)" value="${esc(existingConfig.subdlKey || "")}"><button type="button" class="toggle-btn" id="toggleKeyBtn" onclick="toggleKey()">Mostrar</button></div><small class="help-text">Consigue una clave gratuita en <a href="https://subdl.com" target="_blank" rel="noopener">subdl.com</a> (Panel → API) para ampliar el catálogo.</small></div><div class="btn-container"><button type="button" class="btn-action btn-primary" onclick="installAddon()">Instalar en Stremio</button><button type="button" class="btn-action btn-secondary" id="copyBtn" onclick="copyManifest()">Copiar URL del Manifest</button></div></div>
 <script>
 // NOTA: se usa split/join en vez de .replace(/.../) para no depender de
 // escapes anidados dentro del template literal del Worker (el bug ///g de 1.0.0).
+function selectOrder(val) {
+  var ordEl = document.getElementById('dialectOrder');
+  if (ordEl) ordEl.value = val;
+  if (!document.querySelectorAll) return;
+  var cards = document.querySelectorAll('.opt-card');
+  for (var i = 0; i < cards.length; i++) {
+    var isMatch = cards[i].getAttribute('data-order') === val;
+    if (isMatch) cards[i].classList.add('active');
+    else cards[i].classList.remove('active');
+    cards[i].setAttribute('aria-checked', isMatch ? 'true' : 'false');
+  }
+}
+function toggleKey() {
+  var input = document.getElementById('subdlKey');
+  var btn = document.getElementById('toggleKeyBtn');
+  if (!input) return;
+  var isPwd = input.type === 'password';
+  input.type = isPwd ? 'text' : 'password';
+  if (btn) btn.innerText = isPwd ? 'Ocultar' : 'Mostrar';
+}
 function getManifestUrl(protocol) {
-  var key = document.getElementById('subdlKey').value.trim();
+  var keyEl = document.getElementById('subdlKey');
+  var key = keyEl && keyEl.value ? keyEl.value.trim() : '';
+  var ordEl = document.getElementById('dialectOrder');
+  var ordRaw = ordEl && ordEl.value ? ordEl.value.trim() : 'auto';
+  var ord = (ordRaw === 'lat' || ordRaw === 'es' || ordRaw === 'none') ? ordRaw : 'auto';
   var origin = protocol + '://' + window.location.host;
-  if (!key) return origin + '/manifest.json';
-  var bytes = new TextEncoder().encode(JSON.stringify({ subdlKey: key }));
+  if (!key && ord === 'auto') return origin + '/manifest.json';
+  var payload = {};
+  if (key) payload.subdlKey = key;
+  if (ord !== 'auto') payload.dialectOrder = ord;
+  var bytes = new TextEncoder().encode(JSON.stringify(payload));
   var bin = '';
   for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
   var cfg = btoa(bin).split('+').join('-').split('/').join('_');
@@ -906,6 +1060,7 @@ function copyManifest() {
     .catch(function () { btn.innerText = 'Error al copiar'; });
 }
 </script></body></html>`;
+};
 
 // ---------------------------------------------------------------------------
 // Manifest
@@ -913,7 +1068,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.34",
+  version: "1.4.35",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1779,7 +1934,7 @@ const getCanonicalConfigStr = (config) =>
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf };
+export { looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -1895,6 +2050,10 @@ export default {
         // descargas. Se normaliza todo a la forma exacta de la ruta.
         // Además, si la config no aporta clave válida de SubDL, se normaliza a "" para
         // compartir la entrada global pública. Si aporta clave válida, se unifica en "k_subdl".
+        const filename = extractFilename(url, pathParts, actionIndex);
+        const fnDialect = detectFilenameDialect(filename);
+        const targetDialect = resolveDialectTarget(config, filename);
+
         canonicalConfigStr = getCanonicalConfigStr(config);
         cacheReq = new Request(subtitleCacheUrl(url.origin, canonicalConfigStr, type, fullId));
         let cached = await cacheMatch(cacheReq);
@@ -1905,6 +2064,19 @@ export default {
           : null;
         if (!cached && keyCacheUrl) cached = await cacheMatch(new Request(keyCacheUrl));
         if (cached) {
+          if (targetDialect) {
+            try {
+              const data = await cached.clone().json();
+              if (Array.isArray(data?.subtitles) && data.subtitles.length > 1) {
+                const ordered = orderSubtitlesByDialect(data.subtitles, targetDialect);
+                const hitRes = new Response(JSON.stringify({ ...data, subtitles: ordered }), cached);
+                hitRes.headers.set("x-cache", "HIT");
+                return hitRes;
+              }
+            } catch {
+              /* cuerpo no JSON: se sirve tal cual */
+            }
+          }
           const hitRes = new Response(cached.body, cached);
           hitRes.headers.set("x-cache", "HIT");
           return hitRes;
@@ -2162,9 +2334,14 @@ export default {
             `servidas=${subtitles.length} (OS-V3=${kept["OS-V3"]},SubDL=${kept["SubDL"]}) ` +
             `plataforma=${platformCount}/${subtitles.length} web=${webCount} disco=${discCount} ` +
             `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} mem404=${deadMem.hits} mem404w=${deadWritten} duplicados=${duplicadosContenido} ttl=${ttl}s` +
+            (fnDialect ? ` fn=${fnDialect}` : "") +
+            (targetDialect ? ` orden=${targetDialect}` : "") +
             (scoreLog.length ? ` | ${scoreLog.join(" | ")}` : "")
         );
-        const response = jsonResponse({ subtitles }, ttl, { "x-cache": "MISS" });
+        // En la caché se guarda SIEMPRE el orden canónico (sin aplicar `targetDialect`),
+        // de modo que todas las variantes de `filename` y de `dialectOrder` compartan una
+        // única entrada por título y se reordenen en memoria al servir (HIT o MISS).
+        const canonicalResponse = jsonResponse({ subtitles }, ttl, { "x-cache": "MISS" });
         // - Sin clave válida: namespace público.
         // - SubDL "no utilizable" (clave falsa/rechazada/cuota): la respuesta es
         //   solo OS-V3 -> namespace de ESA clave (nunca `k_subdl`).
@@ -2173,9 +2350,16 @@ export default {
         cachePut(
           ctx,
           canonicalConfigStr && sdlUnusable ? new Request(keyCacheUrl) : cacheReq || request,
-          response
+          canonicalResponse
         );
-        return response;
+        if (targetDialect && subtitles.length > 1) {
+          return jsonResponse(
+            { subtitles: orderSubtitlesByDialect(subtitles, targetDialect) },
+            ttl,
+            { "x-cache": "MISS" }
+          );
+        }
+        return canonicalResponse;
       } catch (err) {
         // Los errores de una request no deben romper la respuesta de Stremio,
         // pero al menos ahora quedan registrados. Caché negativa corta (60 s)
