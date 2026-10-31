@@ -63,3 +63,36 @@ if (langLines.length) {
   console.log("SubDL (language/lang crudo):", sd);
   console.log("SubDL descartados por idioma no español:", Object.keys(sdDrop).length ? sdDrop : "ninguno");
 } else console.log("(sin líneas langs en este export: es anterior a la v1.4.30)");
+
+// ---- v1.4.33: memoria de enlaces muertos y desacuerdo etiqueta/texto ---------------
+{
+  let down = 0, mem = 0, d404 = 0, withMem = 0;
+  for (const m of resumen) {
+    const a = m.match(/ descargas=(\d+)/), b = m.match(/ mem404=(\d+)/), c = m.match(/ descartes404=(\d+)/);
+    if (a) down += +a[1]; if (c) d404 += +c[1];
+    if (b) { mem += +b[1]; if (+b[1] > 0) withMem++; }
+  }
+  console.log(`\n== enlaces muertos: descargas reales ${down} | descartes404 ${d404} | omitidos por memoria (mem404) ${mem} en ${withMem} respuestas ==`);
+  if (!resumen.some((m) => m.includes(" mem404="))) console.log("(sin mem404= en este export: es anterior a la v1.4.33)");
+
+  // Desacuerdos: una línea por archivo (huella h=) aunque se recalcule muchas veces.
+  const dis = msgs.filter((m) => m.startsWith("[classify] desacuerdo "));
+  const byHash = new Map();
+  for (const m of dis) { const h = (m.match(/ h=(\S+)/) || [])[1] || m; if (!byHash.has(h)) byHash.set(h, m); }
+  console.log(`\n== desacuerdos etiqueta/texto: ${dis.length} líneas, ${byHash.size} archivos únicos ==`);
+  if (byHash.size) {
+    const by = {}; const termCount = { es: {}, lat: {}, deb: {} };
+    for (const m of byHash.values()) {
+      const k = (m.match(/rl=(\S+) veredicto=(\S+)/) || []).slice(1, 3).join(" -> "); by[k] = (by[k] || 0) + 1;
+      for (const g of ["es", "lat", "deb"]) {
+        const seg = (m.match(new RegExp(`\\| ${g}: (.*?)(?: \\||\\s\\[|$)`)) || [])[1] || "";
+        for (const t of seg.matchAll(/(\S+)×(\d+)/g)) termCount[g][t[1]] = (termCount[g][t[1]] || 0) + 1;
+      }
+    }
+    console.log("por etiqueta -> veredicto:", by);
+    const top = (o) => Object.entries(o).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([t, c]) => `${t}(${c})`).join(" ");
+    console.log("términos fuertes ES más repetidos entre archivos únicos:", top(termCount.es) || "-");
+    console.log("términos fuertes LAT más repetidos:", top(termCount.lat) || "-");
+    console.log("términos débiles más repetidos:", top(termCount.deb) || "-");
+  } else console.log("(sin líneas de desacuerdo en este export)");
+}

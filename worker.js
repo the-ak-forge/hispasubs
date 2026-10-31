@@ -1,6 +1,22 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.32
+// HispaSubs — Cloudflare Worker v1.4.33
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.33 (30/10/2026):
+//  - [ENLACES MUERTOS / MEMORIA POR TÍTULO] Los enlaces que ya dieron un descarte permanente
+//    (HTTP 404/410 en directa, 410/422 vía proxy) se recuerdan 30 min en la Cache API del
+//    centro de datos (una sola entrada por título, `/_dead/<tipo>/<id>`: 1 lectura y como
+//    mucho 1 escritura por respuesta en frío). Al recalcular el título (caducidad del TTL
+//    de 300 s de las vacías, otra clave de configuración) esos enlaces no se vuelven a
+//    descargar y la 2ª oleada rellena el cupo sin esperar. Dato de producción: una serie
+//    con 22 entradas de SubDL, todas 404, produjo 56 descargas inútiles (2,8 % del total)
+//    y 7 de las 12 respuestas con `servidas=0`. El resumen añade `mem404=N` (enlaces
+//    omitidos por la memoria) y `descargas=` ya NO los cuenta.
+//  - [TELEMETRÍA / DESACUERDO ETIQUETA-TEXTO] Si el proveedor etiqueta `spl` (≈Latino) y el
+//    léxico decide Castellano, o `spn` (≈Castellano) y decide Latino, se registra
+//    `[classify] desacuerdo rl=… veredicto=… es= lat= s= len= h=… | es: término×n … |
+//    lat: … | deb: …` con los términos que decidieron (solo en esos casos, ~9-12 % de los
+//    `spl`). Sirve para separar etiquetas erróneas de falsos positivos del léxico.
 //
 // v1.4.32 (30/10/2026):
 //  - [LÉXICO / TEXTO COMPLETO] `scoreText` puntúa siempre el texto entero (hasta los
@@ -882,7 +898,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.32",
+  version: "1.4.33",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1531,12 +1547,68 @@ const WAVE2_MAX_W1_MS = 4000;
 // de 5 descargas en 0 ms que disparen rate limit HTTP 429 en su origen comunitario.
 const DOWNLOAD_STAGGER_MS = 25;
 
+// v1.4.33: memoria de enlaces muertos (descartes permanentes 404/410/422) por título.
+// Una entrada de la Cache API del centro de datos por título (no por URL: así el coste
+// es 1 lectura + como mucho 1 escritura por respuesta en frío, sin acercarse al tope de
+// subrequests). Guarda las huellas (`hashContent` de la URL final, con &s=&e= en los zips)
+// de los enlaces muertos con su instante de registro: cada enlace caduca a los 30 min de
+// SU descarte (la entrada se reescribe al añadir otro, pero los antiguos no se prorrogan).
+const DEAD_LINK_TTL_S = 1800;
+const DEAD_LINK_MAX = 64;
+const deadLinkKey = (origin, type, fullId) =>
+  `${origin}/_dead/${type}/${encodeURIComponent(fullId)}`;
+const loadDeadLinks = async (keyUrl) => {
+  const mem = { key: keyUrl, known: new Map(), added: new Set(), hits: 0 };
+  try {
+    const r = await cacheMatch(new Request(keyUrl));
+    const arr = r ? await r.json() : null;
+    if (Array.isArray(arr)) {
+      const now = Math.floor(Date.now() / 1000);
+      for (const e of arr.slice(-DEAD_LINK_MAX)) {
+        if (Array.isArray(e) && typeof e[0] === "string" && e[0] && Number.isFinite(e[1]) && now - e[1] < DEAD_LINK_TTL_S) {
+          mem.known.set(e[0], e[1]);
+        }
+      }
+    }
+  } catch { /* caché no disponible o entrada ilegible: sin memoria */ }
+  return mem;
+};
+const saveDeadLinks = (ctx, mem) => {
+  if (!mem || mem.added.size === 0) return;
+  const now = Math.floor(Date.now() / 1000);
+  const merged = new Map(mem.known);
+  for (const h of mem.added) merged.set(h, now);
+  const all = [...merged].slice(-DEAD_LINK_MAX);
+  cachePut(
+    ctx,
+    new Request(mem.key),
+    new Response(JSON.stringify(all), {
+      status: 200,
+      headers: { "content-type": "application/json", "cache-control": `public, max-age=${DEAD_LINK_TTL_S}` },
+    })
+  );
+};
+const FROM_MEM = Symbol.for("hispasubs.fromDeadMemory");
+
+// v1.4.33: términos que más pesaron en un veredicto (para el log de desacuerdo).
+const topTerms = (text, dict, n = 4) => {
+  const counts = new Map();
+  for (const m of text.matchAll(dict)) {
+    const t = m[0].toLowerCase();
+    counts.set(t, (counts.get(t) || 0) + 1);
+  }
+  return [...counts].sort((a, b) => b[1] - a[1]).slice(0, n).map(([t, c]) => `${t}×${c}`).join(" ") || "-";
+};
+// Etiqueta regional del proveedor -> veredicto que se espera del léxico (supuesto medido).
+const RAW_LANG_EXPECTED = { spl: "🇲🇽 Latino", spn: "🇪🇸 Castellano" };
+
 const classifySubtitle = async (
   sub,
   pBase = VERCEL_UNZIPPER,
   spamMode = "drop",
   epSuffix = "",
-  maxTimeoutMs = 0
+  maxTimeoutMs = 0,
+  deadMem = null
 ) => {
   // Guard ANTES de cualquier acceso a sub.url (evita el crash en cascada
   // de Promise.all del 1.0.0).
@@ -1549,6 +1621,13 @@ const classifySubtitle = async (
   // episodio pedido dentro de los zips de temporada completa.
   const isZip = isCompressed(sub.url);
   const finalUrl = isZip ? `${pBase}${encodeURIComponent(sub.url)}${epSuffix}` : sub.url;
+
+  // Enlace ya descartado de forma permanente hace poco: no se vuelve a descargar.
+  const deadHash = deadMem ? hashContent(finalUrl) : "";
+  if (deadMem && deadMem.known.has(deadHash)) {
+    deadMem.hits += 1;
+    return { [DISCARDED_404]: true, [FROM_MEM]: true };
+  }
 
   try {
     // El proxy tarda más (descarga + descomprime): timeout amplio para zips,
@@ -1627,6 +1706,17 @@ const classifySubtitle = async (
       return u;
     }
 
+    // Desacuerdo entre la etiqueta regional del proveedor y el léxico: se registran los
+    // términos que decidieron (solo en estos casos, para no pagar la pasada extra siempre).
+    const expectedFlag = RAW_LANG_EXPECTED[rawLang];
+    if (expectedFlag && scored.flag !== expectedFlag && scored.flag !== "🌎 Neutro") {
+      console.log(
+        `[classify] desacuerdo rl=${rawLang} veredicto=${scored.flag} es=${diag.es} lat=${diag.lat} s=${diag.strong} ` +
+          `len=${lenTag} h=${contentHash} | es: ${topTerms(text, DICT_ES)} | lat: ${topTerms(text, DICT_LAT)} | ` +
+          `deb: ${topTerms(text, DICT_ES_WEAK)} ${topTerms(text, DICT_LAT_WEAK)} [${sub.source}]`
+      );
+    }
+
     return {
       id: sub.id,
       url: finalUrl,
@@ -1648,7 +1738,10 @@ const classifySubtitle = async (
     const isPermanentDiscard = isZip
       ? /\bHTTP 4(?:10|22)\b/.test(error.message)
       : /\bHTTP 4(?:04|10)\b/.test(error.message);
-    if (isPermanentDiscard) return { [DISCARDED_404]: true };
+    if (isPermanentDiscard) {
+      if (deadMem) deadMem.added.add(deadHash);
+      return { [DISCARDED_404]: true };
+    }
     console.error("[classify]", sub.source, error.message);
     // Timeout / red caída / 429 / 5xx / 404 de proxy: fallo transitorio → TTL corto.
     return unclassified(sub, finalUrl, true);
@@ -1915,6 +2008,7 @@ export default {
             ? `&s=${season}&e=${episode}`
             : "";
         const analyzed = new Array(deduped.length).fill(null);
+        const deadMem = await loadDeadLinks(deadLinkKey(url.origin, type, fullId));
         const wave1Idx = [];
         const wave2BySource = { "OS-V3": [], "SubDL": [] };
         const seenPerSource = { "OS-V3": 0, "SubDL": 0 };
@@ -1936,7 +2030,7 @@ export default {
               const delay = (osStaggerW1++) * DOWNLOAD_STAGGER_MS;
               if (delay > 0) await new Promise((r) => setTimeout(r, delay));
             }
-            analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix);
+            analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, 0, deadMem);
           })
         );
         const w1Ms = Date.now() - tWave1;
@@ -1973,7 +2067,7 @@ export default {
                 const delay = (osStaggerW2++) * DOWNLOAD_STAGGER_MS;
                 if (delay > 0) await new Promise((r) => setTimeout(r, delay));
               }
-              analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, remainingMs);
+              analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, remainingMs, deadMem);
             })
           );
           w2Ms = Date.now() - tWave2;
@@ -1987,6 +2081,7 @@ export default {
         // Los fallos de descarga (FAILED) NO se sirven: no pasaron por el
         // filtro anti-spam, así que no son pistas verificadas. Solo cuentan
         // para degradar el TTL si su fuente no alcanzó el cupo de 5 limpias.
+        saveDeadLinks(ctx, deadMem);
         const kept = { "OS-V3": 0, "SubDL": 0 };
         const failed = { "OS-V3": 0, "SubDL": 0 };
         let descartes404 = 0;
@@ -2047,10 +2142,10 @@ export default {
         const discCount = subtitles.filter((s) => s[RELEASE_SOURCE] === "disco").length;
         console.log(
           `[subtitles] resumen ${type}/${fullId}: total=${Date.now() - tStart}ms w1=${w1Ms}ms w2=${w2Ms}ms ` +
-            `descargas=${wave1Idx.length + (wave2Ran ? wave2Idx.length : 0)} ` +
+            `descargas=${wave1Idx.length + (wave2Ran ? wave2Idx.length : 0) - deadMem.hits} ` +
             `servidas=${subtitles.length} (OS-V3=${kept["OS-V3"]},SubDL=${kept["SubDL"]}) ` +
             `plataforma=${platformCount}/${subtitles.length} web=${webCount} disco=${discCount} ` +
-            `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} duplicados=${duplicadosContenido} ttl=${ttl}s` +
+            `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} mem404=${deadMem.hits} duplicados=${duplicadosContenido} ttl=${ttl}s` +
             (scoreLog.length ? ` | ${scoreLog.join(" | ")}` : "")
         );
         const response = jsonResponse({ subtitles }, ttl, { "x-cache": "MISS" });

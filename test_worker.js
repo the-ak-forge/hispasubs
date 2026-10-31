@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.32", m10.version === "1.4.32", m10.version);
+  check("manifest version 1.4.33", m10.version === "1.4.33", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2678,6 +2678,162 @@ try {
     check("servido: archivo grande con castellano fuera de las ventanas antiguas -> 🇪🇸 Castellano en el resumen y len=227k",
       r.lines.some((l) => l.includes("resumen") && /🇪🇸 Castellano[^|]*len=2\d\dk/.test(l)), JSON.stringify(r.lines.filter((l) => l.includes("resumen")).map((l) => l.slice(-120))));
     check("sin logs sombra: no aparecen 'pref48=' ni 'full='", !r.lines.some((l) => l.includes("pref48=") || l.includes("full=")));
+  }
+}
+
+// 22) v1.4.33: memoria de enlaces muertos por título + log de desacuerdo etiqueta/texto
+{
+  const jsonR = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
+  // Cache API simulada con almacén real (Map por URL) para comprobar qué se escribe y se lee.
+  const mkCache = () => {
+    const store = new Map(); const ops = { match: 0, put: 0 };
+    return {
+      store, ops,
+      api: {
+        default: {
+          match: async (req) => { ops.match++; const r = store.get(req.url); return r ? r.clone() : undefined; },
+          put: async (req, res) => { ops.put++; store.set(req.url, res.clone()); },
+        },
+      },
+    };
+  };
+  // Una petición /subtitles/movie/<id> con OS-V3 = `os`; `fetchFor(url)` decide la descarga.
+  // Devuelve líneas de log y nº de descargas por URL.
+  const call = async (cache, id, os, fetchFor, ctxWait = true) => {
+    const prevC = mockGlobal("caches", cache.api);
+    const prevF = globalThis.fetch;
+    const hits = {};
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) return Promise.resolve(jsonR({ subtitles: os }));
+      if (u.includes("api.subdl.com")) return Promise.resolve(jsonR({ status: true, subtitles: [] }));
+      hits[u] = (hits[u] || 0) + 1;
+      return Promise.resolve(fetchFor(u));
+    };
+    const l = console.log, e = console.error, lines = [];
+    console.log = (...a) => lines.push(a.join(" ")); console.error = (...a) => lines.push(a.join(" "));
+    const pending = [];
+    let r, j;
+    try {
+      r = await worker.fetch(new Request(`${base}/subtitles/movie/${id}.json`), {}, { waitUntil: ctxWait ? (p) => pending.push(p) : () => {} });
+      j = await r.json();
+      await Promise.all(pending);
+    } finally { console.log = l; console.error = e; globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
+    return { n: j.subtitles.length, ttl: r.headers.get("cache-control"), lines, hits };
+  };
+  const osList = [
+    { id: "d1", url: "https://subs5.strem.io/dead404.srt", lang: "spa" },
+    { id: "o1", url: "https://subs5.strem.io/ok1.srt", lang: "spa" },
+    { id: "o2", url: "https://subs5.strem.io/ok2.srt", lang: "spa" },
+  ];
+  const fetchOk = (u) => u.includes("dead404") ? new Response("gone", { status: 404 }) : textResp(TXT_CAST + " " + u);
+  const resumenOf = (r) => r.lines.find((l) => l.includes("[subtitles] resumen")) || "";
+
+  // A) un 404 se recuerda; al recalcular el título no se vuelve a descargar
+  {
+    const cache = mkCache();
+    const id = "tt7800001";
+    const r1 = await call(cache, id, osList, fetchOk);
+    const deadKey = `${base}/_dead/movie/${id}`;
+    check("v1.4.33 memoria 404: 1ª respuesta descarga el enlace muerto una vez y sirve las 2 válidas",
+      r1.hits["https://subs5.strem.io/dead404.srt"] === 1 && r1.n === 2, JSON.stringify([r1.hits, r1.n]));
+    check("v1.4.33 memoria 404: se escribe UNA entrada /_dead/<tipo>/<id> con huella y marca de tiempo",
+      cache.store.has(deadKey), [...cache.store.keys()].join(","));
+    const body = JSON.parse(await cache.store.get(deadKey).clone().text());
+    check("v1.4.33 memoria 404: la entrada es [[huella, segundos]] y caduca a 1800 s",
+      Array.isArray(body) && body.length === 1 && typeof body[0][0] === "string" && Number.isFinite(body[0][1]) &&
+        cache.store.get(deadKey).headers.get("cache-control") === "public, max-age=1800", JSON.stringify(body));
+    check("v1.4.33 memoria 404: la 1ª respuesta registra mem404=0", /mem404=0\b/.test(resumenOf(r1)), resumenOf(r1).slice(0, 200));
+    // Simula otra clave/colo/caducidad: se borra la lista del título pero se conserva la memoria.
+    for (const k of [...cache.store.keys()]) if (k.includes("/subtitles/")) cache.store.delete(k);
+    const putsBefore2 = cache.ops.put;
+    const r2 = await call(cache, id, osList, fetchOk);
+    check("v1.4.33 memoria 404: al recalcular NO se vuelve a descargar el enlace muerto",
+      !r2.hits["https://subs5.strem.io/dead404.srt"] && r2.n === 2, JSON.stringify([r2.hits, r2.n]));
+    check("v1.4.33 memoria 404: resumen con mem404=1 y descargas= sin contarlo (2 en vez de 3)",
+      /mem404=1\b/.test(resumenOf(r2)) && /descargas=2\b/.test(resumenOf(r2)), resumenOf(r2).slice(0, 220));
+    check("v1.4.33 memoria 404: el enlace recordado sigue contando como descarte 404 (descartes404=1)",
+      /descartes404=1\b/.test(resumenOf(r2)), resumenOf(r2).slice(0, 220));
+    check("v1.4.33 memoria 404: sin muertos nuevos no se reescribe la entrada (solo se guarda la lista del título)",
+      cache.ops.put - putsBefore2 === 1, String(cache.ops.put - putsBefore2));
+
+    // B) caducidad por enlace: con la marca antigua se vuelve a descargar
+    const old = JSON.stringify(body.map(([h, t]) => [h, t - 4000]));
+    cache.store.set(deadKey, new Response(old, { status: 200, headers: { "content-type": "application/json" } }));
+    for (const k of [...cache.store.keys()]) if (k.includes("/subtitles/")) cache.store.delete(k);
+    const r3 = await call(cache, id, osList, fetchOk);
+    check("v1.4.33 memoria 404: un enlace recordado hace >30 min se descarga de nuevo",
+      r3.hits["https://subs5.strem.io/dead404.srt"] === 1 && /mem404=0\b/.test(resumenOf(r3)), JSON.stringify(r3.hits));
+  }
+
+  // C) solo los descartes PERMANENTES se recuerdan (un 500 o un timeout no)
+  {
+    const cache = mkCache();
+    const id = "tt7800002";
+    const f500 = (u) => u.includes("dead404") ? new Response("boom", { status: 500 }) : textResp(TXT_CAST + " " + u);
+    const r = await call(cache, id, osList, f500);
+    check("v1.4.33 memoria 404: un HTTP 500 NO se recuerda (fallo transitorio)",
+      ![...cache.store.keys()].some((k) => k.includes("/_dead/")) && r.n === 2, [...cache.store.keys()].join(","));
+    const f410 = (u) => u.includes("dead404") ? new Response("gone", { status: 410 }) : textResp(TXT_CAST + " " + u);
+    const cache2 = mkCache();
+    await call(cache2, "tt7800003", osList, f410);
+    check("v1.4.33 memoria 404: un HTTP 410 sí se recuerda", [...cache2.store.keys()].some((k) => k.includes("/_dead/movie/tt7800003")));
+  }
+
+  // D) robustez: entrada ilegible o caché que lanza -> sin memoria y sin romper
+  {
+    const cache = mkCache();
+    cache.store.set(`${base}/_dead/movie/tt7800004`, new Response("no es json{", { status: 200 }));
+    const r = await call(cache, "tt7800004", osList, fetchOk);
+    check("v1.4.33 memoria 404: entrada ilegible se ignora y la respuesta sigue sirviendo", r.n === 2 && r.hits["https://subs5.strem.io/dead404.srt"] === 1, JSON.stringify([r.n, r.hits]));
+    const boom = { api: { default: { match: async () => { throw new Error("cache caída"); }, put: async () => { throw new Error("cache caída"); } } }, store: new Map(), ops: {} };
+    const rb = await call(boom, "tt7800005", osList, fetchOk, false);
+    check("v1.4.33 memoria 404: con la Cache API caída la respuesta sigue sirviendo", rb.n === 2, String(rb.n));
+  }
+
+  // E) un mismo título con el 404 en otra ruta (zip por proxy 422) también se recuerda con su episodio
+  {
+    const cache = mkCache();
+    const zipOs = [
+      { id: "z1", url: "https://dl.opensubtitles.org/pack1.zip", lang: "spa" },
+      { id: "o1", url: "https://subs5.strem.io/ok1.srt", lang: "spa" },
+    ];
+    const f422 = (u) => u.includes("pack1.zip") || u.includes(encodeURIComponent("pack1.zip")) ? new Response("sin episodio", { status: 422 }) : textResp(TXT_CAST + " " + u);
+    const r = await call(cache, "tt7800006", zipOs, f422);
+    const ok = [...cache.store.keys()].some((k) => k.includes("/_dead/movie/tt7800006"));
+    check("v1.4.33 memoria 404: un HTTP 422 de un zip vía proxy se recuerda y se sirve el resto",
+      ok && r.n === 1, JSON.stringify([...cache.store.keys(), r.n, r.hits]));
+  }
+
+  // F) desacuerdo etiqueta/texto
+  {
+    // spl/spn pasan por `looksSpanish` (≥15 % de palabras funcionales): se antepone prosa española.
+    const FUNC = "el la de que y en un por con para los una es no se lo más pero su al como muy esto eso ya del las le me te si hay yo tú ".repeat(4);
+    const TXT_LAT_L = FUNC + TXT_LAT, TXT_CAST_L = FUNC + TXT_CAST;
+    const mk = (lang) => [{ id: "x1", url: "https://subs5.strem.io/x1.srt", lang }];
+    const disagree = (r) => r.lines.find((l) => l.includes("[classify] desacuerdo")) || "";
+    let r = await call(mkCache(), "tt7800010", mk("spl"), () => textResp(TXT_CAST_L));
+    let d = disagree(r);
+    check("v1.4.33 desacuerdo: spl + léxico Castellano -> línea con rl, veredicto, términos y hash",
+      /rl=spl veredicto=🇪🇸 Castellano/.test(d) && /es: coche×\d+/.test(d) && /h=\d+:[a-z0-9]+-[a-z0-9]+/.test(d) && /\[OS-V3\]$/.test(d), d);
+    check("v1.4.33 desacuerdo: la línea trae también los términos del otro bando y los débiles",
+      /\| lat: /.test(d) && /\| deb: /.test(d) && /vale×\d+/.test(d), d);
+    r = await call(mkCache(), "tt7800011", mk("spl"), () => textResp(TXT_LAT_L));
+    check("v1.4.33 desacuerdo: spl + Latino (coincide) -> sin línea", !disagree(r));
+    r = await call(mkCache(), "tt7800012", mk("spn"), () => textResp(TXT_LAT_L));
+    d = disagree(r);
+    check("v1.4.33 desacuerdo: spn + léxico Latino -> línea con rl=spn y términos latinos",
+      /rl=spn veredicto=🇲🇽 Latino/.test(d) && /lat: (carro|wey|güey|celular)×\d+/.test(d), d);
+    r = await call(mkCache(), "tt7800013", mk("spn"), () => textResp(TXT_CAST_L));
+    check("v1.4.33 desacuerdo: spn + Castellano (coincide) -> sin línea", !disagree(r));
+    r = await call(mkCache(), "tt7800014", mk("spa"), () => textResp(TXT_CAST_L));
+    check("v1.4.33 desacuerdo: etiqueta spa (sin dialecto) nunca genera línea", !disagree(r));
+    r = await call(mkCache(), "tt7800015", mk("spl"), () => textResp("Hola, buenos días a todos en la casa. ".repeat(40)));
+    check("v1.4.33 desacuerdo: spl + 📄 (sin léxico) no es desacuerdo", !disagree(r));
+    const mixed = FUNC + "coche coche coche carro carro carro";
+    r = await call(mkCache(), "tt7800016", mk("spl"), () => textResp(mixed));
+    check("v1.4.33 desacuerdo: spl + 🌎 Neutro (léxico empatado) no es desacuerdo",
+      !disagree(r) && /🌎 Neutro/.test(resumenOf(r)), resumenOf(r).slice(-160));
   }
 }
 
