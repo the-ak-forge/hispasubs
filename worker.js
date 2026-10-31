@@ -1,6 +1,19 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.33
+// HispaSubs — Cloudflare Worker v1.4.34
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.34 (31/10/2026):
+//  - [LÉXICO / "carajo"] Pasa de término fuerte Latino a débil (0,25). Datos de producción
+//    (10 h, 31 archivos únicos con etiqueta `spl`/`spn` en desacuerdo con el texto): 12
+//    llevaban "carajo" y 11 de ellos tenían además marcadores exclusivos de España
+//    ("vosotros", "sois", "guay", "hostia", "chaval"...); en 4 el término estuvo a menos de
+//    3 puntos de empujar un archivo castellano a Neutro. Sigue sumando a Latino, pero ya no
+//    decide solo ni con el override de 2 términos.
+//  - [TELEMETRÍA] El resumen añade `mem404w=N`: entradas nuevas escritas en la memoria de
+//    enlaces muertos de esa respuesta. En producción (v1.4.33) `mem404` fue 0 en 969
+//    respuestas porque ningún título con 404 se recalculó en 30 min en el mismo centro de
+//    datos; `mem404w>0` confirma que la escritura ocurre y, junto a `mem404>0` más tarde,
+//    que persiste.
 //
 // v1.4.33 (30/10/2026):
 //  - [ENLACES MUERTOS / MEMORIA POR TÍTULO] Los enlaces que ya dieron un descarte permanente
@@ -512,16 +525,18 @@
 // Términos ambiguos (DICT_*_WEAK, peso WEAK_WEIGHT): comunes a ambos lados
 // o con falsos positivos demostrados —"No vale la pena" contaba como España,
 // "el Papa" y "ganancia neta" como Latino, "ustedes" (formal en España)
-// como Latino—. Cuentan 0,25 en vez de 1 para que una palabra suelta no
+// como Latino—, y "carajo" (v1.4.34: también se usa en España; 12 de 31 archivos `spl`
+// clasificados Castellano en producción lo llevaban, 11 con otros marcadores claros de
+// España). Cuentan 0,25 en vez de 1 para que una palabra suelta no
 // decida la clasificación; solo pesan cuando aparecen muchas veces.
 const WEAK_WEIGHT = 0.25;
 const DICT_ES = /(?<![\p{L}\p{N}_])(?:vosotros|ordenador(?:es)?|coche[s]?|gilipollas|hostias?|chaval(?:es)?|foll(?:ar|a|an|en|ó|o|ado|ando)|guay|m[oó]vil(?:es)?(?!\s+del\s+(?:crimen|asesinato|delito|robo|ataque)|\s+perpetuo)|patata[s]?|zumo[s]?|aparqu[\p{L}]*|aparc[\p{L}]*|condu(?:cir|zco|zca|zcan|ces|ce|cen|jiste|jeron|jo|cía|cías|cíamos|cían|ciendo|cido)(?!\s+a\s+(?:nada|eso|esto|ninguna\s+parte|la\s+ruina|un\s+desastre|una?\s+conclusi[oó]n))|enfad[\p{L}]*|nevera[s]?|jol[ií]n|mol(?:a|an)|ten[eé]is|sois|est[aá]is|mogoll[oó]n|curr(?:ar|o|as|a|amos|áis|an|ando|ado|ante[s]?)|flip(?:ar|o|as|a|amos|áis|an|é|ó|ando|ado|ante[s]?))(?![\p{L}\p{N}_])/giu;
-const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?(?!\s+de\s+(?:(?:la\s+)?compra|combate)|\s+blindado)|auto(?:s)?|pendej[\p{L}]*|ching(?:ar|a|as|an|o|ó|aron|aba|aban|ado|ada|ando|ón|ones|ue|ues|uen|ué|adera)|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion(?:ar|a|as|an|ó|é|aste|aron|aba|abas|ábamos|aban|ado|ada|ando|amiento)|manej[\p{L}]*(?!\s+del?(?![\p{L}\p{N}_]))|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|carajo|[oó]rale|chido|bacano|bolud[\p{L}]*|pelotud[\p{L}]*|pibe[s]?|quilombo[s]?|tenés|querés|podés|sabés|decís|vení|mirá|we[oó]n(?:es|a|as)?|huev[oó]n(?:es|a|as)?|cachai|polol[oa][s]?|parce(?:ro|ra|ros|ras)?|chimba[s]?|chamo[s]?)(?![\p{L}\p{N}_])/giu;
+const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?(?!\s+de\s+(?:(?:la\s+)?compra|combate)|\s+blindado)|auto(?:s)?|pendej[\p{L}]*|ching(?:ar|a|as|an|o|ó|aron|aba|aban|ado|ada|ando|ón|ones|ue|ues|uen|ué|adera)|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion(?:ar|a|as|an|ó|é|aste|aron|aba|abas|ábamos|aban|ado|ada|ando|amiento)|manej[\p{L}]*(?!\s+del?(?![\p{L}\p{N}_]))|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|[oó]rale|chido|bacano|bolud[\p{L}]*|pelotud[\p{L}]*|pibe[s]?|quilombo[s]?|tenés|querés|podés|sabés|decís|vení|mirá|we[oó]n(?:es|a|as)?|huev[oó]n(?:es|a|as)?|cachai|polol[oa][s]?|parce(?:ro|ra|ros|ras)?|chimba[s]?|chamo[s]?)(?![\p{L}\p{N}_])/giu;
 const DICT_ES_WEAK = /(?<![\p{L}\p{N}_])(?:vale|jod(?:e|es|en|emos|er|a|as|an|ía|ías|íamos|ían|ió|ieron|iendo|ido|ida|idos|idas))(?![\p{L}\p{N}_])/giu;
 // Sin flag `i`: "os" / "Os" (inicio de frase) suman 0,25 para España, pero
 // "OS" en mayúsculas (Operating System) no casa nunca.
 const DICT_ES_WEAK_CS = /(?<![\p{L}\p{N}_])[oO]s(?![\p{L}\p{N}_])/gu;
-const DICT_LAT_WEAK = /(?<![\p{L}\p{N}_])(?:papa[s]?|neta[s]?|ustedes|fome[s]?)(?![\p{L}\p{N}_])/giu;
+const DICT_LAT_WEAK = /(?<![\p{L}\p{N}_])(?:papa[s]?|neta[s]?|ustedes|fome[s]?|carajo)(?![\p{L}\p{N}_])/giu;
 // Guarda contra archivos en portugués mal etiquetados como español (donde
 // "carro", "celular" o "estacionamento" darían falso positivo Latino). Sin
 // flag `i` para que "Ã" de mojibake UTF-8 no cuente como tilde portuguesa,
@@ -898,7 +913,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.33",
+  version: "1.4.34",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1574,7 +1589,7 @@ const loadDeadLinks = async (keyUrl) => {
   return mem;
 };
 const saveDeadLinks = (ctx, mem) => {
-  if (!mem || mem.added.size === 0) return;
+  if (!mem || mem.added.size === 0) return 0;
   const now = Math.floor(Date.now() / 1000);
   const merged = new Map(mem.known);
   for (const h of mem.added) merged.set(h, now);
@@ -1587,6 +1602,7 @@ const saveDeadLinks = (ctx, mem) => {
       headers: { "content-type": "application/json", "cache-control": `public, max-age=${DEAD_LINK_TTL_S}` },
     })
   );
+  return mem.added.size;
 };
 const FROM_MEM = Symbol.for("hispasubs.fromDeadMemory");
 
@@ -2081,7 +2097,7 @@ export default {
         // Los fallos de descarga (FAILED) NO se sirven: no pasaron por el
         // filtro anti-spam, así que no son pistas verificadas. Solo cuentan
         // para degradar el TTL si su fuente no alcanzó el cupo de 5 limpias.
-        saveDeadLinks(ctx, deadMem);
+        const deadWritten = saveDeadLinks(ctx, deadMem);
         const kept = { "OS-V3": 0, "SubDL": 0 };
         const failed = { "OS-V3": 0, "SubDL": 0 };
         let descartes404 = 0;
@@ -2145,7 +2161,7 @@ export default {
             `descargas=${wave1Idx.length + (wave2Ran ? wave2Idx.length : 0) - deadMem.hits} ` +
             `servidas=${subtitles.length} (OS-V3=${kept["OS-V3"]},SubDL=${kept["SubDL"]}) ` +
             `plataforma=${platformCount}/${subtitles.length} web=${webCount} disco=${discCount} ` +
-            `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} mem404=${deadMem.hits} duplicados=${duplicadosContenido} ttl=${ttl}s` +
+            `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} mem404=${deadMem.hits} mem404w=${deadWritten} duplicados=${duplicadosContenido} ttl=${ttl}s` +
             (scoreLog.length ? ` | ${scoreLog.join(" | ")}` : "")
         );
         const response = jsonResponse({ subtitles }, ttl, { "x-cache": "MISS" });

@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.33", m10.version === "1.4.33", m10.version);
+  check("manifest version 1.4.34", m10.version === "1.4.34", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2681,6 +2681,22 @@ try {
   }
 }
 
+// 21b) v1.4.34: "carajo" es un término débil (también se usa en España)
+{
+  const sc = (t) => scoreText(t);
+  check('v1.4.34 "carajo" solo (×6) ya no decide Latino: sin término fuerte -> sin veredicto',
+    sc("Qué carajo pasa. ".repeat(6)) === null, JSON.stringify(sc("Qué carajo pasa. ".repeat(6))));
+  const castCarajo = "Vosotros sois guay, coche. " + "¡Qué carajo! ".repeat(8);
+  check('v1.4.34 texto con marcadores de España + "carajo" ×8 ya no sale Latino',
+    sc(castCarajo)?.flag !== "🇲🇽 Latino", JSON.stringify(sc(castCarajo)));
+  const castCarajoReal = "Vosotros sois guay, el coche está aparcado, tenéis el ordenador y el móvil. " + "¡Qué carajo! ".repeat(4);
+  check('v1.4.34 castellano claro con "carajo" ×4 sigue siendo 🇪🇸 Castellano', sc(castCarajoReal)?.flag === "🇪🇸 Castellano", JSON.stringify(sc(castCarajoReal)));
+  const latCarajo = "Oye wey, agarra el celular, el carro y la computadora, carajo. Carajo, qué chido.";
+  check('v1.4.34 latino con términos fuertes + "carajo" sigue siendo 🇲🇽 Latino', sc(latCarajo)?.flag === "🇲🇽 Latino", JSON.stringify(sc(latCarajo)));
+  const diag = {}; scoreText("carajo carajo carajo carajo", diag);
+  check('v1.4.34 diag: lat=1 (4×0,25) y s=0 para "carajo" ×4 (pesa 0,25 y no es fuerte)', diag.lat === 1 && diag.strong === 0, JSON.stringify(diag));
+}
+
 // 22) v1.4.33: memoria de enlaces muertos por título + log de desacuerdo etiqueta/texto
 {
   const jsonR = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
@@ -2744,6 +2760,7 @@ try {
       Array.isArray(body) && body.length === 1 && typeof body[0][0] === "string" && Number.isFinite(body[0][1]) &&
         cache.store.get(deadKey).headers.get("cache-control") === "public, max-age=1800", JSON.stringify(body));
     check("v1.4.33 memoria 404: la 1ª respuesta registra mem404=0", /mem404=0\b/.test(resumenOf(r1)), resumenOf(r1).slice(0, 200));
+    check("v1.4.34 mem404w: la 1ª respuesta registra mem404w=1 (entrada nueva escrita)", /mem404=0 mem404w=1\b/.test(resumenOf(r1)), resumenOf(r1).slice(0, 260));
     // Simula otra clave/colo/caducidad: se borra la lista del título pero se conserva la memoria.
     for (const k of [...cache.store.keys()]) if (k.includes("/subtitles/")) cache.store.delete(k);
     const putsBefore2 = cache.ops.put;
@@ -2752,6 +2769,7 @@ try {
       !r2.hits["https://subs5.strem.io/dead404.srt"] && r2.n === 2, JSON.stringify([r2.hits, r2.n]));
     check("v1.4.33 memoria 404: resumen con mem404=1 y descargas= sin contarlo (2 en vez de 3)",
       /mem404=1\b/.test(resumenOf(r2)) && /descargas=2\b/.test(resumenOf(r2)), resumenOf(r2).slice(0, 220));
+    check("v1.4.34 mem404w: al recalcular sin muertos nuevos registra mem404w=0", /mem404=1 mem404w=0\b/.test(resumenOf(r2)), resumenOf(r2).slice(0, 260));
     check("v1.4.33 memoria 404: el enlace recordado sigue contando como descarte 404 (descartes404=1)",
       /descartes404=1\b/.test(resumenOf(r2)), resumenOf(r2).slice(0, 220));
     check("v1.4.33 memoria 404: sin muertos nuevos no se reescribe la entrada (solo se guarda la lista del título)",

@@ -66,14 +66,16 @@ if (langLines.length) {
 
 // ---- v1.4.33: memoria de enlaces muertos y desacuerdo etiqueta/texto ---------------
 {
-  let down = 0, mem = 0, d404 = 0, withMem = 0;
+  let down = 0, mem = 0, d404 = 0, withMem = 0, memW = 0, withMemW = 0;
   for (const m of resumen) {
     const a = m.match(/ descargas=(\d+)/), b = m.match(/ mem404=(\d+)/), c = m.match(/ descartes404=(\d+)/);
     if (a) down += +a[1]; if (c) d404 += +c[1];
     if (b) { mem += +b[1]; if (+b[1] > 0) withMem++; }
+    const w = m.match(/ mem404w=(\d+)/); if (w) { memW += +w[1]; if (+w[1] > 0) withMemW++; }
   }
-  console.log(`\n== enlaces muertos: descargas reales ${down} | descartes404 ${d404} | omitidos por memoria (mem404) ${mem} en ${withMem} respuestas ==`);
+  console.log(`\n== enlaces muertos: descargas reales ${down} | descartes404 ${d404} | omitidos por memoria (mem404) ${mem} en ${withMem} respuestas | entradas escritas (mem404w) ${memW} en ${withMemW} respuestas ==`);
   if (!resumen.some((m) => m.includes(" mem404="))) console.log("(sin mem404= en este export: es anterior a la v1.4.33)");
+  else if (!resumen.some((m) => m.includes(" mem404w="))) console.log("(sin mem404w= en este export: es anterior a la v1.4.34)");
 
   // Desacuerdos: una línea por archivo (huella h=) aunque se recalcule muchas veces.
   const dis = msgs.filter((m) => m.startsWith("[classify] desacuerdo "));
