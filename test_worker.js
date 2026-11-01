@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.35", m10.version === "1.4.35", m10.version);
+  check("manifest version 1.4.36", m10.version === "1.4.36", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -3044,7 +3044,7 @@ try {
     const htmlCfg = await resCfg.text();
     check("v1.4.35 configure: preselecciona la tarjeta activa según dialectOrder en la URL",
       htmlCfg.includes('id="dialectOrder" value="lat"') &&
-        htmlCfg.includes('class="opt-card active" data-order="lat"'));
+        /value="lat" checked/.test(htmlCfg) && !/value="auto" checked/.test(htmlCfg));
 
     const resXssOrd = await get(`/${b64url({ dialectOrder: '"><script>alert(1)</script>' })}/configure`);
     const htmlXssOrd = await resXssOrd.text();
@@ -3077,6 +3077,76 @@ try {
     check("v1.4.35 configure JS: con clave y orden 'es' codifica ambos campos",
       cfgBoth.subdlKey === "clave999" && cfgBoth.dialectOrder === "es", JSON.stringify(cfgBoth));
   }
+}
+
+// 25) v1.4.36: página de configuración rediseñada (radios, vista previa, claro/oscuro, copiar con respaldo)
+{
+  const pg = await (await get("/configure")).text();
+  check("v1.4.36 página: 4 radios nativos de orden y SOLO 'auto' marcado por defecto",
+    (pg.match(/type="radio" name="dialect-choice"/g) || []).length === 4 && /value="auto" checked/.test(pg) && (pg.match(/ checked /g) || []).length === 1 && /id="dialectOrder" value="auto"/.test(pg));
+  const pgEs = await (await get(`/${b64url({ dialectOrder: "es", subdlKey: "mi_clave_123" })}/configure`)).text();
+  check("v1.4.36 página con config: marca 'es' y rellena la clave (escapada)", /value="es" checked/.test(pgEs) && /id="dialectOrder" value="es"/.test(pgEs) && pgEs.includes('value="mi_clave_123"'));
+  const pgBad = await (await get(`/${b64url({ dialectOrder: '"><img src=x onerror=alert(1)>', subdlKey: '"><img src=y onerror=alert(2)>' })}/configure`)).text();
+  check("v1.4.36 página: dialectOrder y clave maliciosos no se reflejan como HTML", !pgBad.includes("<img src=x") && !pgBad.includes("<img src=y") && /id="dialectOrder" value="auto"/.test(pgBad));
+  check("v1.4.36 página: la configuración antigua `order` (alias) también preselecciona", /value="lat" checked/.test(await (await get(`/${b64url({ order: "lat" })}/configure`)).text()));
+  check("v1.4.36 página: sin interpolaciones sin resolver ni versión escrita a mano", !pg.includes("${") && !pg.includes("undefined") && !pg.includes("[object") && !/ver-badge/.test(pg) && !/v1\.4\.\d+/.test(pg));
+  check("v1.4.36 página: textos clave y accesibilidad (main, legend, foco, reduced-motion, claro/oscuro, aria-live)",
+    ["Instalar en Stremio", "Copiar URL", "Automático", "Latino primero", "Castellano primero", "Sin ordenar", "Así se verá la lista", "no compartas esa URL"].every((x) => pg.includes(x)) &&
+      pg.includes("<main>") && pg.includes("<legend") && pg.includes(":focus-visible") && pg.includes("prefers-reduced-motion") && pg.includes("prefers-color-scheme:dark") && /role="status" aria-live="polite"/.test(pg));
+  check("v1.4.36 página: la clave sigue en type=password con autocomplete off y rel=noopener en el enlace externo", /type="password" id="subdlKey" autocomplete="off"/.test(pg) && /href="https:\/\/subdl\.com" target="_blank" rel="noopener"/.test(pg));
+  const sc = pg.split("<script>")[1].split("</script>")[0];
+  const load = (doc, win = { location: { host: "h" } }, nav = {}) => new Function("document", "window", "navigator", "btoa", "TextEncoder", sc + "; return { stagePref, rankOf, stageNote, copyManifest, toggleKey, getManifestUrl };")(doc, win, nav, (x) => btoa(x), TextEncoder);
+  // La vista previa debe reproducir el orden REAL del servidor (solo sube el dialecto elegido; resto estable)
+  const sample = [["es", "🇪🇸 Castellano (OS-V3)"], ["la", "🇲🇽 Latino (SubDL)"], ["ne", "🌎 Neutro (OS-V3)"], ["la", "🇲🇽 Latino (SDH) (OS-V3)"], ["un", "📄 Español (sin clasificar)"]];
+  const api = load({ getElementById: () => ({ value: "lat" }) });
+  for (const pref of ["lat", "es"]) {
+    const pv = sample.map(([k, l], i) => [k, l, i]).sort((a, b) => api.rankOf(a[0], pref) - api.rankOf(b[0], pref) || a[2] - b[2]).map((x) => x[1]);
+    const srv = orderSubtitlesByDialect(sample.map(([, l]) => ({ label: l })), pref).map((x) => x.label);
+    check(`v1.4.36 vista previa = orden del servidor (${pref})`, JSON.stringify(pv) === JSON.stringify(srv), JSON.stringify([pv, srv]));
+  }
+  check("v1.4.36 stagePref: lat/es/none explícitos; auto usa el ejemplo elegido",
+    load({ getElementById: () => ({ value: "lat" }) }).stagePref() === "lat" && load({ getElementById: () => ({ value: "es" }) }).stagePref() === "es" && load({ getElementById: () => ({ value: "none" }) }).stagePref() === null && load({ getElementById: () => ({ value: "auto" }) }).stagePref() === "lat");
+  check("v1.4.36 stageNote: describe lo que hace cada modo", /sin ordenar|original|fuentes/i.test(api.stageNote("none", null)) && /latinos van primero/.test(api.stageNote("lat", "lat")) && /España van primero/.test(api.stageNote("es", "es")) && /LATINO/.test(api.stageNote("auto", "lat")) && /no dice nada/.test(api.stageNote("auto", null)));
+  // copiar: con portapapeles, sin él y con permiso denegado
+  const runCopy = async (nav) => {
+    const st = { status: "", manualOpen: false, selected: 0, btn: "Copiar URL" };
+    const els = { copyBtn: { set textContent(v) { st.btn = v; }, get textContent() { return st.btn; } }, status: { set textContent(v) { st.status = v; } }, manual: { set open(v) { st.manualOpen = v; } }, manifestUrl: { focus() {}, select() { st.selected++; } }, subdlKey: { value: "" }, dialectOrder: { value: "auto" } };
+    const a = load({ getElementById: (id) => els[id] }, { location: { host: "h" } }, nav);
+    a.copyManifest(); await new Promise((r) => setTimeout(r, 0));
+    return st;
+  };
+  let st = await runCopy({});
+  check("v1.4.36 copiar sin portapapeles: abre el bloque manual, selecciona la URL y lo avisa (sin excepción)", st.manualOpen && st.selected === 1 && /Ctrl\+C/.test(st.status), JSON.stringify(st));
+  st = await runCopy({ clipboard: { writeText: () => Promise.reject(new Error("denegado")) } });
+  check("v1.4.36 copiar con permiso denegado: mismo respaldo manual", st.manualOpen && st.selected === 1, JSON.stringify(st));
+  st = await runCopy({ clipboard: { writeText: () => Promise.resolve() } });
+  check("v1.4.36 copiar OK: botón 'Copiada' y aviso, sin respaldo", st.btn === "Copiada" && /URL copiada/.test(st.status) && !st.manualOpen, JSON.stringify(st));
+  // mostrar/ocultar clave
+  const inp = { type: "password" }; const tb = { textContent: "Mostrar", setAttribute(k, v) { this[k] = v; } };
+  load({ getElementById: (id) => id === "subdlKey" ? inp : tb }).toggleKey();
+  check("v1.4.36 mostrar clave: type=text, texto 'Ocultar' y aria-pressed=true", inp.type === "text" && tb.textContent === "Ocultar" && tb["aria-pressed"] === "true");
+
+  // HIT: log solo cuando el orden cambia
+  const store = new Map();
+  const cacheApi = { default: { match: async (q) => { const x = store.get(q.url); return x ? x.clone() : undefined; }, put: async (q, rs) => { store.set(q.url, rs.clone()); } } };
+  const prevC = mockGlobal("caches", cacheApi), prevF = globalThis.fetch;
+  globalThis.fetch = (input) => { const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) return Promise.resolve(new Response(JSON.stringify({ subtitles: [{ id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" }, { id: "b", url: "https://subs5.strem.io/b.srt", lang: "spa" }] }), { status: 200, headers: { "content-type": "application/json" } }));
+    if (u.includes("api.subdl.com")) return Promise.resolve(new Response(JSON.stringify({ status: true, subtitles: [] }), { status: 200, headers: { "content-type": "application/json" } }));
+    return Promise.resolve(textResp(u.includes("/a.srt") ? TXT_CAST : TXT_LAT)); };
+  const l0 = console.log, e0 = console.error, lines = [];
+  console.log = (...a) => lines.push(a.join(" ")); console.error = () => {};
+  let hitCast, hitLat;
+  try {
+    await worker.fetch(new Request(`${base}/subtitles/movie/tt7860001.json`), {}, { waitUntil: () => {} });
+    hitCast = await worker.fetch(new Request(`${base}/subtitles/movie/tt7860001/filename=Peli.Castellano.mkv.json`), {}, { waitUntil: () => {} });
+    const nCast = lines.filter((x) => x.includes("aplicado en HIT")).length;
+    hitLat = await worker.fetch(new Request(`${base}/subtitles/movie/tt7860001/filename=Peli.LATINO.mkv.json`), {}, { waitUntil: () => {} });
+    const jl = await hitLat.json();
+    check("v1.4.36 HIT: sin cambio de orden (ya era el canónico) no hay log", nCast === 0, String(nCast));
+    check("v1.4.36 HIT: con cambio de orden se registra 'orden=lat aplicado en HIT' y se sirve latino primero",
+      lines.some((x) => x.includes("orden=lat aplicado en HIT")) && jl.subtitles[0].label.startsWith("🇲🇽"), lines.join("|").slice(0, 160));
+  } finally { console.log = l0; console.error = e0; globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

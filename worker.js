@@ -1,6 +1,18 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.35
+// HispaSubs — Cloudflare Worker v1.4.36
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.36 (31/10/2026):
+//  - [CONFIGURE / REDISEÑO] Nueva página de configuración: opciones de orden como radios
+//    nativos (teclado y lectores de pantalla), vista previa en vivo de la lista de
+//    subtítulos con el orden elegido (en «Automático» con tres nombres de archivo de
+//    ejemplo), SubDL como paso opcional con aviso de que la clave viaja en la URL, barra
+//    fija «Instalar en Stremio» / «Copiar URL» (si no hay portapapeles se muestra la URL
+//    para copiarla a mano), tema claro/oscuro según el sistema, móvil primero, foco
+//    visible y `prefers-reduced-motion`. Sin versión escrita en el HTML (antes la insignia
+//    había que subirla a mano). Mantiene `dialectOrder` (`auto|lat|es|none`) de 1.4.35.
+//  - [TELEMETRÍA] `[subtitles] orden=<lat|es> aplicado en HIT` solo cuando el orden cambió
+//    (en MISS ya salía `orden=` en el resumen).
 //
 // v1.4.35 (31/10/2026):
 //  - [ORDEN POR ARCHIVO / PREFERENCIA] Reordenación inteligente de la lista de
@@ -964,100 +976,257 @@ const orderSubtitlesByDialect = (subtitles, targetDialect) => {
 // ---------------------------------------------------------------------------
 
 const getConfigureHTML = (existingConfig = {}) => {
-  const currentOrder = normalizeDialectOrder(existingConfig.dialectOrder ?? existingConfig.order);
-  const cardCls = (v) => (currentOrder === v ? "opt-card active" : "opt-card");
-  const cardAria = (v) => (currentOrder === v ? "true" : "false");
+  const dialect = normalizeDialectOrder(existingConfig.dialectOrder ?? existingConfig.order);
+  const chk = (m) => (dialect === m ? " checked" : "");
   return `<!DOCTYPE html>
-<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Configuración | HispaSubs</title><style>
-:root { --bg: #0b0f17; --card: #151c28; --card-alt: #1c2536; --border: rgba(255,255,255,0.09); --accent: #00d2ff; --accent-hover: #38bdf8; --text: #f8fafc; --muted: #94a3b8; }
-* { box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: radial-gradient(circle at 50% 0%, #17253b 0%, var(--bg) 65%); color: var(--text); display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 24px 16px; }
-.container { background-color: var(--card); padding: 32px 28px; border-radius: 18px; border: 1px solid var(--border); box-shadow: 0 20px 50px rgba(0,0,0,0.55); max-width: 540px; width: 100%; }
-.header { text-align: center; margin-bottom: 22px; }
-.logo-wrap { display: inline-flex; align-items: center; justify-content: center; margin-bottom: 8px; }
-.title-row { display: flex; align-items: center; justify-content: center; gap: 10px; margin: 4px 0 8px; }
-h1 { margin: 0; color: var(--accent); font-size: 28px; letter-spacing: -0.4px; }
-.ver-badge { font-size: 11px; font-weight: 700; color: var(--accent); background: rgba(0,210,255,0.12); border: 1px solid rgba(0,210,255,0.28); padding: 3px 8px; border-radius: 999px; }
-.subtitle { color: var(--muted); font-size: 14px; margin: 0 0 14px; line-height: 1.5; }
-.pills { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; margin-bottom: 4px; }
-.pill { font-size: 12px; font-weight: 600; color: #e2e8f0; background: var(--card-alt); border: 1px solid var(--border); padding: 4px 10px; border-radius: 999px; }
-.section { background: rgba(11,15,23,0.45); border: 1px solid var(--border); border-radius: 14px; padding: 16px; margin-bottom: 16px; text-align: left; }
-.section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
-.section-title { font-weight: 700; font-size: 14px; color: var(--text); margin: 0; }
-.tag { font-size: 11px; font-weight: 600; color: #cbd5e1; background: rgba(255,255,255,0.07); padding: 2px 8px; border-radius: 999px; }
-.tag-accent { color: var(--accent); background: rgba(0,210,255,0.12); }
-.section-desc { color: var(--muted); font-size: 12.5px; margin: 0 0 12px; line-height: 1.45; }
-.opt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-.opt-card { background: var(--card-alt); border: 1.5px solid var(--border); border-radius: 10px; padding: 10px 12px; cursor: pointer; transition: all 0.18s ease; user-select: none; display: flex; flex-direction: column; gap: 3px; }
-.opt-card:hover { border-color: rgba(0,210,255,0.45); transform: translateY(-1px); }
-.opt-card.active { border-color: var(--accent); background: rgba(0,210,255,0.1); box-shadow: 0 0 0 1px rgba(0,210,255,0.25); }
-.opt-title { font-size: 13px; font-weight: 700; color: var(--text); display: flex; align-items: center; justify-content: space-between; }
-.opt-dot { width: 8px; height: 8px; border-radius: 50%; background: transparent; border: 1.5px solid var(--muted); }
-.opt-card.active .opt-dot { background: var(--accent); border-color: var(--accent); }
-.opt-sub { font-size: 11.5px; color: var(--muted); line-height: 1.35; }
-.input-row { position: relative; display: flex; align-items: center; }
-input[type="password"], input[type="text"] { width: 100%; padding: 11px 78px 11px 12px; border: 1.5px solid var(--border); border-radius: 9px; background-color: var(--card-alt); color: #fff; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; transition: border-color 0.2s; }
-input[type="password"]:focus, input[type="text"]:focus { outline: none; border-color: var(--accent); }
-.toggle-btn { position: absolute; right: 6px; width: auto; padding: 6px 10px; font-size: 11.5px; font-weight: 600; color: var(--muted); background: rgba(255,255,255,0.06); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; }
-.toggle-btn:hover { color: var(--text); border-color: rgba(255,255,255,0.2); }
-.help-text { display: block; margin-top: 8px; color: var(--muted); font-size: 12px; line-height: 1.45; }
-.help-text a { color: var(--accent); text-decoration: none; font-weight: 600; }
-.help-text a:hover { text-decoration: underline; }
-.btn-container { display: flex; flex-direction: column; gap: 10px; margin-top: 18px; }
-.btn-action { font-size: 15px; font-weight: 700; border-radius: 10px; cursor: pointer; width: 100%; padding: 13px 20px; transition: all 0.2s ease; }
-.btn-primary { background: linear-gradient(135deg, #00d2ff 0%, #00a8cc 100%); color: #081018; border: none; box-shadow: 0 4px 14px rgba(0,210,255,0.25); }
-.btn-primary:hover { filter: brightness(1.08); transform: translateY(-1px); }
-.btn-secondary { background-color: transparent; color: var(--accent); border: 1.5px solid rgba(0,210,255,0.45); }
-.btn-secondary:hover { background-color: rgba(0,210,255,0.08); border-color: var(--accent); }
-@media (max-width: 480px) { .container { padding: 24px 18px; } .opt-grid { grid-template-columns: 1fr; } }
-</style></head><body><div class="container"><div class="header"><div class="logo-wrap">${LOGO_SVG}</div><div class="title-row"><h1>HispaSubs</h1><span class="ver-badge">v1.4.35</span></div><p class="subtitle">Clasificación léxica en tiempo real para Stremio.<br>Analiza cada subtítulo y lo etiqueta en <strong>🇲🇽 Latino</strong>, <strong>🇪🇸 Castellano</strong> o <strong>🌎 Neutro</strong>.</p><div class="pills"><span class="pill">🇲🇽 Latino</span><span class="pill">🇪🇸 Castellano</span><span class="pill">🌎 Neutro</span><span class="pill">🎧 SDH</span><span class="pill">🛡️ Anti-spam</span></div></div><div class="section"><div class="section-head"><label class="section-title" for="dialectOrder">1. Orden de dialecto</label><span class="tag tag-accent">Nuevo</span></div><p class="section-desc">Elige qué subtítulos aparecen primero en la lista del reproductor (sin ocultar los demás).</p><input type="hidden" id="dialectOrder" value="${esc(currentOrder)}"><div class="opt-grid" role="radiogroup" aria-label="Orden de dialecto"><div class="${cardCls("auto")}" data-order="auto" role="radio" aria-checked="${cardAria("auto")}" onclick="selectOrder('auto')"><div class="opt-title"><span>✨ Automático</span><span class="opt-dot"></span></div><div class="opt-sub">Según el nombre del archivo (LATINO / CASTELLANO)</div></div><div class="${cardCls("lat")}" data-order="lat" role="radio" aria-checked="${cardAria("lat")}" onclick="selectOrder('lat')"><div class="opt-title"><span>🇲🇽 Latino primero</span><span class="opt-dot"></span></div><div class="opt-sub">Prioriza siempre subtítulos en español latino</div></div><div class="${cardCls("es")}" data-order="es" role="radio" aria-checked="${cardAria("es")}" onclick="selectOrder('es')"><div class="opt-title"><span>🇪🇸 Castellano primero</span><span class="opt-dot"></span></div><div class="opt-sub">Prioriza siempre subtítulos de España</div></div><div class="${cardCls("none")}" data-order="none" role="radio" aria-checked="${cardAria("none")}" onclick="selectOrder('none')"><div class="opt-title"><span>📋 Sin preferencia</span><span class="opt-dot"></span></div><div class="opt-sub">Mantiene el orden original sin reordenar</div></div></div></div><div class="section"><div class="section-head"><label class="section-title" for="subdlKey">2. Clave API de SubDL</label><span class="tag">Opcional · Gratis</span></div><p class="section-desc">OpenSubtitles V3 ya funciona de serie. Añade tu clave de SubDL para sumar hasta 5 pistas verificadas extra por título.</p><div class="input-row"><input type="password" id="subdlKey" placeholder="Pega tu API Key (ej: abc123def456...)" value="${esc(existingConfig.subdlKey || "")}"><button type="button" class="toggle-btn" id="toggleKeyBtn" onclick="toggleKey()">Mostrar</button></div><small class="help-text">Consigue una clave gratuita en <a href="https://subdl.com" target="_blank" rel="noopener">subdl.com</a> (Panel → API) para ampliar el catálogo.</small></div><div class="btn-container"><button type="button" class="btn-action btn-primary" onclick="installAddon()">Instalar en Stremio</button><button type="button" class="btn-action btn-secondary" id="copyBtn" onclick="copyManifest()">Copiar URL del Manifest</button></div></div>
+<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="color-scheme" content="light dark"><title>Configuración | HispaSubs</title>
+<style>
+:root{--bg:#eef2f5;--surface:#ffffff;--ink:#14202b;--muted:#566676;--line:#d3dce4;--accent:#0a6c8c;--on-accent:#ffffff;--hl:#dff3fa;--focus:#0a6c8c;--stage:#0f1a24;--stage-ink:#e8eff5;--stage-muted:#93a5b6;--stage-line:#263647;--stage-hl:#12384a;--stage-accent:#22c5ee;--serif:"Iowan Old Style","Palatino Linotype",Palatino,"Book Antiqua",Georgia,serif;--sans:system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color-scheme:light dark}
+@media (prefers-color-scheme:dark){:root{--stage:#080e14;--bg:#0d151d;--surface:#15202b;--ink:#e8eff5;--muted:#9aabbb;--line:#263647;--accent:#22c5ee;--on-accent:#04222c;--hl:#12384a;--focus:#22c5ee}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 var(--sans)}
+main{max-width:48rem;margin:0 auto;padding:2rem 1rem 0}
+.top{display:flex;align-items:center;gap:1rem;margin-bottom:1.75rem}
+.mark{flex:none;width:4rem;height:4rem;border-radius:1rem;background:var(--stage);border:1px solid var(--stage-line);display:flex;align-items:center;justify-content:center}
+.mark svg{width:2.75rem;height:2.75rem}
+h1{font:700 clamp(2rem,6vw,2.6rem)/1.05 var(--serif);letter-spacing:-.01em;margin:0 0 .3rem}
+.lead{margin:0;color:var(--muted);max-width:34rem}
+h2{font:700 1.35rem/1.25 var(--serif);margin:2.25rem 0 .3rem}
+.hint{margin:0 0 1rem;color:var(--muted);max-width:38rem}
+.note{margin:.6rem 0 0;color:var(--muted);font-size:.9rem;max-width:38rem}
+a{color:var(--accent)}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.order{display:grid;gap:1.25rem;grid-template-columns:minmax(0,1fr)}
+@media (min-width:50rem){.order{grid-template-columns:minmax(0,1fr) minmax(0,.95fr);align-items:start}}
+.opts{margin:0;padding:0;min-width:0;border:1px solid var(--line);border-radius:.75rem;background:var(--surface);overflow:hidden}
+.opt{display:flex;align-items:flex-start;gap:.75rem;padding:.9rem 1rem;cursor:pointer}
+.opt+.opt{border-top:1px solid var(--line)}
+.opt input{flex:none;margin:.3rem 0 0;accent-color:var(--accent)}
+.opt:has(input:checked){background:var(--hl)}
+.opt:focus-within{outline:2px solid var(--focus);outline-offset:-2px}
+.opt-title{display:block;font-weight:600}
+.opt-title small{margin-left:.45rem;font-size:.8rem;font-weight:500;color:var(--accent)}
+.opt-desc{display:block;margin-top:.15rem;color:var(--muted);font-size:.9rem}
+.stage{background:var(--stage);color:var(--stage-ink);border:1px solid var(--stage-line);border-radius:.9rem;padding:1rem}
+.stage-title{margin:0 0 .65rem;font-size:.9rem;color:var(--stage-muted)}
+.chips{display:flex;flex-wrap:wrap;gap:.4rem;margin:0 0 .75rem}
+.chips[hidden]{display:none}
+.chips button{font:inherit;font-size:.8rem;line-height:1.2;color:var(--stage-muted);background:transparent;border:1px solid var(--stage-line);border-radius:999px;padding:.35rem .75rem;cursor:pointer}
+.chips button[aria-pressed="true"]{color:var(--stage-ink);background:var(--stage-hl);border-color:var(--stage-accent)}
+.tracks{list-style:none;margin:0;padding:0;display:grid;gap:.35rem}
+.tracks li{display:flex;align-items:center;gap:.6rem;padding:.55rem .7rem;border-radius:.5rem;border-left:3px solid transparent;background:rgba(255,255,255,.05)}
+.tracks li.on{background:var(--stage-hl);border-left-color:var(--stage-accent)}
+.flag{font-size:1.1rem;line-height:1}
+.tname{flex:1;min-width:0}
+.src{font-size:.75rem;color:var(--stage-muted)}
+.stage-note{margin:.75rem 0 0;min-height:2.6em;font-size:.85rem;color:var(--stage-muted)}
+.field label{display:block;margin-bottom:.35rem;font-weight:600}
+.pw{display:flex;gap:.5rem;max-width:30rem}
+.pw input{flex:1;min-width:0;padding:.7rem .8rem;font:.95rem var(--mono);color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:.6rem}
+button{font:inherit;cursor:pointer}
+.ghost{color:var(--ink);background:transparent;border:1px solid var(--line);border-radius:.6rem;padding:0 1rem}
+details{margin-top:1.5rem;padding-top:.8rem;border-top:1px solid var(--line)}
+details+details{margin-top:.8rem}
+summary{font-weight:600;cursor:pointer}
+details p{margin:.6rem 0 0;color:var(--muted);max-width:38rem}
+details input{width:100%;margin-top:.6rem;padding:.6rem .7rem;font:.85rem var(--mono);color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:.6rem}
+.legend{margin:.6rem 0 0;display:grid;gap:.5rem}
+.legend dt{font-weight:600}
+.legend dd{margin:0;color:var(--muted);font-size:.95rem}
+.bar{position:sticky;bottom:0;margin-top:2rem;background:var(--bg);border-top:1px solid var(--line)}
+.bar-in{max-width:48rem;margin:0 auto;padding:.75rem 1rem max(.75rem,env(safe-area-inset-bottom));display:flex;flex-wrap:wrap;align-items:center;gap:.6rem}
+.primary{min-height:2.75rem;padding:0 1.5rem;font-weight:700;color:var(--on-accent);background:var(--accent);border:0;border-radius:.6rem}
+.primary:hover{filter:brightness(.94)}
+.secondary{min-height:2.75rem;padding:0 1.1rem;color:var(--ink);background:transparent;border:1px solid var(--line);border-radius:.6rem}
+.status{font-size:.9rem;color:var(--muted)}
+button:focus-visible,input:focus-visible,summary:focus-visible,a:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style></head>
+<body onload="initPage()">
+<main>
+<header class="top"><div class="mark">${LOGO_SVG}</div><div><h1>HispaSubs</h1><p class="lead">Cada subtítulo en español se lee y se etiqueta como castellano, latino o neutro, para que elijas el que suena a ti.</p></div></header>
+
+<section aria-labelledby="h-order">
+<h2 id="h-order">Orden de los subtítulos</h2>
+<p class="hint">Elige qué dialecto aparece primero en la lista del reproductor.</p>
+<div class="order">
+<fieldset class="opts"><legend class="sr">Dialecto que va primero</legend>
+<label class="opt"><input type="radio" name="dialect-choice" value="auto"${chk("auto")} onchange="setDialect('auto')"><span><span class="opt-title">Automático<small>recomendado</small></span><span class="opt-desc">Sigue el nombre del archivo que reproduces: con «LATINO» pone primero los latinos; con «CASTELLANO» o «Esp», los de España.</span></span></label>
+<label class="opt"><input type="radio" name="dialect-choice" value="lat"${chk("lat")} onchange="setDialect('lat')"><span><span class="opt-title">Latino primero</span><span class="opt-desc">Los 🇲🇽 latinos arriba; el resto, en su orden.</span></span></label>
+<label class="opt"><input type="radio" name="dialect-choice" value="es"${chk("es")} onchange="setDialect('es')"><span><span class="opt-title">Castellano primero</span><span class="opt-desc">Los 🇪🇸 de España arriba; el resto, en su orden.</span></span></label>
+<label class="opt"><input type="radio" name="dialect-choice" value="none"${chk("none")} onchange="setDialect('none')"><span><span class="opt-title">Sin ordenar</span><span class="opt-desc">Respeta el orden en que llegan de las fuentes.</span></span></label>
+</fieldset>
+<div class="stage">
+<p class="stage-title">Así se verá la lista</p>
+<div class="chips" id="chips" role="group" aria-label="Nombre de archivo de ejemplo"><button type="button" id="s-lat" aria-pressed="true" onclick="setSample('lat')">Coco.2017.LATINO.mkv</button><button type="button" id="s-es" aria-pressed="false" onclick="setSample('es')">Oppenheimer.Castellano.mkv</button><button type="button" id="s-none" aria-pressed="false" onclick="setSample('none')">Dune.2021.1080p.mkv</button></div>
+<ol class="tracks" id="tracks">
+<li id="t0" data-i="0" data-k="es"><span class="flag">🇪🇸</span><span class="tname">Castellano</span><span class="src">OS-V3</span></li>
+<li id="t1" data-i="1" data-k="la"><span class="flag">🇲🇽</span><span class="tname">Latino</span><span class="src">SubDL</span></li>
+<li id="t2" data-i="2" data-k="ne"><span class="flag">🌎</span><span class="tname">Neutro</span><span class="src">OS-V3</span></li>
+<li id="t3" data-i="3" data-k="la"><span class="flag">🇲🇽</span><span class="tname">Latino (SDH)</span><span class="src">OS-V3</span></li>
+<li id="t4" data-i="4" data-k="un"><span class="flag">📄</span><span class="tname">Español (sin clasificar)</span><span class="src">OS-V3</span></li>
+</ol>
+<p class="stage-note" id="stageNote" aria-live="polite"></p>
+</div>
+</div>
+</section>
+
+<section aria-labelledby="h-key">
+<h2 id="h-key">Más subtítulos con SubDL (opcional)</h2>
+<p class="hint">Suma el catálogo de SubDL al de OpenSubtitles. Consigue una clave gratis en <a href="https://subdl.com" target="_blank" rel="noopener">subdl.com</a>.</p>
+<div class="field"><label for="subdlKey">Clave de API</label><div class="pw"><input type="password" id="subdlKey" autocomplete="off" spellcheck="false" placeholder="Pega tu clave aquí" value="${esc(existingConfig.subdlKey || "")}" oninput="refreshUrl()"><button type="button" class="ghost" id="showKey" aria-pressed="false" onclick="toggleKey()">Mostrar</button></div></div>
+<p class="note">La clave viaja dentro de la URL de instalación: no compartas esa URL.</p>
+</section>
+
+<input type="hidden" id="dialectOrder" value="${dialect}">
+
+<details id="legend"><summary>¿Qué significan las etiquetas?</summary>
+<dl class="legend">
+<div><dt>🇪🇸 Castellano</dt><dd>Vocabulario de España: coche, vosotros, ordenador, vale…</dd></div>
+<div><dt>🇲🇽 Latino</dt><dd>Vocabulario latinoamericano: carro, celular, ustedes, órale…</dd></div>
+<div><dt>🌎 Neutro</dt><dd>Sin rasgos claros de un dialecto, o con rasgos de los dos.</dd></div>
+<div><dt>📄 Sin clasificar</dt><dd>El texto no tiene vocabulario suficiente para decidir.</dd></div>
+</dl>
+<p>La etiqueta sale de leer el propio subtítulo, no de lo que declare la fuente.</p>
+</details>
+<details id="manual"><summary>¿No se abre Stremio?</summary>
+<p>Copia esta URL e instálala a mano: en Stremio abre Complementos, pulsa «Añadir complemento» y pégala.</p>
+<input type="text" id="manifestUrl" readonly value="" aria-label="URL del complemento" onfocus="this.select()">
+</details>
+</main>
+
+<div class="bar"><div class="bar-in"><button type="button" class="primary" onclick="installAddon()">Instalar en Stremio</button><button type="button" class="secondary" id="copyBtn" onclick="copyManifest()">Copiar URL</button><span class="status" id="status" role="status" aria-live="polite"></span></div></div>
+
 <script>
 // NOTA: se usa split/join en vez de .replace(/.../) para no depender de
 // escapes anidados dentro del template literal del Worker (el bug ///g de 1.0.0).
-function selectOrder(val) {
-  var ordEl = document.getElementById('dialectOrder');
-  if (ordEl) ordEl.value = val;
-  if (!document.querySelectorAll) return;
-  var cards = document.querySelectorAll('.opt-card');
-  for (var i = 0; i < cards.length; i++) {
-    var isMatch = cards[i].getAttribute('data-order') === val;
-    if (isMatch) cards[i].classList.add('active');
-    else cards[i].classList.remove('active');
-    cards[i].setAttribute('aria-checked', isMatch ? 'true' : 'false');
+// El script solo declara funciones (sin código suelto): los tests lo evalúan con un
+// document simulado que únicamente tiene getElementById.
+var DIALECTS = ['auto', 'lat', 'es', 'none'];
+var sample = 'lat';
+function currentDialect() {
+  var el = document.getElementById('dialectOrder');
+  var v = el && el.value ? String(el.value) : 'auto';
+  return DIALECTS.indexOf(v) >= 0 ? v : 'auto';
+}
+function getManifestUrl(protocol) {
+  var key = document.getElementById('subdlKey').value.trim();
+  var dialect = currentDialect();
+  var origin = protocol + '://' + window.location.host;
+  if (!key && dialect === 'auto') return origin + '/manifest.json';
+  var cfg = {};
+  if (key) cfg.subdlKey = key;
+  if (dialect !== 'auto') cfg.dialectOrder = dialect;
+  var bytes = new TextEncoder().encode(JSON.stringify(cfg));
+  var bin = '';
+  for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  var b64 = btoa(bin).split('+').join('-').split('/').join('_');
+  while (b64.charAt(b64.length - 1) === '=') b64 = b64.slice(0, -1);
+  return origin + '/' + b64 + '/manifest.json';
+}
+function installAddon() { window.location.href = getManifestUrl('stremio'); }
+function setStatus(text) {
+  var el = document.getElementById('status');
+  if (el) el.textContent = text;
+}
+function copyManifest() {
+  var btn = document.getElementById('copyBtn');
+  var url = getManifestUrl('https');
+  function fallback() {
+    var box = document.getElementById('manifestUrl');
+    document.getElementById('manual').open = true;
+    box.focus();
+    box.select();
+    setStatus('Selecciona la URL y cópiala con Ctrl+C.');
   }
+  if (!navigator.clipboard) { fallback(); return; }
+  navigator.clipboard.writeText(url).then(function () {
+    btn.textContent = 'Copiada';
+    setStatus('URL copiada. Pégala en Stremio.');
+    setTimeout(function () { btn.textContent = 'Copiar URL'; }, 2000);
+  }).catch(fallback);
+}
+function refreshUrl() {
+  var box = document.getElementById('manifestUrl');
+  if (box) box.value = getManifestUrl('https');
 }
 function toggleKey() {
   var input = document.getElementById('subdlKey');
-  var btn = document.getElementById('toggleKeyBtn');
-  if (!input) return;
-  var isPwd = input.type === 'password';
-  input.type = isPwd ? 'text' : 'password';
-  if (btn) btn.innerText = isPwd ? 'Ocultar' : 'Mostrar';
+  var btn = document.getElementById('showKey');
+  var show = input.type === 'password';
+  input.type = show ? 'text' : 'password';
+  btn.textContent = show ? 'Ocultar' : 'Mostrar';
+  btn.setAttribute('aria-pressed', show ? 'true' : 'false');
 }
-function getManifestUrl(protocol) {
-  var keyEl = document.getElementById('subdlKey');
-  var key = keyEl && keyEl.value ? keyEl.value.trim() : '';
-  var ordEl = document.getElementById('dialectOrder');
-  var ordRaw = ordEl && ordEl.value ? ordEl.value.trim() : 'auto';
-  var ord = (ordRaw === 'lat' || ordRaw === 'es' || ordRaw === 'none') ? ordRaw : 'auto';
-  var origin = protocol + '://' + window.location.host;
-  if (!key && ord === 'auto') return origin + '/manifest.json';
-  var payload = {};
-  if (key) payload.subdlKey = key;
-  if (ord !== 'auto') payload.dialectOrder = ord;
-  var bytes = new TextEncoder().encode(JSON.stringify(payload));
-  var bin = '';
-  for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
-  var cfg = btoa(bin).split('+').join('-').split('/').join('_');
-  while (cfg.charAt(cfg.length - 1) === '=') cfg = cfg.slice(0, -1);
-  return origin + '/' + cfg + '/manifest.json';
+// Vista previa: reproduce en pequeño el orden que aplica el servidor
+// (solo sube el dialecto elegido; el resto conserva su orden: sort estable).
+function stagePref() {
+  var d = currentDialect();
+  if (d === 'none') return null;
+  if (d === 'auto') return sample === 'none' ? null : sample;
+  return d;
 }
-function installAddon() { window.location.href = getManifestUrl('stremio'); }
-function copyManifest() {
-  var btn = document.getElementById('copyBtn');
-  navigator.clipboard.writeText(getManifestUrl('https'))
-    .then(function () { btn.innerText = '¡Copiado! ✓'; })
-    .catch(function () { btn.innerText = 'Error al copiar'; });
+function rankOf(k, pref) {
+  var mine = pref === 'lat' ? 'la' : 'es';
+  return k === mine ? 0 : 1;
+}
+function stageNote(d, pref) {
+  if (d === 'none') return 'Se mantiene el orden en que llegan de las fuentes.';
+  if (d === 'lat') return 'Los latinos van primero; el resto conserva su orden.';
+  if (d === 'es') return 'Los de España van primero; el resto conserva su orden.';
+  if (pref === 'lat') return 'El nombre incluye «LATINO»: los latinos van primero.';
+  if (pref === 'es') return 'El nombre incluye «Castellano»: los de España van primero.';
+  return 'El nombre no dice nada del dialecto: se mantiene el orden de las fuentes.';
+}
+function renderStage(animate) {
+  var list = document.getElementById('tracks');
+  var items = Array.prototype.slice.call(list.children);
+  var d = currentDialect();
+  var pref = stagePref();
+  var before = {};
+  items.forEach(function (li) { before[li.id] = li.getBoundingClientRect().top; });
+  items.sort(function (a, b) {
+    var ra = pref ? rankOf(a.getAttribute('data-k'), pref) : 0;
+    var rb = pref ? rankOf(b.getAttribute('data-k'), pref) : 0;
+    return ra - rb || Number(a.getAttribute('data-i')) - Number(b.getAttribute('data-i'));
+  });
+  items.forEach(function (li) {
+    list.appendChild(li);
+    li.className = pref && rankOf(li.getAttribute('data-k'), pref) === 0 ? 'on' : '';
+  });
+  var calm = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  if (animate && !calm) {
+    items.forEach(function (li) {
+      var dy = before[li.id] - li.getBoundingClientRect().top;
+      if (!dy) return;
+      li.style.transition = 'none';
+      li.style.transform = 'translateY(' + dy + 'px)';
+    });
+    void list.offsetHeight;
+    items.forEach(function (li) {
+      li.style.transition = 'transform .3s ease';
+      li.style.transform = '';
+    });
+  }
+  document.getElementById('chips').hidden = d !== 'auto';
+  document.getElementById('stageNote').textContent = stageNote(d, pref);
+}
+function setDialect(v) {
+  document.getElementById('dialectOrder').value = v;
+  renderStage(true);
+  refreshUrl();
+}
+function setSample(k) {
+  sample = k;
+  ['lat', 'es', 'none'].forEach(function (n) {
+    document.getElementById('s-' + n).setAttribute('aria-pressed', n === k ? 'true' : 'false');
+  });
+  renderStage(true);
+}
+function initPage() {
+  renderStage(false);
+  refreshUrl();
 }
 </script></body></html>`;
 };
@@ -1068,7 +1237,7 @@ function copyManifest() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.35",
+  version: "1.4.36",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -2069,6 +2238,10 @@ export default {
               const data = await cached.clone().json();
               if (Array.isArray(data?.subtitles) && data.subtitles.length > 1) {
                 const ordered = orderSubtitlesByDialect(data.subtitles, targetDialect);
+                // Log solo si el orden realmente cambió (permite medir el uso en HIT).
+                if (ordered.some((x, i) => x !== data.subtitles[i])) {
+                  console.log(`[subtitles] orden=${targetDialect} aplicado en HIT`);
+                }
                 const hitRes = new Response(JSON.stringify({ ...data, subtitles: ordered }), cached);
                 hitRes.headers.set("x-cache", "HIT");
                 return hitRes;
