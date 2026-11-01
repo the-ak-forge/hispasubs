@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.36", m10.version === "1.4.36", m10.version);
+  check("manifest version 1.4.37", m10.version === "1.4.37", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1367,6 +1367,13 @@ try {
     check("v1.4.8: zip con 410 (enlace muerto en SubDL) se descarta sin degradar TTL (7200s)",
       s410.length === 1 && res.headers.get("cache-control") === "public, max-age=7200",
       `len=${s410.length} cc=${res.headers.get("cache-control")}`);
+
+    proxyStatus = 413;
+    res = await get(`/${b64url({ subdlKey: "k" })}/subtitles/series/tt0903747:1:6.json`);
+    const s413 = (await res.json()).subtitles || [];
+    check("v1.4.37: zip con 413 (pack >MAX_BYTES) se descarta sin degradar TTL (7200s) y se sirve el resto",
+      s413.length === 1 && res.headers.get("cache-control") === "public, max-age=7200",
+      `len=${s413.length} cc=${res.headers.get("cache-control")}`);
 
     proxyStatus = 404;
     res = await get(`/${b64url({ subdlKey: "k" })}/subtitles/series/tt0903747:1:9.json`);
@@ -3147,6 +3154,15 @@ try {
     check("v1.4.36 HIT: con cambio de orden se registra 'orden=lat aplicado en HIT' y se sirve latino primero",
       lines.some((x) => x.includes("orden=lat aplicado en HIT")) && jl.subtitles[0].label.startsWith("🇲🇽"), lines.join("|").slice(0, 160));
   } finally { console.log = l0; console.error = e0; globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
+}
+
+// 26) v1.4.37: «lat» suelto en el nombre del archivo marca latino (límites de palabra)
+{
+  const yes = ["Den.of.thieves.2.pantera.2025.1080p-dual-lat-cinecalidad.rs.mp4", "Caballos.lentos.S06E03.2026.WEB-DL.1080p-Dual-Lat.mkv", "La.hipotesis.del.amor.2026.1080p-Dual-Lat", "Peli [Lat] 1080p.mkv", "Peli.LAT.mkv"];
+  const no = ["Plate.of.Lates.2020.1080p.mkv", "Late.Night.2019.1080p.mkv", "Chocolate.2008.mkv", "Flat.Earth.2021.mkv", "Pelicula.Lateral.2020.mkv"];
+  check("v1.4.37 filename: 'lat' como palabra -> latino", yes.every((f) => detectFilenameDialect(f) === "lat"), JSON.stringify(yes.map(detectFilenameDialect)));
+  check("v1.4.37 filename: palabras que solo CONTIENEN 'lat' no activan nada", no.every((f) => detectFilenameDialect(f) === null), JSON.stringify(no.map(detectFilenameDialect)));
+  check("v1.4.37 filename: 'lat' junto a 'castellano' es ambiguo -> null", detectFilenameDialect("Peli.Lat.Castellano.mkv") === null);
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

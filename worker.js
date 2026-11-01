@@ -1,6 +1,18 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.36
+// HispaSubs — Cloudflare Worker v1.4.37
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.37 (01/11/2026):
+//  - [TTL / ZIPS GRANDES] Un zip de SubDL que el proxy rechaza con HTTP 413 («Archivo
+//    demasiado grande», p. ej. un pack de temporada) se descarta como el 410/422: antes
+//    contaba como fallo transitorio y degradaba TODA la respuesta a TTL 60 s. Visto en
+//    producción (1.4.36, 1 h): 3 de las 4 respuestas degradadas eran el mismo título
+//    (tt2560140, episodios 5-7) con 1 pack >10 MB; cada reproducción repetía 5 descargas
+//    y ~1,6 s. Ahora se sirven las demás pistas con TTL 7200 s y el enlace entra en la
+//    memoria de enlaces muertos (`descartes404`).
+//  - [ORDEN POR NOMBRE] `lat` suelto (p. ej. «…1080p-Dual-Lat.mkv», convención de
+//    cinecalidad) cuenta como pista de latino; con límites de palabra, así que «late»,
+//    «plate» o «lates» no lo activan. En el tráfico real, 6 de 235 nombres únicos.
 //
 // v1.4.36 (31/10/2026):
 //  - [CONFIGURE / REDISEÑO] Nueva página de configuración: opciones de orden como radios
@@ -922,7 +934,7 @@ const normalizeDialectOrder = (val) => {
 // Se exigen fronteras no alfanuméricas (incluyendo `_`, `.`, `-`, espacios y
 // corchetes) para que "ESP" no coincida dentro de "ESPAÑOL", "ESPANOL" o
 // "ESPECIAL". Si aparecen ambos bandos a la vez (dual), se considera ambiguo.
-const FILENAME_LAT_RE = /(?:^|[^a-z0-9ñáéíóúü])(?:latino|latam|es[-_](?:419|la|mx))(?=[^a-z0-9ñáéíóúü]|$)/i;
+const FILENAME_LAT_RE = /(?:^|[^a-z0-9ñáéíóúü])(?:latino|latam|lat|es[-_](?:419|la|mx))(?=[^a-z0-9ñáéíóúü]|$)/i;
 const FILENAME_ES_RE = /(?:^|[^a-z0-9ñáéíóúü])(?:castellano|esp|es[-_]es)(?=[^a-z0-9ñáéíóúü]|$)/i;
 
 const detectFilenameDialect = (filename) => {
@@ -1237,7 +1249,7 @@ function initPage() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.36",
+  version: "1.4.37",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -2075,8 +2087,10 @@ const classifySubtitle = async (
     //    episodio en el pack). Un HTTP 404 crudo sobre `isZip` significa que
     //    el propio endpoint del proxy no existe (PROXY_URL rota o caída de
     //    enrutamiento) y SÍ debe contar como FAILED (TTL 60 s).
+    //    v1.4.37: HTTP 413 del proxy (zip por encima de MAX_BYTES, típico de un
+    //    pack de temporada) también es permanente: reintentar no lo encoge.
     const isPermanentDiscard = isZip
-      ? /\bHTTP 4(?:10|22)\b/.test(error.message)
+      ? /\bHTTP 4(?:10|13|22)\b/.test(error.message)
       : /\bHTTP 4(?:04|10)\b/.test(error.message);
     if (isPermanentDiscard) {
       if (deadMem) deadMem.added.add(deadHash);
