@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect } from "./worker.js";
+import worker, { errKind, looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.37", m10.version === "1.4.37", m10.version);
+  check("manifest version 1.4.38", m10.version === "1.4.38", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -3163,6 +3163,59 @@ try {
   check("v1.4.37 filename: 'lat' como palabra -> latino", yes.every((f) => detectFilenameDialect(f) === "lat"), JSON.stringify(yes.map(detectFilenameDialect)));
   check("v1.4.37 filename: palabras que solo CONTIENEN 'lat' no activan nada", no.every((f) => detectFilenameDialect(f) === null), JSON.stringify(no.map(detectFilenameDialect)));
   check("v1.4.37 filename: 'lat' junto a 'castellano' es ambiguo -> null", detectFilenameDialect("Peli.Lat.Castellano.mkv") === null);
+}
+
+// 27) v1.4.38: causas de fallo en el resumen (err=) y modo sombra de release (rel=)
+{
+  check("v1.4.38 errKind: HTTP, timeout y red",
+    errKind("HTTP 503") === "503" && errKind("HTTP 429") === "429" && errKind("The operation was aborted") === "timeout" &&
+      errKind("Tiempo agotado") === "timeout" && errKind("fetch failed") === "red" && errKind(undefined) === "red");
+  const store = new Map();
+  const cacheApi = { default: { match: async (q) => { const x = store.get(q.url); return x ? x.clone() : undefined; }, put: async (q, rs) => { store.set(q.url, rs.clone()); } } };
+  const prevC = mockGlobal("caches", cacheApi), prevF = globalThis.fetch;
+  let osMode = "ok";
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      if (osMode === "down") return Promise.reject(new Error("The operation was aborted"));
+      return Promise.resolve(new Response(JSON.stringify({ subtitles: [
+        { id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa", subtitleFileName: "Peli.2024.1080p.BluRay.x264.srt" },
+        { id: "b", url: "https://subs5.strem.io/b.srt", lang: "spa", subtitleFileName: "Peli.2024.1080p.WEB-DL.srt" },
+        { id: "c", url: "https://subs5.strem.io/c.srt", lang: "spa", subtitleFileName: "Peli.2024.720p.WEB-DL.srt" },
+        { id: "d", url: "https://subs5.strem.io/d.srt", lang: "spa", subtitleFileName: "Peli.2024.HDTV.srt" },
+      ] }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("api.subdl.com")) return Promise.resolve(new Response(JSON.stringify({ status: true, subtitles: osMode === "down" ? [{ url: "https://dl.subdl.com/subtitle/x-1.srt", release_name: "Peli.WEB-DL" }] : [] }), { status: 200, headers: { "content-type": "application/json" } }));
+    if (u.includes("/c.srt")) return Promise.resolve(new Response("x", { status: 503 }));
+    if (u.includes("/d.srt")) return Promise.reject(new Error("The operation was aborted"));
+    return Promise.resolve(textResp(u.includes("/a.srt") ? TXT_CAST : TXT_LAT));
+  };
+  const l0 = console.log, e0 = console.error, lines = [];
+  console.log = (...a) => lines.push(a.join(" ")); console.error = () => {};
+  const ctx = { waitUntil: () => {} };
+  const deferred = [];
+  const chk = (...a) => deferred.push(a);
+  const resumen = (id) => lines.filter((x) => x.includes("resumen") && x.includes(id)).pop() || "";
+  try {
+    await worker.fetch(new Request(`${base}/subtitles/movie/tt7880001/filename=Peli.2024.1080p.WEB-DL.mkv.json`), {}, ctx);
+    const r1 = resumen("tt7880001");
+    chk("v1.4.38 resumen: err= lista causa por fuente (503 y timeout)", /err=OS-V3:503×1,OS-V3:timeout×1/.test(r1), r1.slice(0, 260));
+    chk("v1.4.38 resumen: rel=web, 1 de 2 pistas servidas coincide y la primera no (p1=no)", / rel=web match=1\/2 p1=no/.test(r1), r1.slice(0, 260));
+    chk("v1.4.38 resumen: el modo sombra no cambia el orden (sigue el del proveedor: a antes que b)", (() => { const L = r1.split(" | ").slice(1).map((x) => x.split(" ")[0]); return L.length === 2 && L[0].includes("🇪🇸") && L[1].includes("🇲🇽"); })(), r1.slice(0, 300));
+    await worker.fetch(new Request(`${base}/subtitles/movie/tt7880002/filename=Peli.2024.1080p.BluRay.mkv.json`), {}, ctx);
+    const r2 = resumen("tt7880002");
+    chk("v1.4.38 resumen: rel=disco con la primera pista coincidente -> sin p1=no", / rel=disco match=1\/2/.test(r2) && !r2.includes("p1=no"), r2.slice(0, 260));
+    await worker.fetch(new Request(`${base}/subtitles/movie/tt7880003.json`), {}, ctx);
+    const r3 = resumen("tt7880003");
+    chk("v1.4.38 resumen: sin filename no hay rel=", !r3.includes(" rel=") && r3.includes("resumen"), r3.slice(0, 200));
+    await worker.fetch(new Request(`${base}/subtitles/movie/tt7880004/filename=Peli.2024.mkv.json`), {}, ctx);
+    chk("v1.4.38 resumen: filename sin pista de release no añade rel=", !resumen("tt7880004").includes(" rel="), resumen("tt7880004").slice(0, 200));
+    osMode = "down";
+    await worker.fetch(new Request(`${base}/${b64url({ subdlKey: "clave_de_prueba_123" })}/subtitles/movie/tt7880005.json`), {}, ctx);
+    const r5 = resumen("tt7880005");
+    chk("v1.4.38 resumen: fuente caída entera queda en err= (OS-V3:fuente-timeout)", /err=OS-V3:fuente-timeout×1/.test(r5), r5.slice(0, 260));
+  } finally { console.log = l0; console.error = e0; globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
+  for (const a of deferred) check(...a);
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

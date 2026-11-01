@@ -1,6 +1,17 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.37
+// HispaSubs — Cloudflare Worker v1.4.38
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.38 (01/11/2026):
+//  - [DIAGNÓSTICO] El resumen añade `err=<fuente>:<causa>×<n>,…` cuando hay fallos de
+//    descarga (causa = código HTTP, `timeout` o `red`; `texto` si el contenido no era
+//    texto) o una fuente entera caída (`OS-V3:fuente-429`). Antes `fallos=5` no decía qué
+//    falló: en el tramo de 30 min tras desplegar la 1.4.37 (36 de 62 respuestas
+//    degradadas) no pudo diagnosticarse la causa.
+//  - [RELEASE / MODO SOMBRA] Si el nombre del archivo indica web o disco, el resumen añade
+//    `rel=<web|disco> match=<k>/<n> [p1=no]`: cuántas pistas servidas están sincronizadas
+//    con el mismo origen y si la primera no lo está. NO cambia el orden; sirve para medir
+//    si ordenar por release aportaría algo antes de activarlo.
 //
 // v1.4.37 (01/11/2026):
 //  - [TTL / ZIPS GRANDES] Un zip de SubDL que el proxy rechaza con HTTP 413 («Archivo
@@ -1249,7 +1260,7 @@ function initPage() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.37",
+  version: "1.4.38",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1629,6 +1640,15 @@ const releaseSourceOf = (sub) => {
   if (DISC_RELEASE_RE.test(t)) return "disco";
   if (WEB_RELEASE_RE.test(t) || PLATFORM_RELEASE_RE.test(t)) return "web";
   return "";
+};
+
+// Causa del fallo de descarga (v1.4.38), solo para el log `err=`: código HTTP,
+// "timeout" (abort/tiempo agotado) o "red". Sin URLs ni texto del error.
+const ERR_KIND = Symbol.for("hispasubs.errKind");
+const errKind = (msg) => {
+  const m = /\bHTTP (\d{3})\b/.exec(String(msg || ""));
+  if (m) return m[1];
+  return /abort|timeout|timed out|tiempo/i.test(String(msg || "")) ? "timeout" : "red";
 };
 
 const unclassified = (sub, finalUrl, failed = false, sdh = false) => ({
@@ -2098,7 +2118,9 @@ const classifySubtitle = async (
     }
     console.error("[classify]", sub.source, error.message);
     // Timeout / red caída / 429 / 5xx / 404 de proxy: fallo transitorio → TTL corto.
-    return unclassified(sub, finalUrl, true);
+    const failedTrack = unclassified(sub, finalUrl, true);
+    failedTrack[ERR_KIND] = errKind(error.message);
+    return failedTrack;
   }
 };
 
@@ -2117,7 +2139,7 @@ const getCanonicalConfigStr = (config) =>
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect };
+export { errKind, looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -2460,6 +2482,8 @@ export default {
         const kept = { "OS-V3": 0, "SubDL": 0 };
         const failed = { "OS-V3": 0, "SubDL": 0 };
         let descartes404 = 0;
+        const errCount = {};
+        const addErr = (key) => { errCount[key] = (errCount[key] || 0) + 1; };
         const scoreLog = [];
         const subtitles = [];
         for (let i = 0; i < analyzed.length; i++) {
@@ -2475,6 +2499,7 @@ export default {
           }
           if (s[FAILED]) {
             failed[source] += 1;
+            addErr(`${source}:${s[ERR_KIND] || "texto"}`);
             continue;
           }
           if (kept[source] >= ANALYSIS_BUDGET_PER_SOURCE) continue;
@@ -2512,6 +2537,20 @@ export default {
         } else if (ttl !== 7200) {
           console.log(`[subtitles] sin pistas tras analizar y sin fallos: TTL ${ttl}s`);
         }
+        // Fuente entera caída (promesa rechazada): también deja su causa en `err=`.
+        if (osSubs.status === "rejected") addErr(`OS-V3:fuente-${errKind(osSubs.reason?.message)}`);
+        if (sdlSubs.status === "rejected") addErr(`SubDL:fuente-${errKind(sdlSubs.reason?.message)}`);
+        const errTag = Object.keys(errCount).length
+          ? ` err=${Object.entries(errCount).map(([k, n]) => `${k}×${n}`).join(",")}`
+          : "";
+        // Modo SOMBRA (v1.4.38): ¿el release del archivo (web/disco) coincide con el de las
+        // pistas servidas? Solo se registra; NO cambia el orden. `p1=no` = hay alguna pista
+        // que coincide pero la primera no (ganancia potencial de un ordenado por release).
+        const fileRel = filename ? releaseSourceOf({ releaseName: filename }) : "";
+        const relMatch = fileRel ? subtitles.filter((s) => s[RELEASE_SOURCE] === fileRel).length : 0;
+        const relTag = fileRel
+          ? ` rel=${fileRel} match=${relMatch}/${subtitles.length}${relMatch > 0 && subtitles[0]?.[RELEASE_SOURCE] !== fileRel ? " p1=no" : ""}`
+          : "";
         const platformCount = subtitles.filter((s) => s[IS_PLATFORM]).length;
         const webCount = subtitles.filter((s) => s[RELEASE_SOURCE] === "web").length;
         const discCount = subtitles.filter((s) => s[RELEASE_SOURCE] === "disco").length;
@@ -2521,6 +2560,7 @@ export default {
             `servidas=${subtitles.length} (OS-V3=${kept["OS-V3"]},SubDL=${kept["SubDL"]}) ` +
             `plataforma=${platformCount}/${subtitles.length} web=${webCount} disco=${discCount} ` +
             `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} mem404=${deadMem.hits} mem404w=${deadWritten} duplicados=${duplicadosContenido} ttl=${ttl}s` +
+            errTag + relTag +
             (fnDialect ? ` fn=${fnDialect}` : "") +
             (targetDialect ? ` orden=${targetDialect}` : "") +
             (scoreLog.length ? ` | ${scoreLog.join(" | ")}` : "")

@@ -109,4 +109,28 @@ if (langLines.length) {
   if (Object.keys(fnCounts).length || Object.keys(ordCounts).length) {
     console.log(`\n== orden por dialecto: filename detectado=${JSON.stringify(fnCounts)} | reordenadas=${JSON.stringify(ordCounts)} ==`);
   }
+
+  // ---- v1.4.38: causas de fallo (err=) y modo sombra de release (rel=) ----
+  const errMap = {}, relCounts = { total: 0, p1No: 0, byRel: {} };
+  for (const m of resumen) {
+    const e = (m.match(/ err=(\S+)/) || [])[1];
+    if (e) {
+      for (const pair of e.split(",")) {
+        const [k, n] = pair.split("×");
+        if (k) errMap[k] = (errMap[k] || 0) + (+n || 1);
+      }
+    }
+    const r = m.match(/ rel=(web|disco) match=(\d+)\/(\d+)( p1=no)?/);
+    if (r) {
+      relCounts.total++;
+      relCounts.byRel[r[1]] = (relCounts.byRel[r[1]] || 0) + 1;
+      if (r[4]) relCounts.p1No++;
+    }
+  }
+  if (Object.keys(errMap).length) {
+    console.log(`\n== causas de fallo (err=):`, errMap);
+  }
+  if (relCounts.total > 0) {
+    console.log(`\n== modo sombra release (rel=): ${relCounts.total} peticiones con release | por tipo: ${JSON.stringify(relCounts.byRel)} | p1=no (ganancia potencial): ${relCounts.p1No} (${(100 * relCounts.p1No / relCounts.total).toFixed(1)}%) ==`);
+  }
 }
