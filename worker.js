@@ -3,21 +3,9 @@
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
 //
 // v1.4.39 (01/11/2026):
-//  - [LÉXICO / BLINDAJE DE FUERTES] En `scoreText`, adjudicar un dialecto exige que el
-//    lado ganador tenga al menos 2 términos fuertes (`strongEs >= 2` / `strongLat >= 2`) y
-//    más términos fuertes que el contrario (`strongEs > strongLat` / `strongLat > strongEs`).
-//    Datos de producción (3.768 archivos únicos en `resumen` y 136 en `desacuerdo`): antes,
-//    a partir de 5 apariciones débiles (`vale`, `joder`, `papa`), `esMatches > latMatches + margin`
-//    se saltaba el mínimo de 2 fuertes y permitía que una pista con 0 o 1 término fuerte
-//    (106 pistas únicas con `s=1`, e incluso `h=53333` con `strongEs=0` vs `strongLat=3`)
-//    o en empate/desventaja de fuertes (`enfadado×1` vs `celular×1` + `vale×22` en `h=80348`)
-//    se clasificara al revés. Simulación sobre los 99 subtítulos españoles reales: 0 regresiones.
-//  - [LÉXICO / OVERRIDE SIN OPOSICIÓN FUERTE] El override sin oposición comprueba ahora
-//    `strongOpuesto === 0` y `< 1` punto débil en contra (en vez de `0` absoluto), rescatando
-//    33 archivos únicos de producción que caían en `🌎 Neutro` teniendo ≥2 términos fuertes
-//    y 0 fuertes en contra solo por 1-3 apariciones débiles aisladas ("no vale nada", "ustedes").
-//  - [LÉXICO / "decís"] Se retira `decís` de `DICT_LAT`: en España ("vosotros decís") coincide
-//    con el voseo rioplatense ("vos decís") y restaba ventaja en subtítulos españoles (`h=29359`).
+//  - [SIN CAMBIOS DE CLASIFICACIÓN] `scoreText` base y los diccionarios base (incluido `decís`) son
+//    IDÉNTICOS a los de la 1.4.38: esta versión solo añade medición. El blindaje de términos
+//    fuertes y el override sin oposición fuerte se evaluarán con los datos de `refnombre=`.
 //  - [TELEMETRÍA / REFERENCIA POR NOMBRE] Si el nombre declarado del subtítulo (`sub.releaseName`)
 //    indica un dialecto inequívoco (`detectFilenameDialect`), se registra
 //    `[classify] refnombre=<lat|es> veredicto=<Castellano|Latino|Neutro|sinclasificar> …` y el
@@ -606,9 +594,7 @@
 // decida la clasificación; solo pesan cuando aparecen muchas veces.
 const WEAK_WEIGHT = 0.25;
 const DICT_ES = /(?<![\p{L}\p{N}_])(?:vosotros|ordenador(?:es)?|coche[s]?|gilipollas|hostias?|chaval(?:es)?|foll(?:ar|a|an|en|ó|o|ado|ando)|guay|m[oó]vil(?:es)?(?!\s+del\s+(?:crimen|asesinato|delito|robo|ataque)|\s+perpetuo)|patata[s]?|zumo[s]?|aparqu[\p{L}]*|aparc[\p{L}]*|condu(?:cir|zco|zca|zcan|ces|ce|cen|jiste|jeron|jo|cía|cías|cíamos|cían|ciendo|cido)(?!\s+a\s+(?:nada|eso|esto|ninguna\s+parte|la\s+ruina|un\s+desastre|una?\s+conclusi[oó]n))|enfad[\p{L}]*|nevera[s]?|jol[ií]n|mol(?:a|an)|ten[eé]is|sois|est[aá]is|mogoll[oó]n|curr(?:ar|o|as|a|amos|áis|an|ando|ado|ante[s]?)|flip(?:ar|o|as|a|amos|áis|an|é|ó|ando|ado|ante[s]?))(?![\p{L}\p{N}_])/giu;
-// v1.4.39: se retira "decís" de DICT_LAT porque en España ("vosotros decís") es idéntico al
-// voseo rioplatense ("vos decís"; visto en producción en el archivo español h=29359).
-const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?(?!\s+de\s+(?:(?:la\s+)?compra|combate)|\s+blindado)|auto(?:s)?|pendej[\p{L}]*|ching(?:ar|a|as|an|o|ó|aron|aba|aban|ado|ada|ando|ón|ones|ue|ues|uen|ué|adera)|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion(?:ar|a|as|an|ó|é|aste|aron|aba|abas|ábamos|aban|ado|ada|ando|amiento)|manej[\p{L}]*(?!\s+del?(?![\p{L}\p{N}_]))|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|[oó]rale|chido|bacano|bolud[\p{L}]*|pelotud[\p{L}]*|pibe[s]?|quilombo[s]?|tenés|querés|podés|sabés|vení|mirá|we[oó]n(?:es|a|as)?|huev[oó]n(?:es|a|as)?|cachai|polol[oa][s]?|parce(?:ro|ra|ros|ras)?|chimba[s]?|chamo[s]?)(?![\p{L}\p{N}_])/giu;
+const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?(?!\s+de\s+(?:(?:la\s+)?compra|combate)|\s+blindado)|auto(?:s)?|pendej[\p{L}]*|ching(?:ar|a|as|an|o|ó|aron|aba|aban|ado|ada|ando|ón|ones|ue|ues|uen|ué|adera)|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion(?:ar|a|as|an|ó|é|aste|aron|aba|abas|ábamos|aban|ado|ada|ando|amiento)|manej[\p{L}]*(?!\s+del?(?![\p{L}\p{N}_]))|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|[oó]rale|chido|bacano|bolud[\p{L}]*|pelotud[\p{L}]*|pibe[s]?|quilombo[s]?|tenés|querés|podés|sabés|decís|vení|mirá|we[oó]n(?:es|a|as)?|huev[oó]n(?:es|a|as)?|cachai|polol[oa][s]?|parce(?:ro|ra|ros|ras)?|chimba[s]?|chamo[s]?)(?![\p{L}\p{N}_])/giu;
 const DICT_ES_WEAK = /(?<![\p{L}\p{N}_])(?:vale|jod(?:e|es|en|emos|er|a|as|an|ía|ías|íamos|ían|ió|ieron|iendo|ido|ida|idos|idas))(?![\p{L}\p{N}_])/giu;
 // Sin flag `i`: "os" / "Os" (inicio de frase) suman 0,25 para España, pero
 // "OS" en mayúsculas (Operating System) no casa nunca.
@@ -1764,25 +1750,11 @@ const scoreText = (rawText, diag = {}, useExtra = false) => {
   }
 
   let flag = "🌎 Neutro";
-  // v1.4.39 — Blindaje de fuertes + override sin oposición fuerte:
-  //  1) El dialecto ganador debe tener ≥2 términos fuertes reales y superar en
-  //     términos fuertes al otro dialecto (`strongEs > strongLat`). Así una
-  //     acumulación de términos débiles ("vale"×22, "joder"×21, "papa"×9) nunca
-  //     decide una pista con 0-1 términos fuertes ni invierte un empate/desventaja
-  //     en términos fuertes.
-  //  2) Cuando el otro dialecto tiene 0 términos fuertes (`strongLat === 0`) y
-  //     menos de 1 punto débil (<4 apariciones aisladas como "no vale nada" o un
-  //     "ustedes" formal), ≥2 términos fuertes bastan sin quedar bloqueados en Neutro.
-  const esWins =
-    strongEs >= 2 &&
-    strongEs > strongLat &&
-    (esMatches > latMatches + margin || (strongLat === 0 && latMatches < 1));
-  const latWins =
-    strongLat >= 2 &&
-    strongLat > strongEs &&
-    (latMatches > esMatches + margin || (strongEs === 0 && esMatches < 1));
-  if (esWins) flag = "🇪🇸 Castellano";
-  else if (latWins) flag = "🇲🇽 Latino";
+  // Override sin oposición (v1.4.16): exige al menos 2 términos FUERTES reales
+  // y CERO oposición total (ni fuerte ni débil), impidiendo que acumulación de
+  // términos débiles (ej. "vale" x4) o ambiguos fuercen un dialecto falso.
+  if (esMatches > latMatches + margin || (latMatches === 0 && strongEs >= 2)) flag = "🇪🇸 Castellano";
+  else if (latMatches > esMatches + margin || (esMatches === 0 && strongLat >= 2)) flag = "🇲🇽 Latino";
   return { esMatches, latMatches, strongTotal, total, flag };
 };
 

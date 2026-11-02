@@ -3218,63 +3218,8 @@ try {
   for (const a of deferred) check(...a);
 }
 
-// 28) v1.4.39: Blindaje de fuertes en scoreText, override sin oposición fuerte, retirada de 'decís',
-//              telemetría refnombre= y candidatos léxicos bajo LEXICON_EXTRA
+// 28) v1.4.39: telemetría refnombre= y candidatos léxicos bajo LEXICON_EXTRA (scoreText base = 1.4.38)
 {
-  // A. Blindaje de términos fuertes (casos reales de los logs de producción v1.4.38):
-  // 1) Ganador con 0 términos fuertes propios (h=53333: es=- | lat: manejar×2 jugo×1 | deb: joder×21 jodan×6 vale×2 jodió×2)
-  const h53333 = "manejar manejar jugo " + "joder ".repeat(21) + "jodan ".repeat(6) + "vale vale jodió jodió";
-  const r53333 = scoreText(h53333);
-  check("v1.4.39 blindaje fuertes: 0 fuertes ES + 31 débiles ES frente a 3 fuertes LAT (h=53333) NO sale Castellano",
-    r53333?.flag === "🌎 Neutro", JSON.stringify(r53333));
-
-  // 2) Ganador con solo 1 término fuerte (s=1) + >=5 débiles (antes 1 + 5×0,25 = 2,25 > margin=2 se saltaba strong>=2)
-  const cocheVale5 = scoreText("coche vale vale vale vale vale");
-  check("v1.4.39 blindaje fuertes: 1 fuerte ES + 5 débiles ('coche' + 'vale'×5 = 2,25) queda en Neutro",
-    cocheVale5?.flag === "🌎 Neutro", JSON.stringify(cocheVale5));
-  const h36955 = scoreText("conducir vale vale jodió jodan jodido");
-  check("v1.4.39 blindaje fuertes: h=36955 (conducir×1 + 5 débiles ES = 2,25) queda en Neutro",
-    h36955?.flag === "🌎 Neutro", JSON.stringify(h36955));
-  const h50581 = scoreText("manejar " + "papa ".repeat(9) + "papas ustedes");
-  check("v1.4.39 blindaje fuertes: h=50581 (manejar×1 + papa×10 + ustedes×1 = 3,75 en rl=spn) queda en Neutro",
-    h50581?.flag === "🌎 Neutro", JSON.stringify(h50581));
-
-  // 3) Empate 1 vs 1 en fuertes volteado por 'vale'×22 (h=80348: enfadado×1 vs celular×1 | deb: vale×22 ustedes×4)
-  const h80348 = scoreText("enfadado celular " + "vale ".repeat(22) + "ustedes ".repeat(4));
-  check("v1.4.39 blindaje fuertes: empate 1 vs 1 en fuertes + vale×22 (h=80348) queda en Neutro, no Castellano",
-    h80348?.flag === "🌎 Neutro", JSON.stringify(h80348));
-
-  // 4) Desventaja en fuertes volteada por débiles (h=89434: strongEs=2 vs strongLat=4 + vale×13 joder×5)
-  const h89434 = scoreText(
-    "enfades tenéis enojados enojado autos estacionado " +
-      "vale ".repeat(13) + "joder ".repeat(5) + "jodes jodes jodan jodan " +
-      "carajo ".repeat(6) + "ustedes ustedes"
-  );
-  check("v1.4.39 blindaje fuertes: strongEs=2 < strongLat=4 con aluvión de 'vale'/'joder' (h=89434) NO sale Castellano",
-    h89434?.flag === "🌎 Neutro", JSON.stringify(h89434));
-
-  // Simétrico hacia Latino: strongLat=2 < strongEs=3 con aluvión de 'ustedes'/'carajo' NO sale Latino
-  const simLatWeakFlood = scoreText("vosotros sois ordenador celular carro " + "ustedes ".repeat(20) + "carajo ".repeat(10));
-  check("v1.4.39 blindaje fuertes (simétrico LAT): strongLat=2 < strongEs=3 con ustedes×20 NO sale Latino",
-    simLatWeakFlood?.flag === "🌎 Neutro", JSON.stringify(simLatWeakFlood));
-
-  // B. Override sin oposición fuerte (strong >= 2 con 0 fuertes en contra y < 1 punto débil en contra):
-  const esRescued = scoreText("coche ordenador ustedes");
-  check("v1.4.39 override sin oposición fuerte: 2 fuertes ES vs 0 fuertes LAT + 1 débil ('ustedes' 0,25) -> 🇪🇸 Castellano",
-    esRescued?.flag === "🇪🇸 Castellano", JSON.stringify(esRescued));
-  const latRescued = scoreText("celular computadora vale vale");
-  check("v1.4.39 override sin oposición fuerte: 2 fuertes LAT vs 0 fuertes ES + 2 débiles ('vale'×2 = 0,5) -> 🇲🇽 Latino",
-    latRescued?.flag === "🇲🇽 Latino", JSON.stringify(latRescued));
-  const esBlockedAt1Weak = scoreText("coche ordenador ustedes ustedes ustedes ustedes");
-  check("v1.4.39 override sin oposición fuerte: con >=1 punto débil en contra (4×0,25=1) ya exige superar el margen -> Neutro",
-    esBlockedAt1Weak?.flag === "🌎 Neutro", JSON.stringify(esBlockedAt1Weak));
-
-  // C. Retirada de 'decís' de DICT_LAT (en España es 'vosotros decís', visto en h=29359):
-  const dDecis = {};
-  const rDecis = scoreText("Vosotros decís que estáis en el ordenador", dDecis);
-  check("v1.4.39 'decís' ya no puntúa como término fuerte Latino (latMatches === 0)",
-    dDecis.lat === 0 && rDecis?.flag === "🇪🇸 Castellano", JSON.stringify([dDecis, rDecis]));
-
   // D. Candidatos léxicos bajo LEXICON_EXTRA (apagado por defecto vs encendido):
   const extraSamples = [
     ["ES_VOSOTROS_RE (-áis/-éis/vais)", "¿De qué habláis? Sabéis que podéis venir donde vais", "🇪🇸 Castellano"],
