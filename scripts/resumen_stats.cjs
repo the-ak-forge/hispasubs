@@ -133,4 +133,20 @@ if (langLines.length) {
   if (relCounts.total > 0) {
     console.log(`\n== modo sombra release (rel=): ${relCounts.total} peticiones con release | por tipo: ${JSON.stringify(relCounts.byRel)} | p1=no (ganancia potencial): ${relCounts.p1No} (${(100 * relCounts.p1No / relCounts.total).toFixed(1)}%) ==`);
   }
+
+  // ---- v1.4.39: referencia por nombre declarado (refnombre=) ----
+  const refLines = msgs.filter((m) => m.startsWith("[classify] refnombre="));
+  const refUniq = new Map();
+  for (const m of refLines) {
+    const h = (m.match(/ h=(\S+)/) || [])[1] || m;
+    if (!refUniq.has(h)) refUniq.set(h, m);
+  }
+  if (refUniq.size > 0) {
+    const refMatrix = {};
+    for (const m of refUniq.values()) {
+      const k = (m.match(/refnombre=(\S+) veredicto=(\S+)/) || []).slice(1, 3).join(" -> ");
+      if (k) refMatrix[k] = (refMatrix[k] || 0) + 1;
+    }
+    console.log(`\n== referencia por nombre (refnombre=): ${refLines.length} líneas, ${refUniq.size} archivos únicos ==`, refMatrix);
+  }
 }

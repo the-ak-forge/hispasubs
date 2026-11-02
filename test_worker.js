@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { errKind, looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect } from "./worker.js";
+import worker, { errKind, looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, REF_NAME, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect, ES_VOSOTROS_RE, DICT_ES_EXTRA, DICT_LAT_EXTRA, DICT_ES_WEAK_EXTRA, DICT_LAT_WEAK_EXTRA } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.38", m10.version === "1.4.38", m10.version);
+  check("manifest version 1.4.39", m10.version === "1.4.39", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -3214,6 +3214,174 @@ try {
     await worker.fetch(new Request(`${base}/${b64url({ subdlKey: "clave_de_prueba_123" })}/subtitles/movie/tt7880005.json`), {}, ctx);
     const r5 = resumen("tt7880005");
     chk("v1.4.38 resumen: fuente caída entera queda en err= (OS-V3:fuente-timeout)", /err=OS-V3:fuente-timeout×1/.test(r5), r5.slice(0, 260));
+  } finally { console.log = l0; console.error = e0; globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
+  for (const a of deferred) check(...a);
+}
+
+// 28) v1.4.39: Blindaje de fuertes en scoreText, override sin oposición fuerte, retirada de 'decís',
+//              telemetría refnombre= y candidatos léxicos bajo LEXICON_EXTRA
+{
+  // A. Blindaje de términos fuertes (casos reales de los logs de producción v1.4.38):
+  // 1) Ganador con 0 términos fuertes propios (h=53333: es=- | lat: manejar×2 jugo×1 | deb: joder×21 jodan×6 vale×2 jodió×2)
+  const h53333 = "manejar manejar jugo " + "joder ".repeat(21) + "jodan ".repeat(6) + "vale vale jodió jodió";
+  const r53333 = scoreText(h53333);
+  check("v1.4.39 blindaje fuertes: 0 fuertes ES + 31 débiles ES frente a 3 fuertes LAT (h=53333) NO sale Castellano",
+    r53333?.flag === "🌎 Neutro", JSON.stringify(r53333));
+
+  // 2) Ganador con solo 1 término fuerte (s=1) + >=5 débiles (antes 1 + 5×0,25 = 2,25 > margin=2 se saltaba strong>=2)
+  const cocheVale5 = scoreText("coche vale vale vale vale vale");
+  check("v1.4.39 blindaje fuertes: 1 fuerte ES + 5 débiles ('coche' + 'vale'×5 = 2,25) queda en Neutro",
+    cocheVale5?.flag === "🌎 Neutro", JSON.stringify(cocheVale5));
+  const h36955 = scoreText("conducir vale vale jodió jodan jodido");
+  check("v1.4.39 blindaje fuertes: h=36955 (conducir×1 + 5 débiles ES = 2,25) queda en Neutro",
+    h36955?.flag === "🌎 Neutro", JSON.stringify(h36955));
+  const h50581 = scoreText("manejar " + "papa ".repeat(9) + "papas ustedes");
+  check("v1.4.39 blindaje fuertes: h=50581 (manejar×1 + papa×10 + ustedes×1 = 3,75 en rl=spn) queda en Neutro",
+    h50581?.flag === "🌎 Neutro", JSON.stringify(h50581));
+
+  // 3) Empate 1 vs 1 en fuertes volteado por 'vale'×22 (h=80348: enfadado×1 vs celular×1 | deb: vale×22 ustedes×4)
+  const h80348 = scoreText("enfadado celular " + "vale ".repeat(22) + "ustedes ".repeat(4));
+  check("v1.4.39 blindaje fuertes: empate 1 vs 1 en fuertes + vale×22 (h=80348) queda en Neutro, no Castellano",
+    h80348?.flag === "🌎 Neutro", JSON.stringify(h80348));
+
+  // 4) Desventaja en fuertes volteada por débiles (h=89434: strongEs=2 vs strongLat=4 + vale×13 joder×5)
+  const h89434 = scoreText(
+    "enfades tenéis enojados enojado autos estacionado " +
+      "vale ".repeat(13) + "joder ".repeat(5) + "jodes jodes jodan jodan " +
+      "carajo ".repeat(6) + "ustedes ustedes"
+  );
+  check("v1.4.39 blindaje fuertes: strongEs=2 < strongLat=4 con aluvión de 'vale'/'joder' (h=89434) NO sale Castellano",
+    h89434?.flag === "🌎 Neutro", JSON.stringify(h89434));
+
+  // Simétrico hacia Latino: strongLat=2 < strongEs=3 con aluvión de 'ustedes'/'carajo' NO sale Latino
+  const simLatWeakFlood = scoreText("vosotros sois ordenador celular carro " + "ustedes ".repeat(20) + "carajo ".repeat(10));
+  check("v1.4.39 blindaje fuertes (simétrico LAT): strongLat=2 < strongEs=3 con ustedes×20 NO sale Latino",
+    simLatWeakFlood?.flag === "🌎 Neutro", JSON.stringify(simLatWeakFlood));
+
+  // B. Override sin oposición fuerte (strong >= 2 con 0 fuertes en contra y < 1 punto débil en contra):
+  const esRescued = scoreText("coche ordenador ustedes");
+  check("v1.4.39 override sin oposición fuerte: 2 fuertes ES vs 0 fuertes LAT + 1 débil ('ustedes' 0,25) -> 🇪🇸 Castellano",
+    esRescued?.flag === "🇪🇸 Castellano", JSON.stringify(esRescued));
+  const latRescued = scoreText("celular computadora vale vale");
+  check("v1.4.39 override sin oposición fuerte: 2 fuertes LAT vs 0 fuertes ES + 2 débiles ('vale'×2 = 0,5) -> 🇲🇽 Latino",
+    latRescued?.flag === "🇲🇽 Latino", JSON.stringify(latRescued));
+  const esBlockedAt1Weak = scoreText("coche ordenador ustedes ustedes ustedes ustedes");
+  check("v1.4.39 override sin oposición fuerte: con >=1 punto débil en contra (4×0,25=1) ya exige superar el margen -> Neutro",
+    esBlockedAt1Weak?.flag === "🌎 Neutro", JSON.stringify(esBlockedAt1Weak));
+
+  // C. Retirada de 'decís' de DICT_LAT (en España es 'vosotros decís', visto en h=29359):
+  const dDecis = {};
+  const rDecis = scoreText("Vosotros decís que estáis en el ordenador", dDecis);
+  check("v1.4.39 'decís' ya no puntúa como término fuerte Latino (latMatches === 0)",
+    dDecis.lat === 0 && rDecis?.flag === "🇪🇸 Castellano", JSON.stringify([dDecis, rDecis]));
+
+  // D. Candidatos léxicos bajo LEXICON_EXTRA (apagado por defecto vs encendido):
+  const extraSamples = [
+    ["ES_VOSOTROS_RE (-áis/-éis/vais)", "¿De qué habláis? Sabéis que podéis venir donde vais", "🇪🇸 Castellano"],
+    ["DICT_ES_EXTRA (cojones, coño, majo, cutre, chorrada)", "¡Qué coño dices, tío majo! No digas chorradas en este sitio tan cutre", "🇪🇸 Castellano"],
+    ["DICT_LAT_EXTRA México (ahorita, chamba, pinche, cuate, ¿mande?)", "¿Mande? Ahorita voy a la chamba con mi cuate, pinche tráfico", "🇲🇽 Latino"],
+    ["DICT_LAT_EXTRA Sudamérica (frutilla, durazno, remera, pollera, bacán, pana)", "Mi pana compró frutillas y duraznos con su remera nueva, qué bacán", "🇲🇽 Latino"],
+  ];
+  for (const [label, sample, expected] of extraSamples) {
+    const offRes = scoreText(sample, {}, false);
+    const onRes = scoreText(sample, {}, true);
+    check(`v1.4.39 LEXICON_EXTRA apagado: ${label} no altera scoreText base (null)`,
+      offRes === null, JSON.stringify(offRes));
+    check(`v1.4.39 LEXICON_EXTRA encendido: ${label} clasifica como ${expected}`,
+      onRes?.flag === expected, JSON.stringify(onRes));
+  }
+
+  // Controles negativos de los candidatos extra (falsos amigos que NO deben puntuar con LEXICON_EXTRA=true):
+  const extraNegatives = [
+    ["sustantivos agudos en -aís/-eís (país, maíz, anís, raíz, seis, bonsáis, jerséis)", "El país produce maíz y anís de raíz con seis bonsáis y dos jerséis"],
+    ["verbo mandar en subjuntivo/imperativo ('mande' sin ¿...?)", "Como usted mande capitán, cuando mande a sus hombres que nadie lo mande"],
+    ["'pana' como tejido ('de pana')", "Lleva un pantalón de pana y una chaqueta de pana marrón"],
+    ["'lana' textil/mineral y 'boleto de lotería'", "Compró un boleto de lotería y un abrigo de lana de oveja y lana virgen"],
+    ["'colegas' profesionales", "Mis colegas del hospital y los colegas médicos presentaron el informe"],
+    ["palabras universales excluidas (zapatillas, tío, piso, venga, billete, plata)", "Mi tío subió al segundo piso con zapatillas y un billete de plata cuando venga"],
+  ];
+  for (const [label, sample] of extraNegatives) {
+    const resNeg = scoreText(sample, {}, true);
+    check(`v1.4.39 LEXICON_EXTRA negativo: ${label} -> null (0 puntos)`,
+      resNeg === null, JSON.stringify(resNeg));
+  }
+
+  // No duplicar conteo entre DICT_ES y ES_VOSOTROS_RE para tenéis/estáis/aparcáis/curráis/flipáis:
+  const dDupOff = {}, dDupOn = {};
+  scoreText("tenéis estáis aparcáis curráis flipáis", dDupOff, false);
+  scoreText("tenéis estáis aparcáis curráis flipáis", dDupOn, true);
+  check("v1.4.39 ES_VOSOTROS_RE no duplica verbos que ya están en DICT_ES",
+    dDupOff.es === 5 && dDupOn.es === 5 && dDupOn.strong === 5, JSON.stringify([dDupOff, dDupOn]));
+
+  // Débiles extra (colega, gafas, boleto, lana) suman 0,25 con LEXICON_EXTRA=true:
+  const dWeakEx = {};
+  scoreText("Mis colegas llevan gafas y compraron boletos con mucha lana", dWeakEx, true);
+  check("v1.4.39 DICT_*_WEAK_EXTRA: colegas+gafas (0,5 ES) y boletos+lana (0,5 LAT) con strong=0 -> null",
+    dWeakEx.es === 0.5 && dWeakEx.lat === 0.5 && dWeakEx.strong === 0, JSON.stringify(dWeakEx));
+
+  // Reporte A/B sobre corpus mixto (verifica regresión 0 en base y lista cambios con LEXICON_EXTRA=true):
+  const abCorpus = [
+    { id: "base_es", txt: "Vosotros tenéis el coche aparcado frente al ordenador", expOff: "🇪🇸 Castellano", expOn: "🇪🇸 Castellano" },
+    { id: "base_lat", txt: "Ustedes dejaron el carro estacionado junto a la computadora", expOff: "🇲🇽 Latino", expOn: "🇲🇽 Latino" },
+    { id: " dialog_vosotros_extra", txt: "¿Dónde habéis dejado las gafas? Sabéis que no podéis tardar", expOff: null, expOn: "🇪🇸 Castellano" },
+    { id: "dialog_mx_extra", txt: "Ahorita no tengo chamba ni lana, mi cuate", expOff: null, expOn: "🇲🇽 Latino" },
+    { id: "dialog_conosur_extra", txt: "Se puso la remera y la pollera para comer frutillas", expOff: null, expOn: "🇲🇽 Latino" },
+    { id: "dialog_es_slang_extra", txt: "¡Qué cojones! Eso es una chorrada muy cutre, colega", expOff: null, expOn: "🇪🇸 Castellano" },
+  ];
+  const abChanged = [];
+  for (const item of abCorpus) {
+    const fOff = scoreText(item.txt, {}, false)?.flag ?? null;
+    const fOn = scoreText(item.txt, {}, true)?.flag ?? null;
+    if (fOff !== fOn) abChanged.push(`${item.id}: ${fOff ?? "📄"} -> ${fOn ?? "📄"}`);
+    check(`v1.4.39 A/B [${item.id}]: off=${item.expOff ?? "📄"} / on=${item.expOn ?? "📄"}`,
+      fOff === item.expOff && fOn === item.expOn, `off=${fOff} on=${fOn}`);
+  }
+  console.log(`  (A/B LEXICON_EXTRA: ${abChanged.length}/${abCorpus.length} pistas cambian -> ${abChanged.join(", ")})`);
+
+  // E. Telemetría [classify] refnombre= y contador refnombre= en [subtitles] resumen + env.LEXICON_EXTRA en router:
+  const store = new Map();
+  const cacheApi = { default: { match: async (q) => { const x = store.get(q.url); return x ? x.clone() : undefined; }, put: async (q, rs) => { store.set(q.url, rs.clone()); } } };
+  const prevC = mockGlobal("caches", cacheApi), prevF = globalThis.fetch;
+  globalThis.fetch = (input) => {
+    const u = String(input && input.url !== undefined ? input.url : input);
+    if (u.includes("opensubtitles-v3.strem.io")) {
+      return Promise.resolve(new Response(JSON.stringify({ subtitles: [
+        { id: "r1", url: "https://subs5.strem.io/r1.srt", lang: "spa", subtitleFileName: "Peli.2025.1080p.Dual-Lat.srt" },
+        { id: "r2", url: "https://subs5.strem.io/r2.srt", lang: "spa", subtitleFileName: "Peli.2025.Castellano.WEB-DL.srt" },
+        { id: "r3", url: "https://subs5.strem.io/r3.srt", lang: "spa", subtitleFileName: "Peli.2025.LATINO.CASTELLANO.srt" },
+        { id: "r4", url: "https://subs5.strem.io/r4.srt", lang: "spa", subtitleFileName: "Late.Night.Chocolate.Plate.2025.srt" },
+      ] }), { status: 200, headers: { "content-type": "application/json" } }));
+    }
+    if (u.includes("/r1.srt")) return Promise.resolve(textResp(TXT_LAT));
+    if (u.includes("/r2.srt")) return Promise.resolve(textResp("¿De qué habláis? Sabéis que podéis venir donde vais"));
+    if (u.includes("/r3.srt")) return Promise.resolve(textResp(TXT_CAST));
+    return Promise.resolve(textResp("Texto neutro sin marcas regionales conocidas en absoluto"));
+  };
+  const l0 = console.log, e0 = console.error, lines = [];
+  console.log = (...a) => lines.push(a.join(" ")); console.error = () => {};
+  const ctx = { waitUntil: () => {} };
+  const deferred = [];
+  const chk = (...a) => deferred.push(a);
+  try {
+    // 1) Sin LEXICON_EXTRA: r1 -> Latino, r2 -> sinclasificar (solo tiene verbos de ES_VOSOTROS_RE)
+    await worker.fetch(new Request(`${base}/subtitles/movie/tt7890001.json`), {}, ctx);
+    const refLogs1 = lines.filter((x) => x.startsWith("[classify] refnombre="));
+    const res1 = lines.filter((x) => x.includes("[subtitles] resumen") && x.includes("tt7890001")).pop() || "";
+    chk("v1.4.39 refnombre: emite exactamente 2 líneas (r1=lat y r2=es; r3 dual y r4 'Late/Chocolate/Plate' se ignoran)",
+      refLogs1.length === 2 &&
+        refLogs1.some((x) => /^\[classify\] refnombre=lat veredicto=Latino es=0 lat=[\d.]+ s=\d+ len=1k h=\S+ \[OS-V3\]$/.test(x)) &&
+        refLogs1.some((x) => /^\[classify\] refnombre=es veredicto=sinclasificar es=0 lat=0 s=0 len=1k h=\S+ \[OS-V3\]$/.test(x)),
+      JSON.stringify(refLogs1));
+    chk("v1.4.39 resumen: incluye refnombre=2 cuando hay 2 pistas con nombre dialectal",
+      /\brefnombre=2\b/.test(res1), res1);
+
+    // 2) Con env.LEXICON_EXTRA="1": r2 pasa de 'sinclasificar' a 'Castellano' gracias a ES_VOSOTROS_RE
+    lines.length = 0;
+    await worker.fetch(new Request(`${base}/subtitles/movie/tt7890002.json`), { LEXICON_EXTRA: "1" }, ctx);
+    const refLogs2 = lines.filter((x) => x.startsWith("[classify] refnombre="));
+    chk("v1.4.39 env.LEXICON_EXTRA=1: activa ES_VOSOTROS_RE en el router y r2 pasa a veredicto=Castellano",
+      refLogs2.some((x) => /^\[classify\] refnombre=es veredicto=Castellano es=4 lat=0 s=4 len=1k h=\S+ \[OS-V3\]$/.test(x)),
+      JSON.stringify(refLogs2));
   } finally { console.log = l0; console.error = e0; globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
   for (const a of deferred) check(...a);
 }

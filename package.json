@@ -1,6 +1,6 @@
 {
   "name": "hispasubs-addon",
-  "version": "1.4.38",
+  "version": "1.4.39",
   "description": "Proxy ZIP extractor for HispaSubs",
   "main": "api/proxy.js",
   "type": "module",

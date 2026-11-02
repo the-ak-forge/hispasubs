@@ -1,6 +1,31 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.38
+// HispaSubs — Cloudflare Worker v1.4.39
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.39 (01/11/2026):
+//  - [LÉXICO / BLINDAJE DE FUERTES] En `scoreText`, adjudicar un dialecto exige que el
+//    lado ganador tenga al menos 2 términos fuertes (`strongEs >= 2` / `strongLat >= 2`) y
+//    más términos fuertes que el contrario (`strongEs > strongLat` / `strongLat > strongEs`).
+//    Datos de producción (3.768 archivos únicos en `resumen` y 136 en `desacuerdo`): antes,
+//    a partir de 5 apariciones débiles (`vale`, `joder`, `papa`), `esMatches > latMatches + margin`
+//    se saltaba el mínimo de 2 fuertes y permitía que una pista con 0 o 1 término fuerte
+//    (106 pistas únicas con `s=1`, e incluso `h=53333` con `strongEs=0` vs `strongLat=3`)
+//    o en empate/desventaja de fuertes (`enfadado×1` vs `celular×1` + `vale×22` en `h=80348`)
+//    se clasificara al revés. Simulación sobre los 99 subtítulos españoles reales: 0 regresiones.
+//  - [LÉXICO / OVERRIDE SIN OPOSICIÓN FUERTE] El override sin oposición comprueba ahora
+//    `strongOpuesto === 0` y `< 1` punto débil en contra (en vez de `0` absoluto), rescatando
+//    33 archivos únicos de producción que caían en `🌎 Neutro` teniendo ≥2 términos fuertes
+//    y 0 fuertes en contra solo por 1-3 apariciones débiles aisladas ("no vale nada", "ustedes").
+//  - [LÉXICO / "decís"] Se retira `decís` de `DICT_LAT`: en España ("vosotros decís") coincide
+//    con el voseo rioplatense ("vos decís") y restaba ventaja en subtítulos españoles (`h=29359`).
+//  - [TELEMETRÍA / REFERENCIA POR NOMBRE] Si el nombre declarado del subtítulo (`sub.releaseName`)
+//    indica un dialecto inequívoco (`detectFilenameDialect`), se registra
+//    `[classify] refnombre=<lat|es> veredicto=<Castellano|Latino|Neutro|sinclasificar> …` y el
+//    contador `refnombre=<n>` en `[subtitles] resumen` (solo si >0).
+//  - [LÉXICO / CANDIDATOS EXTRA] Nuevos patrones `ES_VOSOTROS_RE` (terminaciones verbales `-áis`/`-éis`
+//    de 2ª persona plural de España), `DICT_ES_EXTRA`, `DICT_LAT_EXTRA`, `DICT_ES_WEAK_EXTRA` y
+//    `DICT_LAT_WEAK_EXTRA`, activables con `LEXICON_EXTRA` (`env.LEXICON_EXTRA` o 3er parámetro de
+//    `scoreText`, desactivado por defecto) para evaluación A/B sin alterar el léxico base.
 //
 // v1.4.38 (01/11/2026):
 //  - [DIAGNÓSTICO] El resumen añade `err=<fuente>:<causa>×<n>,…` cuando hay fallos de
@@ -581,12 +606,25 @@
 // decida la clasificación; solo pesan cuando aparecen muchas veces.
 const WEAK_WEIGHT = 0.25;
 const DICT_ES = /(?<![\p{L}\p{N}_])(?:vosotros|ordenador(?:es)?|coche[s]?|gilipollas|hostias?|chaval(?:es)?|foll(?:ar|a|an|en|ó|o|ado|ando)|guay|m[oó]vil(?:es)?(?!\s+del\s+(?:crimen|asesinato|delito|robo|ataque)|\s+perpetuo)|patata[s]?|zumo[s]?|aparqu[\p{L}]*|aparc[\p{L}]*|condu(?:cir|zco|zca|zcan|ces|ce|cen|jiste|jeron|jo|cía|cías|cíamos|cían|ciendo|cido)(?!\s+a\s+(?:nada|eso|esto|ninguna\s+parte|la\s+ruina|un\s+desastre|una?\s+conclusi[oó]n))|enfad[\p{L}]*|nevera[s]?|jol[ií]n|mol(?:a|an)|ten[eé]is|sois|est[aá]is|mogoll[oó]n|curr(?:ar|o|as|a|amos|áis|an|ando|ado|ante[s]?)|flip(?:ar|o|as|a|amos|áis|an|é|ó|ando|ado|ante[s]?))(?![\p{L}\p{N}_])/giu;
-const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?(?!\s+de\s+(?:(?:la\s+)?compra|combate)|\s+blindado)|auto(?:s)?|pendej[\p{L}]*|ching(?:ar|a|as|an|o|ó|aron|aba|aban|ado|ada|ando|ón|ones|ue|ues|uen|ué|adera)|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion(?:ar|a|as|an|ó|é|aste|aron|aba|abas|ábamos|aban|ado|ada|ando|amiento)|manej[\p{L}]*(?!\s+del?(?![\p{L}\p{N}_]))|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|[oó]rale|chido|bacano|bolud[\p{L}]*|pelotud[\p{L}]*|pibe[s]?|quilombo[s]?|tenés|querés|podés|sabés|decís|vení|mirá|we[oó]n(?:es|a|as)?|huev[oó]n(?:es|a|as)?|cachai|polol[oa][s]?|parce(?:ro|ra|ros|ras)?|chimba[s]?|chamo[s]?)(?![\p{L}\p{N}_])/giu;
+// v1.4.39: se retira "decís" de DICT_LAT porque en España ("vosotros decís") es idéntico al
+// voseo rioplatense ("vos decís"; visto en producción en el archivo español h=29359).
+const DICT_LAT = /(?<![\p{L}\p{N}_])(?:computadora[s]?|carro[s]?(?!\s+de\s+(?:(?:la\s+)?compra|combate)|\s+blindado)|auto(?:s)?|pendej[\p{L}]*|ching(?:ar|a|as|an|o|ó|aron|aba|aban|ado|ada|ando|ón|ones|ue|ues|uen|ué|adera)|platic[\p{L}]*|celular(?:es)?|jugo[s]?|estacion(?:ar|a|as|an|ó|é|aste|aron|aba|abas|ábamos|aban|ado|ada|ando|amiento)|manej[\p{L}]*(?!\s+del?(?![\p{L}\p{N}_]))|enoj[\p{L}]*|refrigerador(?:es)?|chavo(?:s)?|wey|güey|[oó]rale|chido|bacano|bolud[\p{L}]*|pelotud[\p{L}]*|pibe[s]?|quilombo[s]?|tenés|querés|podés|sabés|vení|mirá|we[oó]n(?:es|a|as)?|huev[oó]n(?:es|a|as)?|cachai|polol[oa][s]?|parce(?:ro|ra|ros|ras)?|chimba[s]?|chamo[s]?)(?![\p{L}\p{N}_])/giu;
 const DICT_ES_WEAK = /(?<![\p{L}\p{N}_])(?:vale|jod(?:e|es|en|emos|er|a|as|an|ía|ías|íamos|ían|ió|ieron|iendo|ido|ida|idos|idas))(?![\p{L}\p{N}_])/giu;
 // Sin flag `i`: "os" / "Os" (inicio de frase) suman 0,25 para España, pero
 // "OS" en mayúsculas (Operating System) no casa nunca.
 const DICT_ES_WEAK_CS = /(?<![\p{L}\p{N}_])[oO]s(?![\p{L}\p{N}_])/gu;
 const DICT_LAT_WEAK = /(?<![\p{L}\p{N}_])(?:papa[s]?|neta[s]?|ustedes|fome[s]?|carajo)(?![\p{L}\p{N}_])/giu;
+
+// v1.4.39: Candidatos de ampliación léxica (activables con LEXICON_EXTRA para evaluación A/B).
+//  - ES_VOSOTROS_RE: desinencias verbales de 2ª persona plural de España (-áis / -éis, más "vais").
+//    Excluye los verbos que ya están en DICT_ES (tenéis, estáis, aparcáis, curráis, flipáis,
+//    enfadáis) para no puntuar doble, así como préstamos nominales (bonsáis, espráis, jerséis) y
+//    palabras con hiato -aí-/-eí- (país, maíz, anís, raíz, seis). No usa -ís genérico.
+const ES_VOSOTROS_RE = /(?<![\p{L}\p{N}_])(?!(?:(?:ten[eé]|est[aá]|aparc[aá]|aparqu[eé]|curr[aáeé]|flip[aáeé]|enfad[aáeé]|bons[aá]|espr[aá]|jers[eé])is|(?:pa[ií]|ma[ií]|an[ií]|ra[ií]|se[ií]?)s)(?![\p{L}\p{N}_]))(?:vais|[\p{L}]{2,}(?:áis|éis))(?![\p{L}\p{N}_])/giu;
+const DICT_ES_EXTRA = /(?<![\p{L}\p{N}_])(?:cojones|coño|maj[oa]s?|cutres?|pij[oa]s?|chorradas?)(?![\p{L}\p{N}_])/giu;
+const DICT_LAT_EXTRA = /(?<![\p{L}\p{N}_])(?:ahorita|chambas?|cuates?|h[ií]jole|nom[aá]s|[aá]ndale|pinches?|culer[oa]s?|nac[oa]s?|popotes?|(?<!(?<![\p{L}\p{N}_])de\s+)panas?(?!\s+de\s)|bac[aá]n(?:es)?|duraznos?|frutillas?|polleras?|remeras?|mij[oa]s?)(?![\p{L}\p{N}_])|[¿¡]\s*mande\s*\?/giu;
+const DICT_ES_WEAK_EXTRA = /(?<![\p{L}\p{N}_])(?:colegas?(?!\s+(?:del\s+(?:trabajo|hospital|partido|instituto|senado)|m[eé]dicos?|cient[ií]ficos?))|gafas)(?![\p{L}\p{N}_])/giu;
+const DICT_LAT_WEAK_EXTRA = /(?<![\p{L}\p{N}_])(?:boletos?(?!\s+de\s+(?:loter[ií]a|rifa))|lana(?!\s+(?:de\s+(?:oveja|cordero|merino|alpaca|vidrio|roca|acero)|virgen|mineral)))(?![\p{L}\p{N}_])/giu;
 // Guarda contra archivos en portugués mal etiquetados como español (donde
 // "carro", "celular" o "estacionamento" darían falso positivo Latino). Sin
 // flag `i` para que "Ã" de mojibake UTF-8 no cuente como tilde portuguesa,
@@ -1260,7 +1298,7 @@ function initPage() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.38",
+  version: "1.4.39",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1620,6 +1658,7 @@ const dedupWave = (indices, analyzed, seenHashes) => {
 // cuentan aparte (RELEASE_SOURCE) y no como "plataforma".
 const IS_PLATFORM = Symbol.for("hispasubs.isPlatform");
 const RELEASE_SOURCE = Symbol.for("hispasubs.releaseSource");
+const REF_NAME = Symbol.for("hispasubs.refName");
 const PLATFORM_RELEASE_RE =
   /(?<![\p{L}\p{N}])(?:NF|NETFLIX|AMZN|DSNP|ATVP|HMAX|HULU|MAX(?=[\s._-]*WEB))(?![\p{L}\p{N}])/iu;
 const DISC_RELEASE_RE =
@@ -1671,7 +1710,7 @@ const unclassified = (sub, finalUrl, failed = false, sdh = false) => ({
 // (209 archivos grandes comparados) mostraron que el texto completo solo convierte
 // veredictos Neutro/📄 en dialecto, sin saltos Castellano<->Latino y sin pérdida de
 // precisión frente a las etiquetas `spl`/`spn`, a ~0,34 ms de media por archivo grande.
-const scoreText = (rawText, diag = {}) => {
+const scoreText = (rawText, diag = {}, useExtra = false) => {
   if (typeof rawText !== "string" || !rawText) return null;
   const text = rawText;
 
@@ -1687,13 +1726,21 @@ const scoreText = (rawText, diag = {}) => {
   // Los términos ambiguos (WEAK) valen 0,25: "No vale la pena", "el Papa",
   // "ganancia neta" o un "ustedes" formal de España ya no deciden solos.
   const score = (dict, weight) => (text.match(dict) || []).length * weight;
+  const extra = Boolean(useExtra);
   // Una sola pasada por diccionario fuerte: strongEs/strongLat alimentan tanto
   // las puntuaciones por dialecto como strongTotal (antes se volvían a
   // recorrer, duplicando el coste léxico).
-  const strongEs = score(DICT_ES, 1);
-  const strongLat = score(DICT_LAT, 1);
-  const esMatches = strongEs + score(DICT_ES_WEAK, WEAK_WEIGHT) + score(DICT_ES_WEAK_CS, WEAK_WEIGHT);
-  const latMatches = strongLat + score(DICT_LAT_WEAK, WEAK_WEIGHT);
+  const strongEs = score(DICT_ES, 1) + (extra ? score(DICT_ES_EXTRA, 1) + score(ES_VOSOTROS_RE, 1) : 0);
+  const strongLat = score(DICT_LAT, 1) + (extra ? score(DICT_LAT_EXTRA, 1) : 0);
+  const esMatches =
+    strongEs +
+    score(DICT_ES_WEAK, WEAK_WEIGHT) +
+    score(DICT_ES_WEAK_CS, WEAK_WEIGHT) +
+    (extra ? score(DICT_ES_WEAK_EXTRA, WEAK_WEIGHT) : 0);
+  const latMatches =
+    strongLat +
+    score(DICT_LAT_WEAK, WEAK_WEIGHT) +
+    (extra ? score(DICT_LAT_WEAK_EXTRA, WEAK_WEIGHT) : 0);
   const strongTotal = strongEs + strongLat;
   const total = esMatches + latMatches;
   diag.es = esMatches;
@@ -1717,11 +1764,25 @@ const scoreText = (rawText, diag = {}) => {
   }
 
   let flag = "🌎 Neutro";
-  // Override sin oposición (v1.4.16): exige al menos 2 términos FUERTES reales
-  // y CERO oposición total (ni fuerte ni débil), impidiendo que acumulación de
-  // términos débiles (ej. "vale" x4) o ambiguos fuercen un dialecto falso.
-  if (esMatches > latMatches + margin || (latMatches === 0 && strongEs >= 2)) flag = "🇪🇸 Castellano";
-  else if (latMatches > esMatches + margin || (esMatches === 0 && strongLat >= 2)) flag = "🇲🇽 Latino";
+  // v1.4.39 — Blindaje de fuertes + override sin oposición fuerte:
+  //  1) El dialecto ganador debe tener ≥2 términos fuertes reales y superar en
+  //     términos fuertes al otro dialecto (`strongEs > strongLat`). Así una
+  //     acumulación de términos débiles ("vale"×22, "joder"×21, "papa"×9) nunca
+  //     decide una pista con 0-1 términos fuertes ni invierte un empate/desventaja
+  //     en términos fuertes.
+  //  2) Cuando el otro dialecto tiene 0 términos fuertes (`strongLat === 0`) y
+  //     menos de 1 punto débil (<4 apariciones aisladas como "no vale nada" o un
+  //     "ustedes" formal), ≥2 términos fuertes bastan sin quedar bloqueados en Neutro.
+  const esWins =
+    strongEs >= 2 &&
+    strongEs > strongLat &&
+    (esMatches > latMatches + margin || (strongLat === 0 && latMatches < 1));
+  const latWins =
+    strongLat >= 2 &&
+    strongLat > strongEs &&
+    (latMatches > esMatches + margin || (strongEs === 0 && esMatches < 1));
+  if (esWins) flag = "🇪🇸 Castellano";
+  else if (latWins) flag = "🇲🇽 Latino";
   return { esMatches, latMatches, strongTotal, total, flag };
 };
 
@@ -1980,7 +2041,8 @@ const classifySubtitle = async (
   spamMode = "drop",
   epSuffix = "",
   maxTimeoutMs = 0,
-  deadMem = null
+  deadMem = null,
+  lexiconExtra = false
 ) => {
   // Guard ANTES de cualquier acceso a sub.url (evita el crash en cascada
   // de Promise.all del 1.0.0).
@@ -2050,7 +2112,7 @@ const classifySubtitle = async (
     const isPlatform = isPlatformRelease(sub);
 
     const diag = {};
-    const scored = scoreText(text, diag);
+    const scored = scoreText(text, diag, lexiconExtra);
     // len = tamaño del texto analizado en KB (caracteres/1024, redondeado hacia
     // arriba); "+" si se cortó en MAX_ANALYZE_BYTES.
     const lenTag = `${Math.ceil(text.length / 1024)}k${truncated ? "+" : ""}`;
@@ -2065,6 +2127,20 @@ const classifySubtitle = async (
       console.log(`[classify] descartado por idioma (portugués) [${sub.source}]`);
       return null;
     }
+    // v1.4.39: Referencia de dialecto por nombre declarado de la pista (`sub.releaseName`).
+    const refDialect = detectFilenameDialect(sub.releaseName);
+    if (refDialect) {
+      const refVerdict = !scored
+        ? "sinclasificar"
+        : scored.flag.includes("Castellano")
+        ? "Castellano"
+        : scored.flag.includes("Latino")
+        ? "Latino"
+        : "Neutro";
+      console.log(
+        `[classify] refnombre=${refDialect} veredicto=${refVerdict} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0} len=${lenTag} h=${contentHash} [${sub.source}]`
+      );
+    }
     const brief = (flag) =>
       `${flag}${isPlatform ? " [PLAT]" : ""}${sdh ? " SDH" : ""} es=${diag.es ?? 0} lat=${diag.lat ?? 0} s=${diag.strong ?? 0} len=${lenTag}${rlTag}${
         diag.reason ? ` (${diag.reason})` : ""
@@ -2075,6 +2151,7 @@ const classifySubtitle = async (
       const u = unclassified(sub, finalUrl, false, sdh);
       u[SCORE] = brief("📄");
       u[CONTENT_HASH] = contentHash;
+      u[REF_NAME] = Boolean(refDialect);
       return u;
     }
 
@@ -2098,6 +2175,7 @@ const classifySubtitle = async (
       [CONTENT_HASH]: contentHash,
       [IS_PLATFORM]: isPlatform,
       [RELEASE_SOURCE]: releaseSourceOf(sub),
+      [REF_NAME]: Boolean(refDialect),
     };
   } catch (error) {
     // Descarte permanente sin penalizar el TTL:
@@ -2139,7 +2217,7 @@ const getCanonicalConfigStr = (config) =>
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { errKind, looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect };
+export { errKind, looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, REF_NAME, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect, ES_VOSOTROS_RE, DICT_ES_EXTRA, DICT_LAT_EXTRA, DICT_ES_WEAK_EXTRA, DICT_LAT_WEAK_EXTRA };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -2400,6 +2478,9 @@ export default {
         //    ANALYSIS_FETCH_PER_SOURCE = 8 en total por fuente).
         const pBase = proxyBase(env);
         const spamMode = env && env.SPAM_FILTER === "log" ? "log" : "drop";
+        const lexiconExtra = Boolean(
+          env && (env.LEXICON_EXTRA === "1" || env.LEXICON_EXTRA === "true" || env.LEXICON_EXTRA === true)
+        );
         const epSuffix =
           season && episode && /^\d+$/.test(season) && /^\d+$/.test(episode)
             ? `&s=${season}&e=${episode}`
@@ -2427,7 +2508,7 @@ export default {
               const delay = (osStaggerW1++) * DOWNLOAD_STAGGER_MS;
               if (delay > 0) await new Promise((r) => setTimeout(r, delay));
             }
-            analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, 0, deadMem);
+            analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, 0, deadMem, lexiconExtra);
           })
         );
         const w1Ms = Date.now() - tWave1;
@@ -2464,7 +2545,7 @@ export default {
                 const delay = (osStaggerW2++) * DOWNLOAD_STAGGER_MS;
                 if (delay > 0) await new Promise((r) => setTimeout(r, delay));
               }
-              analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, remainingMs, deadMem);
+              analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, remainingMs, deadMem, lexiconExtra);
             })
           );
           w2Ms = Date.now() - tWave2;
@@ -2554,6 +2635,7 @@ export default {
         const platformCount = subtitles.filter((s) => s[IS_PLATFORM]).length;
         const webCount = subtitles.filter((s) => s[RELEASE_SOURCE] === "web").length;
         const discCount = subtitles.filter((s) => s[RELEASE_SOURCE] === "disco").length;
+        const refNameCount = subtitles.filter((s) => s[REF_NAME]).length;
         console.log(
           `[subtitles] resumen ${type}/${fullId}: total=${Date.now() - tStart}ms w1=${w1Ms}ms w2=${w2Ms}ms ` +
             `descargas=${wave1Idx.length + (wave2Ran ? wave2Idx.length : 0) - deadMem.hits} ` +
@@ -2561,6 +2643,7 @@ export default {
             `plataforma=${platformCount}/${subtitles.length} web=${webCount} disco=${discCount} ` +
             `fallos=${failed["OS-V3"] + failed["SubDL"]} descartes404=${descartes404} mem404=${deadMem.hits} mem404w=${deadWritten} duplicados=${duplicadosContenido} ttl=${ttl}s` +
             errTag + relTag +
+            (refNameCount > 0 ? ` refnombre=${refNameCount}` : "") +
             (fnDialect ? ` fn=${fnDialect}` : "") +
             (targetDialect ? ` orden=${targetDialect}` : "") +
             (scoreLog.length ? ` | ${scoreLog.join(" | ")}` : "")
