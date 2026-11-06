@@ -1,6 +1,12 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.39
+// HispaSubs — Cloudflare Worker v1.4.40
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.40 (05/11/2026):
+//  - [FILTRO DE IDIOMA OPCIONAL] Nueva variable `LANG_VERIFY` (`1`, `true` o `all`; apagada por
+//    defecto): aplica `looksSpanish` a TODAS las fuentes (SubDL y OS-V3 `spa`), no solo a OS-V3
+//    `spl`/`spn`, y descarta las pistas cuyo texto no parece español (log `descartado por idioma`).
+//    Con la variable sin definir el comportamiento es idéntico al de la 1.4.39.
 //
 // v1.4.39 (01/11/2026):
 //  - [SIN CAMBIOS DE CLASIFICACIÓN] `scoreText` base y los diccionarios base (incluido `decís`) son
@@ -1284,7 +1290,7 @@ function initPage() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.39",
+  version: "1.4.40",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -2014,7 +2020,8 @@ const classifySubtitle = async (
   epSuffix = "",
   maxTimeoutMs = 0,
   deadMem = null,
-  lexiconExtra = false
+  lexiconExtra = false,
+  verifyAll = false
 ) => {
   // Guard ANTES de cualquier acceso a sub.url (evita el crash en cascada
   // de Promise.all del 1.0.0).
@@ -2058,7 +2065,7 @@ const classifySubtitle = async (
 
     // Pistas de códigos regionales no confirmados (OS-V3 `spl`/`spn`): si el texto
     // no parece español, se descartan en vez de servirlas como "📄 Español".
-    if (sub.verifyEs && !looksSpanish(text)) {
+    if ((sub.verifyEs || verifyAll) && !looksSpanish(text)) {
       console.log(`[classify] descartado por idioma (no parece español; código ${sub.rawLang}) [${sub.source}]`);
       return null;
     }
@@ -2453,6 +2460,11 @@ export default {
         const lexiconExtra = Boolean(
           env && (env.LEXICON_EXTRA === "1" || env.LEXICON_EXTRA === "true" || env.LEXICON_EXTRA === true)
         );
+        // LANG_VERIFY=1|true|all: aplica `looksSpanish` a TODAS las fuentes (SubDL y OS-V3 `spa`),
+        // no solo a OS-V3 `spl`/`spn`. Apagado por defecto: comportamiento idéntico al 1.4.39.
+        const verifyAll = Boolean(
+          env && (env.LANG_VERIFY === "1" || env.LANG_VERIFY === "true" || env.LANG_VERIFY === "all" || env.LANG_VERIFY === true)
+        );
         const epSuffix =
           season && episode && /^\d+$/.test(season) && /^\d+$/.test(episode)
             ? `&s=${season}&e=${episode}`
@@ -2480,7 +2492,7 @@ export default {
               const delay = (osStaggerW1++) * DOWNLOAD_STAGGER_MS;
               if (delay > 0) await new Promise((r) => setTimeout(r, delay));
             }
-            analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, 0, deadMem, lexiconExtra);
+            analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, 0, deadMem, lexiconExtra, verifyAll);
           })
         );
         const w1Ms = Date.now() - tWave1;
@@ -2517,7 +2529,7 @@ export default {
                 const delay = (osStaggerW2++) * DOWNLOAD_STAGGER_MS;
                 if (delay > 0) await new Promise((r) => setTimeout(r, delay));
               }
-              analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, remainingMs, deadMem, lexiconExtra);
+              analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, remainingMs, deadMem, lexiconExtra, verifyAll);
             })
           );
           w2Ms = Date.now() - tWave2;

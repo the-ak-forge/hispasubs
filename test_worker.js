@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.39", m10.version === "1.4.39", m10.version);
+  check("manifest version 1.4.40", m10.version === "1.4.40", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -2553,7 +2553,7 @@ try {
   }
 
   const jsonR = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
-  const run = async (id, { os = [], osStatus = 200, subdl = null, dl = null, key = "", body = null } = {}) => {
+  const run = async (id, { os = [], osStatus = 200, subdl = null, dl = null, key = "", body = null, env = {} } = {}) => {
     const prevC = mockGlobal("caches", { default: { match: async () => undefined, put: async () => {} } });
     const prevF = globalThis.fetch;
     globalThis.fetch = (input) => {
@@ -2568,7 +2568,7 @@ try {
     let r, j;
     try {
       const pre = key ? `/${b64url({ subdlKey: key })}` : "";
-      r = await worker.fetch(new Request(`${base}${pre}/subtitles/movie/${id}.json`), {}, { waitUntil: () => {} });
+      r = await worker.fetch(new Request(`${base}${pre}/subtitles/movie/${id}.json`), env, { waitUntil: () => {} });
       j = await r.json();
     } finally { console.log = l; console.error = e; globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
     return { ttl: r.headers.get("cache-control"), n: j.subtitles.length, lines };
@@ -2655,6 +2655,35 @@ try {
     r = await run("tt7790033", { os: [{ id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" }], body: PT });
     check("portugués (guarda de scoreText) -> se descarta en vez de servirse como 📄 español", r.n === 0 && r.lines.some((l) => l.includes("descartado por idioma (portugués) [OS-V3]")), JSON.stringify([r.n, r.lines.filter((l) => l.includes("[classify]"))]));
     check("portugués descartado sin fallos: caché negativa de 300 s", r.ttl === "public, max-age=300", String(r.ttl));
+
+    // ---- v1.4.40: LANG_VERIFY aplica looksSpanish a TODAS las fuentes (apagado por defecto) ----
+    const osEng = { os: [{ id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" }], body: ENG };
+    const sdlEng = { key: "clave_valida_123", subdl: { status: true, subtitles: [{ url: "/subtitle/1-1.zip", release_name: "A", language: "ES", file_id: 1 }] }, body: ENG };
+    const sdlEs = { key: "clave_valida_123", subdl: { status: true, subtitles: [{ url: "/subtitle/1-1.zip", release_name: "A", language: "ES", file_id: 1 }] }, body: perEs };
+    r = await run("tt7790040", { ...osEng });
+    check("LANG_VERIFY apagado: OS-V3 spa en inglés se sirve (idéntico a 1.4.39)", r.n === 1 && !r.lines.some((l) => l.includes("descartado por idioma")), JSON.stringify([r.n]));
+    r = await run("tt7790041", { ...sdlEng });
+    check("LANG_VERIFY apagado: SubDL en inglés se sirve (idéntico a 1.4.39)", r.n === 1 && !r.lines.some((l) => l.includes("descartado por idioma")), JSON.stringify([r.n]));
+    for (const v of ["1", "true", "all", true]) {
+      r = await run("tt77900" + (42 + ["1", "true", "all", true].indexOf(v)), { ...osEng, env: { LANG_VERIFY: v } });
+      check(`LANG_VERIFY=${String(v)}: OS-V3 spa en inglés se descarta`, r.n === 0 && r.lines.some((l) => l.includes("descartado por idioma (no parece español") && l.includes("[OS-V3]")), JSON.stringify([r.n, r.lines.filter((l) => l.includes("[classify]"))]));
+    }
+    r = await run("tt7790046", { ...sdlEng, env: { LANG_VERIFY: "1" } });
+    check("LANG_VERIFY=1: SubDL en inglés se descarta", r.n === 0 && r.lines.some((l) => l.includes("descartado por idioma (no parece español") && l.includes("[SubDL]")), JSON.stringify([r.n, r.lines.filter((l) => l.includes("[classify]"))]));
+    r = await run("tt7790047", { ...sdlEs, env: { LANG_VERIFY: "1" } });
+    check("LANG_VERIFY=1: SubDL en español NO se descarta", r.n === 1 && !r.lines.some((l) => l.includes("descartado por idioma")), JSON.stringify([r.n]));
+    r = await run("tt7790048", { os: [{ id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" }], body: perEs, env: { LANG_VERIFY: "1" } });
+    check("LANG_VERIFY=1: OS-V3 spa en español NO se descarta", r.n === 1 && !r.lines.some((l) => l.includes("descartado por idioma")), JSON.stringify([r.n]));
+    r = await run("tt7790049", { ...osEng, env: { LANG_VERIFY: "0" } });
+    check("LANG_VERIFY=0 / valor desconocido: no activa el filtro", r.n === 1, JSON.stringify([r.n]));
+    r = await run("tt7790050", { os: [{ id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" }], body: "1\n00:00:01,000 --> 00:00:02,000\nHello there friend\n\n", env: { LANG_VERIFY: "1" } });
+    check("LANG_VERIFY=1: texto demasiado corto (<20 palabras) no se descarta", r.n === 1, JSON.stringify([r.n]));
+    // 2ª oleada (reserva de candidatos): con 8 pistas en inglés, las 3 de la 2ª oleada también deben descartarse.
+    const osEng8 = Array.from({ length: 8 }, (_, i) => ({ id: "e" + i, url: `https://subs5.strem.io/e${i}.srt`, lang: "spa" }));
+    r = await run("tt7790051", { os: osEng8, body: (u) => ENG + " x" + u.slice(-8), env: { LANG_VERIFY: "1" } });
+    check("LANG_VERIFY=1: también filtra la 2ª oleada (8 pistas en inglés -> 0 servidas)", r.n === 0, JSON.stringify([r.n]));
+    r = await run("tt7790052", { os: osEng8, body: (u) => ENG + " x" + u.slice(-8) });
+    check("LANG_VERIFY apagado: 8 pistas en inglés: se sirven 5 (tope por fuente, referencia de la 2ª oleada)", r.n === 5, JSON.stringify([r.n]));
 
     r = await run("tt7790034", { key: "clave_valida_123", subdl: { status: true, subtitles: [
       { url: "/subtitle/1-1.zip", release_name: "A", language: "BR_PT", file_id: 1 },
