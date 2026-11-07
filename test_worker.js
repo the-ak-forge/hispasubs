@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.40", m10.version === "1.4.40", m10.version);
+  check("manifest version 1.4.41", m10.version === "1.4.41", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -599,6 +599,33 @@ try {
   check("v1.4.2 spam débil (correo + sitio sin frase de crédito) -> descarta",
     spamVerdict("Escríbenos a promo@casino-gana.com\nwww.casino-gana.com").discard === true,
     JSON.stringify(spamVerdict("Escríbenos a promo@casino-gana.com\nwww.casino-gana.com")));
+
+  // --- v1.4.41: SPAM_CREDITS (tercer argumento de spamVerdict; apagado por defecto) ---
+  const cue = (...ls) => "1\n00:00:01,000 --> 00:00:03,000\n" + ls.join("\n") + "\n\n2\n00:00:04,000 --> 00:00:06,000\nHola, ¿cómo estás?\n\n";
+  const creditBlock = cue("Subtítulos por", "SupernaturalForo.com", "GrupoTS.net");
+  const vOff = spamVerdict(creditBlock);
+  const vOn = spamVerdict(creditBlock, false, true);
+  check("v1.4.41 SPAM_CREDITS apagado: crédito de comunidad no listada (Subtítulos por + 2 sitios) -> descarta (como en 1.4.40)",
+    vOff.discard === true && vOff.reason === "3 líneas débiles", JSON.stringify(vOff));
+  check("v1.4.41 SPAM_CREDITS encendido: el mismo crédito se conserva", vOn.discard === false, JSON.stringify(vOn));
+  const idCases = [creditBlock, cue("Traducido Por", "Corregido Por", "www.TheSubFactory.net", "www.TheSubFactory.net"),
+    cue("Subtítulos por", "www.OpenSubtitles.org", "www.OpenSubtitles.org"), cue("www.VidaInformatica.com", "www.VidaInformatica.com"),
+    cue("Traducido por Argenteam", "www.opensubtitles.org"), cue("Visita www.casino-gana.com"), cue("Hola"), "", "Subtítulos por MrX\nEscríbenos a promo@casino-gana.com",
+    cue("YTS", "YTS"), cue("Traducido por", "https://www.instagram.com/x", "https://www.instagram.com/y")];
+  check("v1.4.41 SPAM_CREDITS apagado explícito: salida literal idéntica a la llamada sin argumento (11 entradas)",
+    idCases.every((t) => JSON.stringify(spamVerdict(t, false, false)) === JSON.stringify(spamVerdict(t))));
+  const wm = spamVerdict(cue("Subtítulos por", "www.OpenSubtitles.org", "www.OpenSubtitles.org"), false, true);
+  check("v1.4.41 SPAM_CREDITS encendido: con marca de agua OpenSubtitles SIGUE descartando", wm.discard === true, JSON.stringify(wm));
+  const yt = spamVerdict(cue("Traducido por", "YTS.MX", "YTS.MX"), false, true);
+  check("v1.4.41 SPAM_CREDITS encendido: con marca de agua YTS SIGUE descartando", yt.discard === true, JSON.stringify(yt));
+  const st = spamVerdict(cue("Traducido por X", "www.foo.com", "Casa de apuestas online"), false, true);
+  check("v1.4.41 SPAM_CREDITS encendido: un término fuerte (apuestas) SIGUE descartando", st.discard === true && st.reason === "fuerte", JSON.stringify(st));
+  const noCred = spamVerdict(cue("www.VidaInformatica.com", "www.VidaInformatica.com"), false, true);
+  check("v1.4.41 SPAM_CREDITS encendido: sin frase de crédito (solo dominios) SIGUE descartando", noCred.discard === true, JSON.stringify(noCred));
+  const oneLine = spamVerdict(cue("Traducido por Argenteam"), false, true);
+  check("v1.4.41 SPAM_CREDITS encendido: una sola línea débil sigue conservándose", oneLine.discard === false, JSON.stringify(oneLine));
+  const trunc = spamVerdict(creditBlock, true, true);
+  check("v1.4.41 SPAM_CREDITS encendido + archivo truncado: se conserva (la cabecera es lo único que se evalúa)", trunc.discard === false, JSON.stringify(trunc));
 
   // --- Guard anti-falsos-positivos: diálogo legítimo con palabras "peligrosas" ---
   const limpios = [
@@ -2684,6 +2711,28 @@ try {
     check("LANG_VERIFY=1: también filtra la 2ª oleada (8 pistas en inglés -> 0 servidas)", r.n === 0, JSON.stringify([r.n]));
     r = await run("tt7790052", { os: osEng8, body: (u) => ENG + " x" + u.slice(-8) });
     check("LANG_VERIFY apagado: 8 pistas en inglés: se sirven 5 (tope por fuente, referencia de la 2ª oleada)", r.n === 5, JSON.stringify([r.n]));
+
+    // ---- v1.4.41: SPAM_CREDITS (apagado por defecto) ----
+    const credHdr = "1\n00:00:01,000 --> 00:00:03,000\nSubtítulos por\nSupernaturalForo.com\nGrupoTS.net\n\n";
+    const adHdr = "1\n00:00:01,000 --> 00:00:03,000\nwww.VidaInformatica.com\nwww.VidaInformatica.com\n\n";
+    const osCred = { os: [{ id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" }], body: (u) => credHdr + perEs(u) };
+    r = await run("tt7791001", { ...osCred });
+    check("SPAM_CREDITS apagado: crédito de comunidad no listada se descarta (idéntico a 1.4.40)", r.n === 0 && r.lines.some((l) => l.includes("descartado por spam (3 líneas débiles")), JSON.stringify([r.n, r.lines.filter((l) => l.includes("[classify]"))]));
+    for (const [i, v] of ["1", "true", true].entries()) {
+      r = await run("tt779100" + (2 + i), { ...osCred, env: { SPAM_CREDITS: v } });
+      check(`SPAM_CREDITS=${String(v)}: el crédito se conserva y se sirve`, r.n === 1 && !r.lines.some((l) => l.includes("descartado por spam")), JSON.stringify([r.n, r.lines.filter((l) => l.includes("[classify]"))]));
+    }
+    r = await run("tt7791005", { ...osCred, env: { SPAM_CREDITS: "0" } });
+    check("SPAM_CREDITS=0 / valor desconocido: no activa la regla", r.n === 0, JSON.stringify([r.n]));
+    r = await run("tt7791006", { os: [{ id: "a", url: "https://subs5.strem.io/a.srt", lang: "spa" }], body: (u) => adHdr + perEs(u), env: { SPAM_CREDITS: "1" } });
+    check("SPAM_CREDITS=1: publicidad (solo dominios, sin frase de crédito) SIGUE descartándose", r.n === 0 && r.lines.some((l) => l.includes("descartado por spam")), JSON.stringify([r.n]));
+    // 2ª oleada: 5 pistas de publicidad en la 1ª, 3 créditos en la reserva -> solo se sirven con la regla encendida
+    const osMix = [...Array.from({ length: 5 }, (_, i) => ({ id: "ad" + i, url: `https://subs5.strem.io/ad${i}.srt`, lang: "spa" })), ...Array.from({ length: 3 }, (_, i) => ({ id: "cr" + i, url: `https://subs5.strem.io/cr${i}.srt`, lang: "spa" }))];
+    const bodyMix = (u) => (u.includes("/ad") ? adHdr : credHdr) + perEs(u);
+    r = await run("tt7791007", { os: osMix, body: bodyMix, env: { SPAM_CREDITS: "1" } });
+    check("SPAM_CREDITS=1: también aplica en la 2ª oleada (3 créditos de la reserva se sirven)", r.n === 3, JSON.stringify([r.n]));
+    r = await run("tt7791008", { os: osMix, body: bodyMix });
+    check("SPAM_CREDITS apagado: 2ª oleada: los 3 créditos de la reserva se descartan (0 servidas)", r.n === 0, JSON.stringify([r.n]));
 
     r = await run("tt7790034", { key: "clave_valida_123", subdl: { status: true, subtitles: [
       { url: "/subtitle/1-1.zip", release_name: "A", language: "BR_PT", file_id: 1 },

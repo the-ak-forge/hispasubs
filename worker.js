@@ -1,6 +1,13 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.40
+// HispaSubs — Cloudflare Worker v1.4.41
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.41 (07/11/2026):
+//  - [CRÉDITOS DE TRADUCTORES OPCIONAL] Nueva variable `SPAM_CREDITS` (`1` o `true`; apagada por
+//    defecto): una pista con frase de crédito ("Traducido por", "Subtítulos por"…) y sin marca de agua
+//    de OpenSubtitles/YTS ya no se descarta por líneas débiles (créditos de comunidades que no están en
+//    la lista de conocidas, p. ej. SupernaturalForo/GrupoTS, TheSubFactory). Los términos fuertes y la
+//    marca de agua siguen descartando. Con la variable sin definir el comportamiento es idéntico al 1.4.40.
 //
 // v1.4.40 (05/11/2026):
 //  - [FILTRO DE IDIOMA OPCIONAL] Nueva variable `LANG_VERIFY` (`1`, `true` o `all`; apagada por
@@ -1290,7 +1297,7 @@ function initPage() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.40",
+  version: "1.4.41",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1846,7 +1853,11 @@ const isCreditOnlyLine = (line) =>
 // Si `truncated` es true (el archivo superó MAX_ANALYZE_BYTES y se cortó a
 // mitad), solo se extrae la cabeza: las últimas líneas del buffer truncado
 // son diálogo de mitad de película, no el pie del subtítulo.
-const spamVerdict = (text, truncated = false) => {
+// `spamCredits` (SPAM_CREDITS=1, apagado por defecto): una pista con frase de crédito
+// ("Traducido por", "Subtítulos por"…) y SIN marca de agua de OpenSubtitles/YTS no se
+// descarta por líneas débiles (créditos de comunidades/uploaders que la lista de
+// comunidades conocidas no cubre). Los términos fuertes se evalúan antes y no cambian.
+const spamVerdict = (text, truncated = false, spamCredits = false) => {
   // Marca/URL inequívoca: evaluada sobre cabeza (48 KB) y cola (16 KB) para no
   // ejecutar el regex Unicode sobre 300 KB de texto completo (ahorro de ~1.5 ms CPU).
   const spamSample = text.length <= 65536 ? text : text.slice(0, 49152) + "\n" + text.slice(-16384);
@@ -1918,7 +1929,7 @@ const spamVerdict = (text, truncated = false) => {
     if (SPAM_CREDIT_PHRASE_TEST.test(line)) hasCreditPhrase = true;
     if (SPAM_WATERMARK.test(line)) hasWatermark = true;
   }
-  if (weakMatches.length >= 2 && (hasWatermark || (hasCreditPhrase ? adLines >= 2 : adLines >= 1))) {
+  if (weakMatches.length >= 2 && (hasWatermark || (hasCreditPhrase ? !spamCredits && adLines >= 2 : adLines >= 1))) {
     return {
       discard: true,
       reason: `${weakMatches.length} líneas débiles`,
@@ -2021,7 +2032,8 @@ const classifySubtitle = async (
   maxTimeoutMs = 0,
   deadMem = null,
   lexiconExtra = false,
-  verifyAll = false
+  verifyAll = false,
+  spamCredits = false
 ) => {
   // Guard ANTES de cualquier acceso a sub.url (evita el crash en cascada
   // de Promise.all del 1.0.0).
@@ -2075,7 +2087,7 @@ const classifySubtitle = async (
     // deliberado NO es una respuesta degradada, así que no marca FAILED ni
     // baja el TTL. Con SPAM_FILTER=log (modo sombra) se registra el veredicto
     // pero la pista se sirve: sirve para medir en producción qué se perdería.
-    const spam = spamVerdict(text, truncated);
+    const spam = spamVerdict(text, truncated, spamCredits);
     if (spam.discard) {
       const detail = spam.match ? `: "${spam.match}"` : "";
       if (spamMode === "log") {
@@ -2465,6 +2477,11 @@ export default {
         const verifyAll = Boolean(
           env && (env.LANG_VERIFY === "1" || env.LANG_VERIFY === "true" || env.LANG_VERIFY === "all" || env.LANG_VERIFY === true)
         );
+        // SPAM_CREDITS=1|true: las pistas con frase de crédito y sin marca de agua de
+        // OpenSubtitles/YTS no se descartan por líneas débiles. Apagado por defecto: idéntico a la 1.4.40.
+        const spamCredits = Boolean(
+          env && (env.SPAM_CREDITS === "1" || env.SPAM_CREDITS === "true" || env.SPAM_CREDITS === true)
+        );
         const epSuffix =
           season && episode && /^\d+$/.test(season) && /^\d+$/.test(episode)
             ? `&s=${season}&e=${episode}`
@@ -2492,7 +2509,7 @@ export default {
               const delay = (osStaggerW1++) * DOWNLOAD_STAGGER_MS;
               if (delay > 0) await new Promise((r) => setTimeout(r, delay));
             }
-            analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, 0, deadMem, lexiconExtra, verifyAll);
+            analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, 0, deadMem, lexiconExtra, verifyAll, spamCredits);
           })
         );
         const w1Ms = Date.now() - tWave1;
@@ -2529,7 +2546,7 @@ export default {
                 const delay = (osStaggerW2++) * DOWNLOAD_STAGGER_MS;
                 if (delay > 0) await new Promise((r) => setTimeout(r, delay));
               }
-              analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, remainingMs, deadMem, lexiconExtra, verifyAll);
+              analyzed[i] = await classifySubtitle(deduped[i], pBase, spamMode, epSuffix, remainingMs, deadMem, lexiconExtra, verifyAll, spamCredits);
             })
           );
           w2Ms = Date.now() - tWave2;
