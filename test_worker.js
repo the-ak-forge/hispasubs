@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { errKind, looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, REF_NAME, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect, ES_VOSOTROS_RE, DICT_ES_EXTRA, DICT_LAT_EXTRA, DICT_ES_WEAK_EXTRA, DICT_LAT_WEAK_EXTRA } from "./worker.js";
+import worker, { errKind, looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, REF_NAME, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect, ES_VOSOTROS_RE, DICT_ES_EXTRA, DICT_LAT_EXTRA, DICT_ES_WEAK_EXTRA, DICT_LAT_WEAK_EXTRA, releaseMatchesEp, getSubDL } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.41", m10.version === "1.4.41", m10.version);
+  check("manifest version 1.4.43", m10.version === "1.4.43", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -3407,6 +3407,336 @@ try {
       JSON.stringify(refLogs2));
   } finally { console.log = l0; console.error = e0; globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
   for (const a of deferred) check(...a);
+}
+
+// 29) v1.4.42: pre-filtrado de episodio/rango en SubDL y desempate por sincronía de release (web/disco) en MISS y HIT
+{
+  // A. Unitario: orderSubtitlesByDialect con targetRelease ("web" / "disco")
+  const mixSubs = [
+    { id: "lat_bd", label: "🇲🇽 Latino (OS-V3)", [RELEASE_SOURCE]: "disco" },
+    { id: "es_bd", label: "🇪🇸 Castellano (OS-V3)", [RELEASE_SOURCE]: "disco" },
+    { id: "lat_web", label: "🇲🇽 Latino (SubDL)", [RELEASE_SOURCE]: "web" },
+    { id: "es_web", label: "🇪🇸 Castellano (SubDL)", [RELEASE_SOURCE]: "web" },
+  ];
+  const ordLatWeb = orderSubtitlesByDialect(mixSubs, "lat", "web");
+  check("v1.4.42 orderSubtitlesByDialect('lat', 'web'): prioriza 🇲🇽 y desempata por 'web' dentro de cada bloque",
+    JSON.stringify(ordLatWeb.map((s) => s.id)) === JSON.stringify(["lat_web", "lat_bd", "es_web", "es_bd"]) &&
+      mixSubs[0].id === "lat_bd",
+    JSON.stringify(ordLatWeb.map((s) => s.id)));
+
+  const ordOnlyWeb = orderSubtitlesByDialect(mixSubs, null, "web");
+  check("v1.4.42 orderSubtitlesByDialect(null, 'web'): sin dialecto objetivo sube las pistas 'web' de forma estable",
+    JSON.stringify(ordOnlyWeb.map((s) => s.id)) === JSON.stringify(["lat_web", "es_web", "lat_bd", "es_bd"]),
+    JSON.stringify(ordOnlyWeb.map((s) => s.id)));
+
+  const ordOnlyDisco = orderSubtitlesByDialect(mixSubs, null, "disco");
+  check("v1.4.42 orderSubtitlesByDialect(null, 'disco'): sin dialecto objetivo sube las pistas 'disco' de forma estable",
+    JSON.stringify(ordOnlyDisco.map((s) => s.id)) === JSON.stringify(["lat_bd", "es_bd", "lat_web", "es_web"]),
+    JSON.stringify(ordOnlyDisco.map((s) => s.id)));
+
+  // B. Tests unitarios e integración SUBDL_EPFILTER y rescate por releaseName
+  {
+    // 1. Tests unitarios de releaseMatchesEp (ceros a la izquierda, temporadas, negativos)
+    check("releaseMatchesEp: S01E01 casa con s=1 e=1", releaseMatchesEp("Show.S01E01.720p", 1, 1) === true);
+    check("releaseMatchesEp: E01 y E1 equivalen a episodio 1",
+      releaseMatchesEp("Show.E01.HDTV", 1, 1) === true &&
+      releaseMatchesEp("Show.E1.HDTV", 1, 1) === true);
+    check("releaseMatchesEp: E19 NO casa con episodio 1",
+      releaseMatchesEp("Show.E19.HDTV", 1, 1) === false &&
+      releaseMatchesEp("Show.S01E19.HDTV", 1, 1) === false);
+    check("releaseMatchesEp: S02E01 NO casa cuando se pide temporada 1",
+      releaseMatchesEp("Show.S02E01.HDTV", 1, 1) === false);
+    check("releaseMatchesEp: 1x01 casa con s=1 e=1 y 2x01 no",
+      releaseMatchesEp("Show.1x01.HDTV", 1, 1) === true &&
+      releaseMatchesEp("Show.2x01.HDTV", 1, 1) === false);
+
+    // 2. Integración: comportamiento con SUBDL_EPFILTER apagado (por defecto), en 'log' y en '1'/'true'
+    const subdlFixture = [
+      { file_id: 1, url: "/subtitle/ep2-wrong.zip", episode: 2, full_season: false, release_name: "Show.S01E02" },
+      { file_id: 2, url: "/subtitle/range1-4-wrong.zip", episode_from: 1, episode_end: 4, release_name: "Show.S01E01-E04" },
+      { file_id: 3, url: "/subtitle/range5-8-ok.zip", episode_from: 5, episode_end: 8, release_name: "Show.S01E05-E08" },
+      { file_id: 4, url: "/subtitle/full-season-ok.zip", episode: 1, full_season: true, release_name: "Show.S01.Pack" },
+      { file_id: 5, url: "/subtitle/ep2-rescued-by-rel.zip", episode: 2, full_season: false, release_name: "Show.S01E05.WEBRip" },
+    ];
+
+    const prevF = globalThis.fetch;
+    const prevLog = console.log;
+    const loggedLines = [];
+    console.log = (...args) => {
+      loggedLines.push(args.join(" "));
+      prevLog(...args);
+    };
+
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) {
+        return Promise.resolve(new Response(JSON.stringify({ subtitles: [] }), { status: 200, headers: { "content-type": "application/json" } }));
+      }
+      if (u.includes("api.subdl.com")) {
+        return Promise.resolve(new Response(JSON.stringify({
+          status: true,
+          subtitles: subdlFixture,
+        }), { status: 200, headers: { "content-type": "application/json" } }));
+      }
+      return Promise.resolve(textResp(TXT_LAT + " " + u));
+    };
+
+    try {
+      // 2a. Sin variable (por defecto): NO descarta nada (idéntico a 1.4.41, 5 pistas)
+      loggedLines.length = 0;
+      const rDefault = await worker.fetch(
+        new Request(`${base}/${b64url({ subdlKey: "clave_valida_123" })}/subtitles/series/tt7900001:1:5.json`),
+        {},
+        {}
+      );
+      const jDefault = await rDefault.json();
+      check("SUBDL_EPFILTER apagado por defecto: no descarta nada (idéntico a v1.4.41, 5 pistas)",
+        jDefault.subtitles.length === 5,
+        `served=${jDefault.subtitles.length}`);
+      check("SUBDL_EPFILTER apagado: no emite log de epfiltro",
+        !loggedLines.some((l) => l.includes("[SubDL] epfiltro (log):")));
+
+      // 2b. SUBDL_EPFILTER='log': NO descarta nada pero registra línea con pedido y ejemplos
+      loggedLines.length = 0;
+      const rLog = await worker.fetch(
+        new Request(`${base}/${b64url({ subdlKey: "clave_valida_123" })}/subtitles/series/tt7900001:1:5.json`),
+        { SUBDL_EPFILTER: "log" },
+        {}
+      );
+      const jLog = await rLog.json();
+      check("SUBDL_EPFILTER='log': sirve las mismas pistas que sin variable (5 pistas)",
+        jLog.subtitles.length === 5,
+        `served=${jLog.subtitles.length}`);
+      const logLine = loggedLines.find((l) => l.includes("[SubDL] epfiltro (log):"));
+      check("SUBDL_EPFILTER='log': emite exactamente una línea con formato pedido y ejemplos",
+        logLine && logLine.includes("2 de 5 se habrían descartado (pedido s01e05)") &&
+          logLine.includes("Show.S01E02") && !logLine.includes("clave_valida_123") && !logLine.includes("http"),
+        logLine);
+
+      // 2c. SUBDL_EPFILTER='1': descarta las 2 erróneas pero conserva las 2 válidas + 1 rescatada por release (3 pistas)
+      loggedLines.length = 0;
+      const rActive = await worker.fetch(
+        new Request(`${base}/${b64url({ subdlKey: "clave_valida_123" })}/subtitles/series/tt7900001:1:5.json`),
+        { SUBDL_EPFILTER: "1" },
+        {}
+      );
+      const jActive = await rActive.json();
+      const activeUrls = jActive.subtitles.map((s) => s.url);
+      check("SUBDL_EPFILTER='1': descarta ep2-wrong y range1-4-wrong pero rescata las coincidencias de release",
+        !activeUrls.some((u) => u.includes("ep2-wrong") || u.includes("range1-4-wrong")) &&
+          activeUrls.some((u) => u.includes("ep2-rescued-by-rel")) &&
+          jActive.subtitles.length === 3,
+        `served=${jActive.subtitles.length} urls=${JSON.stringify(activeUrls)}`);
+
+      // 2d. getSubDL con rescate E01 vs E19 (s=1 e=1)
+      const subdlEp1 = await getSubDL("tt7900001", "1", "1", "clave_valida_123", "series", { SUBDL_EPFILTER: "1" });
+      // Nota: subdlFixture tiene s=1 e=5, probamos rescate sobre un conjunto específico para e=1:
+      const customSubs = [
+        { file_id: 11, url: "/subtitle/e01-rescued.zip", episode: 99, release_name: "Show.E01.720p" },
+        { file_id: 12, url: "/subtitle/e19-not-rescued.zip", episode: 99, release_name: "Show.E19.720p" },
+      ];
+      const origFetch = globalThis.fetch;
+      globalThis.fetch = () => Promise.resolve(new Response(JSON.stringify({ status: true, subtitles: customSubs }), { status: 200 }));
+      const rescuedSubs = await getSubDL("tt7900001", "1", "1", "clave_valida_123", "series", { SUBDL_EPFILTER: "1" });
+      globalThis.fetch = origFetch;
+      check("SUBDL_EPFILTER='1': rescata E01 para episodio 1 pero no rescata E19",
+        rescuedSubs.length === 1 && rescuedSubs[0].url.includes("e01-rescued"),
+        JSON.stringify(rescuedSubs));
+    } finally {
+      globalThis.fetch = prevF;
+      console.log = prevLog;
+    }
+  }
+
+  // C. End-to-end MISS y HIT con sincronía de release (RELEASE_ORDER apagado por defecto y activo con flag)
+  {
+    const store = new Map();
+    const cacheApi = {
+      default: {
+        match: async (q) => { const x = store.get(q.url); return x ? x.clone() : undefined; },
+        put: async (q, rs) => { store.set(q.url, rs.clone()); },
+      },
+    };
+    const prevC = mockGlobal("caches", cacheApi), prevF = globalThis.fetch;
+    let downloads = 0;
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) {
+        return Promise.resolve(new Response(JSON.stringify({
+          subtitles: [
+            { id: "bd_es", url: "https://subs5.strem.io/bd_es.srt", lang: "spa", subtitleFileName: "Film.2024.1080p.BluRay.x264.srt" },
+            { id: "web_lat", url: "https://subs5.strem.io/web_lat.srt", lang: "spa", subtitleFileName: "Film.2024.1080p.WEB-DL.DDP5.1.srt" },
+          ],
+        }), { status: 200, headers: { "content-type": "application/json" } }));
+      }
+      downloads += 1;
+      return Promise.resolve(textResp(u.includes("bd_es") ? TXT_CAST : TXT_LAT));
+    };
+    const origLog = console.log, origErr = console.error;
+    console.log = () => {}; console.error = () => {};
+    const deferred = [];
+    const chk = (...a) => deferred.push(a);
+    try {
+      const pending = [];
+      const ctx = { waitUntil: (p) => pending.push(p) };
+
+      // 1) Sin flag (por defecto): MISS no reordena por release, no escribe x-sub-rel (idéntico a 1.4.41)
+      const rMissDefault = await worker.fetch(
+        new Request(`${base}/subtitles/movie/tt7900002/filename=Film.2024.1080p.WEB-DL.mkv.json`),
+        {},
+        ctx
+      );
+      await Promise.all(pending);
+      const jMissDefault = await rMissDefault.json();
+      const cachedEntry = store.get(`${base}/subtitles/movie/tt7900002.json`);
+      chk("RELEASE_ORDER apagado: MISS devuelve orden canónico de proveedor (idéntico a 1.4.41)",
+        jMissDefault.subtitles[0].id === "bd_es" && jMissDefault.subtitles[1].id === "web_lat",
+        JSON.stringify(jMissDefault.subtitles.map((s) => s.id)));
+      chk("RELEASE_ORDER apagado: MISS no escribe cabecera x-sub-rel en caché",
+        cachedEntry && cachedEntry.headers.get("x-sub-rel") === null);
+
+      // 2) Sin flag: HIT devuelve orden canónico sin cabecera x-sub-rel
+      const rHitDefault = await worker.fetch(
+        new Request(`${base}/subtitles/movie/tt7900002/filename=Film.2024.1080p.WEB-DL.mkv.json`),
+        {},
+        ctx
+      );
+      const jHitDefault = await rHitDefault.json();
+      chk("RELEASE_ORDER apagado: HIT devuelve orden canónico y borra x-sub-rel",
+        rHitDefault.headers.get("x-cache") === "HIT" &&
+          rHitDefault.headers.get("x-sub-rel") === null &&
+          jHitDefault.subtitles[0].id === "bd_es",
+        JSON.stringify(jHitDefault.subtitles.map((s) => s.id)));
+
+      // 3) Entrada de caché preexistente con x-sub-rel pero flag apagado: ignora x-sub-rel y borra cabecera
+      store.clear();
+      const fakeCachedWithRel = new Response(JSON.stringify({
+        subtitles: [
+          { id: "bd_es", url: "https://subs5.strem.io/bd_es.srt", lang: "spa" },
+          { id: "web_lat", url: "https://subs5.strem.io/web_lat.srt", lang: "spa" },
+        ],
+      }), {
+        headers: { "content-type": "application/json", "x-sub-rel": "disco,web" },
+      });
+      store.set(`${base}/subtitles/movie/tt7900002.json`, fakeCachedWithRel);
+      const rHitPreexisting = await worker.fetch(
+        new Request(`${base}/subtitles/movie/tt7900002/filename=Film.2024.1080p.WEB-DL.mkv.json`),
+        {},
+        ctx
+      );
+      const jHitPreexisting = await rHitPreexisting.json();
+      chk("RELEASE_ORDER apagado con caché previa con x-sub-rel: ignora cabecera y la elimina de la respuesta",
+        rHitPreexisting.headers.get("x-cache") === "HIT" &&
+          rHitPreexisting.headers.get("x-sub-rel") === null &&
+          jHitPreexisting.subtitles[0].id === "bd_es" &&
+          jHitPreexisting.subtitles[1].id === "web_lat",
+        JSON.stringify(jHitPreexisting.subtitles.map((s) => s.id)));
+
+      // 4) Con flag activo (RELEASE_ORDER="1"): MISS con filename WEB-DL prioriza web_lat y escribe x-sub-rel
+      store.clear();
+      const rMissWeb = await worker.fetch(
+        new Request(`${base}/subtitles/movie/tt7900002/filename=Film.2024.1080p.WEB-DL.mkv.json`),
+        { RELEASE_ORDER: "1" },
+        ctx
+      );
+      await Promise.all(pending);
+      const jMissWeb = await rMissWeb.json();
+      const cachedActive = store.get(`${base}/subtitles/movie/tt7900002.json`);
+      chk("RELEASE_ORDER='1' MISS: prioriza WEB-DL y escribe x-sub-rel en caché",
+        rMissWeb.headers.get("x-cache") === "MISS" &&
+          rMissWeb.headers.get("x-sub-rel") === null &&
+          cachedActive && cachedActive.headers.get("x-sub-rel") === "disco,web" &&
+          jMissWeb.subtitles[0].id === "web_lat" &&
+          jMissWeb.subtitles[1].id === "bd_es",
+        JSON.stringify(jMissWeb.subtitles.map((s) => s.id)));
+
+      // 5) Con flag activo: HIT con BluRay sirve bd_es primero (0 descargas nuevas)
+      const dlBefore = downloads;
+      const rHitBd = await worker.fetch(
+        new Request(`${base}/subtitles/movie/tt7900002/filename=Film.2024.1080p.BluRay.mkv.json`),
+        { RELEASE_ORDER: "1" },
+        ctx
+      );
+      const jHitBd = await rHitBd.json();
+      chk("RELEASE_ORDER='1' HIT BluRay: 0 descargas nuevas y sirve BluRay primero",
+        rHitBd.headers.get("x-cache") === "HIT" &&
+          rHitBd.headers.get("x-sub-rel") === null &&
+          downloads === dlBefore &&
+          jHitBd.subtitles[0].id === "bd_es" &&
+          jHitBd.subtitles[1].id === "web_lat",
+        JSON.stringify(jHitBd.subtitles.map((s) => s.id)));
+
+      // 6) Con flag activo: HIT con WEBRip sirve web_lat primero
+      const rHitWeb = await worker.fetch(
+        new Request(`${base}/subtitles/movie/tt7900002/filename=Film.2024.2160p.WEBRip.mkv.json`),
+        { RELEASE_ORDER: "1" },
+        ctx
+      );
+      const jHitWeb = await rHitWeb.json();
+      chk("RELEASE_ORDER='1' HIT WEBRip: reordena en HIT y sirve WEB-DL primero",
+        rHitWeb.headers.get("x-cache") === "HIT" &&
+          rHitWeb.headers.get("x-sub-rel") === null &&
+          downloads === dlBefore &&
+          jHitWeb.subtitles[0].id === "web_lat" &&
+          jHitWeb.subtitles[1].id === "bd_es",
+        JSON.stringify(jHitWeb.subtitles.map((s) => s.id)));
+
+      // 7) Con flag activo: dialectOrder='none' respeta orden canónico
+      const rHitNone = await worker.fetch(
+        new Request(`${base}/${b64url({ dialectOrder: "none" })}/subtitles/movie/tt7900002/filename=Film.2024.1080p.WEB-DL.mkv.json`),
+        { RELEASE_ORDER: "1" },
+        ctx
+      );
+      const jHitNone = await rHitNone.json();
+      chk("RELEASE_ORDER='1' HIT con dialectOrder='none': respeta orden canónico",
+        rHitNone.headers.get("x-cache") === "HIT" &&
+          jHitNone.subtitles[0].id === "bd_es" &&
+          jHitNone.subtitles[1].id === "web_lat",
+        JSON.stringify(jHitNone.subtitles.map((s) => s.id)));
+
+      // 8) Con 1 sola pista en caché: HIT funciona limpiamente sin reordenar
+      store.clear();
+      store.set(`${base}/subtitles/movie/tt7900003.json`, new Response(JSON.stringify({
+        subtitles: [{ id: "solo_una", url: "https://subs5.strem.io/solo.srt", lang: "spa" }],
+      }), { headers: { "content-type": "application/json", "x-sub-rel": "web" } }));
+      const rSingle = await worker.fetch(
+        new Request(`${base}/subtitles/movie/tt7900003/filename=Film.2024.WEB-DL.mkv.json`),
+        { RELEASE_ORDER: "1" },
+        ctx
+      );
+      const jSingle = await rSingle.json();
+      chk("RELEASE_ORDER='1' HIT con 1 sola pista: responde 200 sin errores y elimina x-sub-rel",
+        rSingle.headers.get("x-cache") === "HIT" &&
+          rSingle.headers.get("x-sub-rel") === null &&
+          jSingle.subtitles.length === 1 && jSingle.subtitles[0].id === "solo_una",
+        JSON.stringify(jSingle));
+
+      // 9) HIT con caché de 1.4.41 (sin cabecera x-sub-rel) y flag encendido: funciona sin errores
+      store.clear();
+      store.set(`${base}/subtitles/movie/tt7900004.json`, new Response(JSON.stringify({
+        subtitles: [
+          { id: "bd_es", url: "https://subs5.strem.io/bd_es.srt", lang: "spa" },
+          { id: "web_lat", url: "https://subs5.strem.io/web_lat.srt", lang: "spa" },
+        ],
+      }), { headers: { "content-type": "application/json" } }));
+      const rHit1441Cache = await worker.fetch(
+        new Request(`${base}/subtitles/movie/tt7900004/filename=Film.2024.WEB-DL.mkv.json`),
+        { RELEASE_ORDER: "1" },
+        ctx
+      );
+      const jHit1441Cache = await rHit1441Cache.json();
+      chk("RELEASE_ORDER='1' HIT con caché de 1.4.41 (sin cabecera): degrada con orden canónico sin fallar",
+        rHit1441Cache.status === 200 &&
+          rHit1441Cache.headers.get("x-cache") === "HIT" &&
+          jHit1441Cache.subtitles.length === 2 &&
+          jHit1441Cache.subtitles[0].id === "bd_es",
+        JSON.stringify(jHit1441Cache.subtitles.map((s) => s.id)));
+    } finally {
+      console.log = origLog; console.error = origErr;
+      globalThis.fetch = prevF; restoreGlobal("caches", prevC);
+    }
+    for (const a of deferred) check(...a);
+  }
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);

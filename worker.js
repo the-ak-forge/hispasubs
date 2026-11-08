@@ -1,6 +1,32 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.41
+// HispaSubs — Cloudflare Worker v1.4.43
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.43 (08/11/2026) — Hotfix 1.4.43:
+//  - [REVERSIÓN POR DEFECTO] `SUBDL_EPFILTER` y `RELEASE_ORDER` pasan a estar APAGADOS
+//    por defecto. La v1.4.43 revierte por defecto ambos comportamientos de la 1.4.42
+//    para garantizar compatibilidad total con 1.4.41 salvo activación explícita.
+//  - [SUBDL / SERIES] Pre-filtrado bajo flag `SUBDL_EPFILTER` ('log' o '1'/'true'):
+//    Sin definir (defecto): sin pre-filtro (idéntico a 1.4.41).
+//    'log': no descarta nada; registra una línea por petición con pedidos y ejemplos.
+//    '1'/'true': descarta episodios disjuntos pero rescata cuando `release_name` contiene
+//    el episodio solicitado (tratando ceros a la izquierda: E01 == E1 == 1, E19 != 1).
+//    Se retira la afirmación no respaldada de peticiones destinadas a 422.
+//  - [SINCRONÍA / ORDEN POR RELEASE] Desempate por release bajo flag `RELEASE_ORDER` ('1'/'true'):
+//    Sin definir (defecto): targetRelease = "" y no se escribe ni se propaga cabecera
+//    x-sub-rel (idéntico a 1.4.41). En HIT se ignora y elimina x-sub-rel si existía en caché.
+//    '1'/'true': activa el desempate por release en MISS y reordena en HIT sin re-descargas.
+//
+// v1.4.42 (08/11/2026):
+//  - [SUBDL / SERIES] Pre-filtrado de episodio y rango en `getSubDL`: cuando se pide una serie con
+//    temporada y episodio numéricos, se descartan antes de descargar las entradas de SubDL cuyo
+//    `episode` explícito (sin `full_season`) o rango parcial `episode_from..episode_end` no incluye
+//    el episodio solicitado, ahorrando presupuesto de análisis y peticiones `.zip`.
+//  - [SINCRONÍA / ORDEN POR RELEASE] `orderSubtitlesByDialect` incorpora `targetRelease` (`"web"` o
+//    `"disco"` extraído de `filename`) como criterio de desempate estable dentro de cada bloque de
+//    dialecto (o en toda la lista cuando no hay preferencia de dialecto), tanto en `MISS` como en
+//    `HIT` (mediante metadato `x-sub-rel` en la copia de la Cache API, sin fragmentar la clave de
+//    caché ni añadir campos al JSON de Stremio).
 //
 // v1.4.41 (07/11/2026):
 //  - [CRÉDITOS DE TRADUCTORES OPCIONAL] Nueva variable `SPAM_CREDITS` (`1` o `true`; apagada por
@@ -1021,14 +1047,20 @@ const resolveDialectTarget = (config, filename = "") => {
 };
 
 // Reordena de forma estable poniendo primero el dialecto objetivo (`🇲🇽` o `🇪🇸`)
-// y manteniendo intacto el orden relativo del resto (incluyendo la prioridad
-// `[PLAT]` dentro de cada bloque). No muta el array original.
-const orderSubtitlesByDialect = (subtitles, targetDialect) => {
+// y, dentro de cada bloque de dialecto (o en toda la lista si no hay dialecto
+// objetivo), priorizando las pistas cuyo origen de vídeo (`RELEASE_SOURCE`:
+// `"web"` o `"disco"`) coincide con `targetRelease` del archivo reproducido,
+// manteniendo intacto el orden relativo del resto (incluida la prioridad
+// `[PLAT]`). No muta el array original.
+const orderSubtitlesByDialect = (subtitles, targetDialect, targetRelease = "") => {
   if (!Array.isArray(subtitles) || subtitles.length <= 1) return subtitles;
-  if (targetDialect !== "lat" && targetDialect !== "es") return subtitles;
+  const hasDialect = targetDialect === "lat" || targetDialect === "es";
+  const hasRelease = targetRelease === "web" || targetRelease === "disco";
+  if (!hasDialect && !hasRelease) return subtitles;
   const flag = targetDialect === "lat" ? "🇲🇽" : "🇪🇸";
-  const match = (s) => (typeof s?.label === "string" && s.label.startsWith(flag) ? 1 : 0);
-  return [...subtitles].sort((a, b) => match(b) - match(a));
+  const matchDialect = (s) => (hasDialect && typeof s?.label === "string" && s.label.startsWith(flag) ? 1 : 0);
+  const matchRel = (s) => (hasRelease && s?.[RELEASE_SOURCE] === targetRelease ? 1 : 0);
+  return [...subtitles].sort((a, b) => matchDialect(b) - matchDialect(a) || matchRel(b) - matchRel(a));
 };
 
 // ---------------------------------------------------------------------------
@@ -1297,7 +1329,7 @@ function initPage() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.41",
+  version: "1.4.43",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1417,11 +1449,56 @@ const getOpenSubtitlesV3 = async (type, fullId) => {
   }
 };
 
+// Comprueba si el nombre de release contiene el episodio (y temporada si aplica)
+// solicitado para rescatar subtítulos mal etiquetados numéricamente en SubDL.
+// Trata ceros a la izquierda (E01 == E1 == 1) y evita falsos positivos (E19 != 1).
+const releaseMatchesEp = (rel, reqSeason, reqEp) => {
+  if (!rel || typeof rel !== "string" || reqEp === null) return false;
+  const sStr = rel.toLowerCase();
+
+  // 1. Patrón Season + Episode: S01E05, S1E5, S01.E05, S01_E05, 1x05
+  const seRe = /(?:^|[^a-z0-9])(?:s(\d+)[._\s-]*e|(\d+)x)0*(\d+)(?![0-9a-z])/gi;
+  let match;
+  while ((match = seRe.exec(sStr)) !== null) {
+    const sNum = Number(match[1] !== undefined ? match[1] : match[2]);
+    const eNum = Number(match[3]);
+    if (reqSeason !== null && sNum !== reqSeason) {
+      continue;
+    }
+    if (eNum === reqEp) {
+      return true;
+    }
+  }
+
+  // 2. Si hay una temporada explícita diferente, no rescatar por episodio suelto
+  if (reqSeason !== null) {
+    const standaloneSeasonRe = /(?:^|[^a-z0-9])(?:s|season)[._\s-]*(\d+)(?![0-9a-z])/gi;
+    let sMatch;
+    while ((sMatch = standaloneSeasonRe.exec(sStr)) !== null) {
+      if (Number(sMatch[1]) !== reqSeason) {
+        return false;
+      }
+    }
+  }
+
+  // 3. Patrón solo Episode: E05, E5, Ep.05, Ep 5
+  const epOnlyRe = /(?:^|[^a-z0-9])(?:ep?|episode)[._\s-]*0*(\d+)(?![0-9a-z])/gi;
+  let epMatch;
+  while ((epMatch = epOnlyRe.exec(sStr)) !== null) {
+    const eNum = Number(epMatch[1]);
+    if (eNum === reqEp) {
+      return true;
+    }
+  }
+
+  return false;
+};
+
 // 2. SubDL
 // Resultado vacío marcado como "no utilizable" (clave rechazada, cuota agotada,
 // status:false): el router NO lo cachea en el namespace compartido `k_subdl`.
 const unusableSubDL = () => Object.assign([], { unusable: true });
-const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") => {
+const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie", env = {}) => {
   // Sin clave no se consulta nada. Antes se escribía un log por petición
   // ("sin api_key"): en producción ocupaba el 14 % de los 1000 eventos
   // exportables (ventana de 46 min). Ahora la línea de diagnóstico por título
@@ -1465,7 +1542,23 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
       console.log(`[SubDL] 0 resultados para ${imdbId} (${subdlType}${season ? ` s${season}e${episode}` : ""})`);
     }
 
+    const hasNumericEp = mediaType === "series" && season && episode && /^\d+$/.test(season) && /^\d+$/.test(episode);
+    const reqEp = hasNumericEp ? Number(episode) : null;
+    const reqSeason = hasNumericEp ? Number(season) : null;
+    const epFilterMode = env && typeof env.SUBDL_EPFILTER === "string"
+      ? env.SUBDL_EPFILTER.trim().toLowerCase()
+      : (env && env.SUBDL_EPFILTER === true ? "1" : "");
+    const isFilterActive = epFilterMode === "1" || epFilterMode === "true";
+    const isFilterLog = epFilterMode === "log";
+    const discardCandidates = [];
+    const numOrNull = (v) =>
+      v === "" || v === null || v === undefined || typeof v === "boolean"
+        ? null
+        : Number.isFinite(Number(v))
+        ? Number(v)
+        : null;
     const droppedLang = {};
+    let droppedEp = 0;
     const out = data.subtitles
       .map((sub, i) => {
         if (!sub || typeof sub.url !== "string" || !sub.url.trim()) return null;
@@ -1477,6 +1570,35 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
         if (declared && !SUBDL_ES_LANG_RE.test(declared)) {
           droppedLang[declared] = (droppedLang[declared] || 0) + 1;
           return null;
+        }
+        // Pre-filtrado de episodio/rango en series: bajo SUBDL_EPFILTER (log o 1/true).
+        // Por defecto (apagado): no descarta (comportamiento idéntico a v1.4.41).
+        // Con 1/true descarta si el episodio explícito o rango no incluye el pedido,
+        // salvo que el release_name respalde el episodio pedido.
+        // Con log registra sin descartar.
+        let candidateForDiscard = false;
+        if (reqEp !== null) {
+          const subEp = numOrNull(sub.episode);
+          const subFrom = numOrNull(sub.episode_from);
+          const subEnd = numOrNull(sub.episode_end);
+          if (subFrom !== null && subEnd !== null && subEnd >= subFrom && subEnd > 0) {
+            if (reqEp < subFrom || reqEp > subEnd) {
+              candidateForDiscard = true;
+            }
+          } else if (!sub.full_season && subEp !== null && subEp > 0 && subEp !== reqEp) {
+            candidateForDiscard = true;
+          }
+          if (candidateForDiscard && releaseMatchesEp(sub.release_name || sub.name || "", reqSeason, reqEp)) {
+            candidateForDiscard = false;
+          }
+        }
+        if (candidateForDiscard) {
+          if (isFilterLog) {
+            discardCandidates.push(sub);
+          } else if (isFilterActive) {
+            droppedEp += 1;
+            return null;
+          }
         }
         // SubDL devuelve URLs RELATIVAS ("/subtitle/111-222.zip", según la doc
         // oficial). El guard de seguridad iba ANTES de absolutizar, así que
@@ -1523,10 +1645,25 @@ const getSubDL = async (imdbId, season, episode, apiKey, mediaType = "movie") =>
         };
       })
       .filter(Boolean); // entradas malformadas se descartan una a una
+    if (isFilterLog && hasNumericEp) {
+      const examples = discardCandidates.slice(0, 5).map((s) => ({
+        episode: s.episode,
+        episode_from: s.episode_from,
+        episode_end: s.episode_end,
+        full_season: s.full_season,
+        release_name: String(s.release_name || s.name || "").slice(0, 60),
+      }));
+      const sTag = String(season).padStart(2, "0");
+      const eTag = String(episode).padStart(2, "0");
+      console.log(
+        `[SubDL] epfiltro (log): ${discardCandidates.length} de ${data.subtitles.length} se habrían descartado (pedido s${sTag}e${eTag})` +
+        (examples.length > 0 ? ` ${JSON.stringify(examples)}` : "")
+      );
+    }
     // Caso que antes quedaba mudo: la API devuelve subs pero ninguno con url
     // descargable (p.ej. solo referencias a página web). Sin este log, "SubDL=0"
     // sería indistinguible de "0 resultados".
-    if (data.subtitles.length > 0 && out.length === 0 && Object.keys(droppedLang).length === 0) {
+    if (data.subtitles.length > 0 && out.length === 0 && Object.keys(droppedLang).length === 0 && droppedEp === 0) {
       console.error(`[SubDL] ${data.subtitles.length} subs en la respuesta pero ninguno con url descargable`);
     }
     // Propiedad auxiliar de la lista (igual que `nearMiss` en OS-V3).
@@ -2208,7 +2345,7 @@ const getCanonicalConfigStr = (config) =>
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { errKind, looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, REF_NAME, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect, ES_VOSOTROS_RE, DICT_ES_EXTRA, DICT_LAT_EXTRA, DICT_ES_WEAK_EXTRA, DICT_LAT_WEAK_EXTRA };
+export { errKind, looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, REF_NAME, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect, ES_VOSOTROS_RE, DICT_ES_EXTRA, DICT_LAT_EXTRA, DICT_ES_WEAK_EXTRA, DICT_LAT_WEAK_EXTRA, releaseMatchesEp, getSubDL };
 
 // ---------------------------------------------------------------------------
 // Router
@@ -2327,6 +2464,15 @@ export default {
         const filename = extractFilename(url, pathParts, actionIndex);
         const fnDialect = detectFilenameDialect(filename);
         const targetDialect = resolveDialectTarget(config, filename);
+        const releaseOrderMode = env && typeof env.RELEASE_ORDER === "string"
+          ? env.RELEASE_ORDER.trim().toLowerCase()
+          : (env && env.RELEASE_ORDER === true ? "1" : "");
+        const releaseOrderActive = releaseOrderMode === "1" || releaseOrderMode === "true";
+        const fileRel = filename ? releaseSourceOf({ releaseName: filename }) : "";
+        const targetRelease =
+          releaseOrderActive && normalizeDialectOrder(config?.dialectOrder ?? config?.order) !== "none"
+            ? fileRel
+            : "";
 
         canonicalConfigStr = getCanonicalConfigStr(config);
         cacheReq = new Request(subtitleCacheUrl(url.origin, canonicalConfigStr, type, fullId));
@@ -2338,16 +2484,28 @@ export default {
           : null;
         if (!cached && keyCacheUrl) cached = await cacheMatch(new Request(keyCacheUrl));
         if (cached) {
-          if (targetDialect) {
+          if (targetDialect || targetRelease) {
             try {
               const data = await cached.clone().json();
               if (Array.isArray(data?.subtitles) && data.subtitles.length > 1) {
-                const ordered = orderSubtitlesByDialect(data.subtitles, targetDialect);
+                if (targetRelease) {
+                  const relCsv = cached.headers.get("x-sub-rel") || "";
+                  if (relCsv) {
+                    const relParts = relCsv.split(",");
+                    for (let i = 0; i < data.subtitles.length; i++) {
+                      if (data.subtitles[i] && typeof data.subtitles[i] === "object") {
+                        data.subtitles[i][RELEASE_SOURCE] = relParts[i] || "";
+                      }
+                    }
+                  }
+                }
+                const ordered = orderSubtitlesByDialect(data.subtitles, targetDialect, targetRelease);
                 // Log solo si el orden realmente cambió (permite medir el uso en HIT).
                 if (ordered.some((x, i) => x !== data.subtitles[i])) {
-                  console.log(`[subtitles] orden=${targetDialect} aplicado en HIT`);
+                  console.log(`[subtitles] orden=${targetDialect || targetRelease} aplicado en HIT`);
                 }
                 const hitRes = new Response(JSON.stringify({ ...data, subtitles: ordered }), cached);
+                hitRes.headers.delete("x-sub-rel");
                 hitRes.headers.set("x-cache", "HIT");
                 return hitRes;
               }
@@ -2356,6 +2514,7 @@ export default {
             }
           }
           const hitRes = new Response(cached.body, cached);
+          hitRes.headers.delete("x-sub-rel");
           hitRes.headers.set("x-cache", "HIT");
           return hitRes;
         }
@@ -2382,7 +2541,7 @@ export default {
         const tStart = Date.now();
         const [osSubs, sdlSubs] = await Promise.allSettled([
           getOpenSubtitlesV3(type, fullId),
-          getSubDL(imdbId, season, episode, config.subdlKey, type),
+          getSubDL(imdbId, season, episode, config.subdlKey, type, env),
         ]);
 
         // Diagnóstico por fuente: permite ver en los logs de Cloudflare
@@ -2625,10 +2784,9 @@ export default {
         const errTag = Object.keys(errCount).length
           ? ` err=${Object.entries(errCount).map(([k, n]) => `${k}×${n}`).join(",")}`
           : "";
-        // Modo SOMBRA (v1.4.38): ¿el release del archivo (web/disco) coincide con el de las
-        // pistas servidas? Solo se registra; NO cambia el orden. `p1=no` = hay alguna pista
-        // que coincide pero la primera no (ganancia potencial de un ordenado por release).
-        const fileRel = filename ? releaseSourceOf({ releaseName: filename }) : "";
+        // Diagnóstico de sincronía (v1.4.38) sobre la lista canónica antes de reordenar:
+        // ¿cuántas pistas servidas coinciden con el release del archivo (web/disco) y si
+        // la primera canónica no coincidía (`p1=no`)?
         const relMatch = fileRel ? subtitles.filter((s) => s[RELEASE_SOURCE] === fileRel).length : 0;
         const relTag = fileRel
           ? ` rel=${fileRel} match=${relMatch}/${subtitles.length}${relMatch > 0 && subtitles[0]?.[RELEASE_SOURCE] !== fileRel ? " p1=no" : ""}`
@@ -2649,10 +2807,15 @@ export default {
             (targetDialect ? ` orden=${targetDialect}` : "") +
             (scoreLog.length ? ` | ${scoreLog.join(" | ")}` : "")
         );
-        // En la caché se guarda SIEMPRE el orden canónico (sin aplicar `targetDialect`),
-        // de modo que todas las variantes de `filename` y de `dialectOrder` compartan una
-        // única entrada por título y se reordenen en memoria al servir (HIT o MISS).
+        // En la caché se guarda SIEMPRE el orden canónico (sin aplicar `targetDialect` ni
+        // `targetRelease`), junto con el mapa `x-sub-rel` para que todas las variantes de
+        // `filename` y de `dialectOrder` compartan una única entrada por título y se
+        // reordenen en memoria al servir (HIT o MISS).
+        const subRelHeader = releaseOrderActive && subtitles.some((s) => s[RELEASE_SOURCE])
+          ? { "x-sub-rel": subtitles.map((s) => s[RELEASE_SOURCE] || "").join(",") }
+          : {};
         const canonicalResponse = jsonResponse({ subtitles }, ttl, { "x-cache": "MISS" });
+        const cachedCanonical = jsonResponse({ subtitles }, ttl, { "x-cache": "MISS", ...subRelHeader });
         // - Sin clave válida: namespace público.
         // - SubDL "no utilizable" (clave falsa/rechazada/cuota): la respuesta es
         //   solo OS-V3 -> namespace de ESA clave (nunca `k_subdl`).
@@ -2661,11 +2824,11 @@ export default {
         cachePut(
           ctx,
           canonicalConfigStr && sdlUnusable ? new Request(keyCacheUrl) : cacheReq || request,
-          canonicalResponse
+          cachedCanonical
         );
-        if (targetDialect && subtitles.length > 1) {
+        if ((targetDialect || targetRelease) && subtitles.length > 1) {
           return jsonResponse(
-            { subtitles: orderSubtitlesByDialect(subtitles, targetDialect) },
+            { subtitles: orderSubtitlesByDialect(subtitles, targetDialect, targetRelease) },
             ttl,
             { "x-cache": "MISS" }
           );

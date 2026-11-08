@@ -8,7 +8,7 @@
 
 import AdmZip from "adm-zip";
 import dns from "node:dns/promises";
-import handler, { ALLOWED_HOSTS, MAX_BYTES, MAX_ENTRY_BYTES, isPublicIP, readCapped, rateLimit, RATE_MAP_CAP } from "./api/proxy.js";
+import handler, { ALLOWED_HOSTS, MAX_BYTES, MAX_ENTRY_BYTES, isPublicIP, readCapped, rateLimit, RATE_MAP_CAP, trackRank, toUtf8Buffer } from "./api/proxy.js";
 
 let pass = 0;
 let fail = 0;
@@ -744,6 +744,123 @@ section("v1.4.22: tope de descarga (10 MB) separado del tope por entrada extraí
     fetchImpl = () => new Response(zipBuf, { status: 200, headers: { "content-length": String(zipBuf.length) } });
     const res = await call(q + "&s=3&e=11");
     check("season pack ~8,8 MB: se extrae el episodio pedido (200)", res.statusCode === 200 && /línea 1 /.test(String(res.body)), `${res.statusCode}`);
+  }
+}
+
+// ===========================================================================
+// 8. v1.4.42/v1.4.43: conversión garantizada a UTF-8 y orden de pistas accesorias
+// ===========================================================================
+section("8. conversión a UTF-8 (toUtf8Buffer) y orden de pistas accesorias");
+{
+  // A. Tests unitarios de toUtf8Buffer
+  const sampleEs = "¡Hola! ¿Qué tal están los niños en España?";
+  const validUtf8 = Buffer.from(sampleEs, "utf8");
+  check("toUtf8Buffer: UTF-8 válido con acentos devuelve el mismo Buffer (misma instancia)",
+    toUtf8Buffer(validUtf8) === validUtf8);
+
+  const u8LiteralFffd = Buffer.from("Texto UTF-8 válido con \uFFFD literal y acentos: acción y camión", "utf8");
+  const resFffd = toUtf8Buffer(u8LiteralFffd);
+  check("toUtf8Buffer: UTF-8 válido con \\uFFFD literal devuelve bytes idénticos (mismo Buffer)",
+    resFffd === u8LiteralFffd && resFffd.toString("utf8") === u8LiteralFffd.toString("utf8"));
+
+  const u8WithStrayByte = Buffer.concat([
+    Buffer.from("¿Cómo estás? Este es un subtítulo con muchos acentos en español: niño, camión, acción, ", "utf8"),
+    Buffer.from([0xe9]), // byte 0xE9 suelto inválido en UTF-8
+    Buffer.from(" y más texto con tildes válidas.", "utf8"),
+  ]);
+  const resStray = toUtf8Buffer(u8WithStrayByte);
+  check("toUtf8Buffer: UTF-8 con un byte suelto 0xE9 se devuelve sin convertir a Windows-1252",
+    resStray === u8WithStrayByte);
+
+  const win1252Sample = "1\n00:00:01,000 --> 00:00:02,000\n¡Hola! ¿Qué tal? Niño, camión, acción, estás aquí.\n";
+  const win1252Buf = Buffer.from(win1252Sample, "latin1");
+  const convertedWin = toUtf8Buffer(win1252Buf);
+  check("toUtf8Buffer: Windows-1252 genuino con 10 acentos se convierte a UTF-8 correcto",
+    convertedWin !== win1252Buf && Buffer.isBuffer(convertedWin) && convertedWin.toString("utf8") === win1252Sample && !convertedWin.toString("utf8").includes("\uFFFD"),
+    convertedWin.toString("utf8"));
+
+  const utf16lePayload = Buffer.from(sampleEs, "utf16le");
+  const utf16leBom = Buffer.concat([Buffer.from([0xff, 0xfe]), utf16lePayload]);
+  const converted16le = toUtf8Buffer(utf16leBom);
+  check("toUtf8Buffer: UTF-16LE con BOM (FF FE) se convierte a Buffer UTF-8 limpio",
+    Buffer.isBuffer(converted16le) && converted16le.toString("utf8") === sampleEs,
+    converted16le.toString("utf8"));
+
+  const utf16bePayload = Buffer.alloc(utf16lePayload.length);
+  for (let i = 0; i < utf16lePayload.length; i += 2) {
+    utf16bePayload[i] = utf16lePayload[i + 1];
+    utf16bePayload[i + 1] = utf16lePayload[i];
+  }
+  const utf16beBom = Buffer.concat([Buffer.from([0xfe, 0xff]), utf16bePayload]);
+  const converted16be = toUtf8Buffer(utf16beBom);
+  check("toUtf8Buffer: UTF-16BE con BOM (FE FF) se convierte a Buffer UTF-8 limpio",
+    Buffer.isBuffer(converted16be) && converted16be.toString("utf8") === sampleEs,
+    converted16be.toString("utf8"));
+
+  const binWithNull = Buffer.from([0x53, 0x55, 0x42, 0x00, 0x01, 0x02, 0x03]);
+  check("toUtf8Buffer: Buffer con 0x00 en los primeros 4 KB se devuelve sin tocar",
+    toUtf8Buffer(binWithNull) === binWithNull);
+
+  // B. Tests de trackRank y relegación de forced/commentary
+  check("trackRank: normal (2) > forced/forzado (1) > commentary/comentarios (0)",
+    trackRank("Movie.2024.Spanish.srt") === 2 &&
+      trackRank("Reinforced.Armor.2024.srt") === 2 &&
+      trackRank("Movie.2024.Forced.srt") === 1 &&
+      trackRank("Movie.2024.Forzados.es.srt") === 1 &&
+      trackRank("Movie.2024.Commentary.srt") === 0 &&
+      trackRank("Movie.2024.Comentarios.Director.srt") === 0);
+
+  // C. Integración: zip con SRT en Windows-1252 responde en UTF-8 válido
+  const q = "/proxy?zipUrl=" + encodeURIComponent("https://dl.subdl.com/subtitle/42-42.zip");
+  {
+    const z = new AdmZip();
+    z.addFile("Pelicula.1999.Spanish.srt", Buffer.from("1\n00:00:01,000 --> 00:00:02,000\n¡Qué niño más güey en el camión!\n", "latin1"));
+    const zipBuf = z.toBuffer();
+    fetchImpl = () => new Response(zipBuf, { status: 200, headers: { "content-length": String(zipBuf.length) } });
+    const res = await call(q);
+    const text = res.body.toString("utf8");
+    check("integración UTF-8: SRT Windows-1252 dentro de zip se sirve en UTF-8 sin caracteres rotos",
+      res.statusCode === 200 && Buffer.isBuffer(res.body) && text.includes("¡Qué niño más güey en el camión!") && !text.includes("\uFFFD"),
+      text);
+  }
+
+  // D. Integración: zip con pista normal + forced + commentary elige la pista normal aunque comentario/forced sean mayores
+  {
+    const z = new AdmZip();
+    z.addFile("Movie.2024.Commentary.es.srt", Buffer.from("1\n00:00:01,000 --> 00:00:02,000\nComentario larguísimo del director ".repeat(40)));
+    z.addFile("Movie.2024.Forced.es.srt", Buffer.from("1\n00:00:01,000 --> 00:00:02,000\nCartel forzado ".repeat(30)));
+    z.addFile("Movie.2024.es.srt", Buffer.from("1\n00:00:01,000 --> 00:00:02,000\nDiálogo principal completo\n"));
+    const zipBuf = z.toBuffer();
+    fetchImpl = () => new Response(zipBuf, { status: 200, headers: { "content-length": String(zipBuf.length) } });
+    const res = await call(q);
+    check("integración zip: prefiere pista principal sobre Forced y Commentary aunque pesen más",
+      res.statusCode === 200 && res.body.toString("utf8").includes("Diálogo principal completo"),
+      res.headers["content-disposition"]);
+  }
+
+  // E. Integración: si el zip solo trae Forced y Commentary, sirve Forced como respaldo (mejor que Commentary o 422)
+  {
+    const z = new AdmZip();
+    z.addFile("Movie.2024.Comentarios.es.srt", Buffer.from("1\n00:00:01,000 --> 00:00:02,000\nComentarios del director ".repeat(20)));
+    z.addFile("Movie.2024.Forzado.es.srt", Buffer.from("1\n00:00:01,000 --> 00:00:02,000\nCartel en español\n"));
+    const zipBuf = z.toBuffer();
+    fetchImpl = () => new Response(zipBuf, { status: 200, headers: { "content-length": String(zipBuf.length) } });
+    const res = await call(q);
+    check("integración zip: sin pista normal, Forced gana a Comentarios como respaldo",
+      res.statusCode === 200 && res.body.toString("utf8").includes("Cartel en español"),
+      res.headers["content-disposition"]);
+  }
+
+  // F. Integración: un zip con solo una pista forzada la sigue sirviendo (200)
+  {
+    const z = new AdmZip();
+    z.addFile("Movie.2024.Forced.Only.srt", Buffer.from("1\n00:00:01,000 --> 00:00:02,000\nSolo cartel forzado\n"));
+    const zipBuf = z.toBuffer();
+    fetchImpl = () => new Response(zipBuf, { status: 200, headers: { "content-length": String(zipBuf.length) } });
+    const res = await call(q);
+    check("integración zip: un zip con solo una pista forzada la sigue sirviendo (200)",
+      res.statusCode === 200 && res.body.toString("utf8").includes("Solo cartel forzado"),
+      res.headers["content-disposition"]);
   }
 }
 
