@@ -1,5 +1,5 @@
 // ============================================================================
-// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.42
+// HispaSubs — Proxy de extracción para Vercel (Node.js) v1.4.41
 //
 // ANTES (1.0.0): aceptaba CUALQUIER zipUrl -> open proxy / SSRF / relay de
 // ancho de banda. Cualquiera podía usar tu servidor para descargar lo que
@@ -18,17 +18,6 @@
 //  - Timeout en la descarga.
 //  - Solo devuelve .srt/.vtt/.ass extraídos del zip (nunca binarios raros).
 //  - Limitación de peticiones por IP (best-effort, RATE_LIMIT_PER_MIN).
-//
-// v1.4.42 (08/11/2026):
-//  - [UTF-8] Salida garantizada en UTF-8 (`toUtf8Buffer`): decodifica entradas
-//    UTF-16LE (BOM FF FE), UTF-16BE (BOM FE FF) y Windows-1252 (cuando UTF-8
-//    produce caracteres de reemplazo `\uFFFD`) antes de responder a Stremio y
-//    al Worker, evitando glifos rotos (``) en el reproductor del usuario.
-//  - [ZIP] Relegación de pistas accesorias (`forced`/`forzado` y
-//    `commentary`/`comentarios`) en `filteredCandidates.sort`: una pista
-//    principal siempre gana sobre una forzada o de comentarios aunque pesen
-//    más o tengan extensión `.srt`, sirviendo `forced` solo como respaldo si
-//    es la única disponible en el `.zip`.
 //
 // v1.4.41 (07/11/2026):
 //  - Compatibilidad de versión con el Worker v1.4.41 (sin cambios de comportamiento).
@@ -262,51 +251,9 @@ const MAX_ENTRIES = 2000; // corte de zips con cientos de miles de entradas
 // quien sube el zip, así que se ignoran las entradas con nombres más largos: defensa en
 // profundidad contra ReDoS en TODOS los regex de episodio (no solo SE_HEAD/EP_NEXT).
 const MAX_ENTRY_NAME = 512;
-const USER_AGENT = "HispaSubs/1.4.42";
+const USER_AGENT = "HispaSubs/1.4.41";
 
 const ALLOWED_EXT = /\.(srt|vtt|ass|ssa|sub)$/i;
-
-// Pistas accesorias dentro de un .zip: una pista principal (diálogo completo)
-// siempre debe preferirse frente a una de cartelitos forzados (`forced`/`forzado`)
-// o comentarios del director (`commentary`/`comentarios`), aunque estos últimos
-// pesen más o vengan en `.srt` frente a un `.ass`/`.vtt` principal.
-const COMMENTARY_RE = /(?:^|[^a-z0-9ñáéíóúü])(?:commentary|comentarios?)(?=[^a-z0-9ñáéíóúü]|$)/i;
-const FORCED_RE = /(?:^|[^a-z0-9ñáéíóúü])(?:forced|forzad[oa]s?)(?=[^a-z0-9ñáéíóúü]|$)/i;
-function trackRank(name) {
-  if (typeof name !== "string" || !name) return 2;
-  if (COMMENTARY_RE.test(name)) return 0;
-  if (FORCED_RE.test(name)) return 1;
-  return 2;
-}
-
-// Garantiza que el Buffer servido a Stremio y al Worker sea UTF-8 válido:
-//  - UTF-16LE (BOM FF FE) y UTF-16BE (BOM FE FF) se decodifican y pasan a UTF-8.
-//  - Si decodificar como UTF-8 produce caracteres de reemplazo (\uFFFD), se
-//    reintenta como Windows-1252 (codificación clásica de SRT en español) y se
-//    codifica en UTF-8.
-//  - Si ya es UTF-8 válido sin BOM, se devuelve el mismo Buffer (cero copias).
-function toUtf8Buffer(buf) {
-  if (!Buffer.isBuffer(buf) || buf.length === 0) return Buffer.from([]);
-  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
-    return Buffer.from(new TextDecoder("utf-16le").decode(buf), "utf8");
-  }
-  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
-    try {
-      return Buffer.from(new TextDecoder("utf-16be").decode(buf), "utf8");
-    } catch {
-      return Buffer.from(new TextDecoder("utf-8").decode(buf), "utf8");
-    }
-  }
-  const utf8Text = new TextDecoder("utf-8").decode(buf);
-  if (utf8Text.includes("\uFFFD")) {
-    try {
-      return Buffer.from(new TextDecoder("windows-1252").decode(buf), "utf8");
-    } catch {
-      return buf;
-    }
-  }
-  return buf;
-}
 
 // Error con código HTTP propio: evita el cable de return/status anidados del
 // flujo de validación (que se ejecuta ahora en el origen Y en cada salto).
@@ -727,8 +674,6 @@ export default async function handler(req, res) {
         const diff = epRank(b.name) - epRank(a.name);
         if (diff !== 0) return diff;
       }
-      const tDiff = trackRank(b.name) - trackRank(a.name);
-      if (tDiff !== 0) return tDiff;
       const score = (x) => (x.name.toLowerCase().endsWith(".srt") ? 2 : 1);
       return score(b) - score(a) || b.declared - a.declared;
     });
@@ -772,7 +717,7 @@ export default async function handler(req, res) {
     res.setHeader("Content-Type", "text/plain; charset=utf-8");
     res.setHeader("Content-Disposition", contentDisposition(chosen.name));
     res.setHeader("Cache-Control", "public, max-age=86400, s-maxage=86400, stale-while-revalidate=3600"); // evita re-descargas en cliente y CDN de Vercel
-    return res.status(200).send(toUtf8Buffer(chosen.data));
+    return res.status(200).send(chosen.data);
   } catch (err) {
     if (err instanceof ProxyError) {
       return res.status(err.status).json({ error: err.message });
@@ -784,4 +729,4 @@ export default async function handler(req, res) {
 }
 
 // Exportados para test_proxy.js (la lógica de SSRF no puede quedar sin tests).
-export { ALLOWED_HOSTS, MAX_BYTES, MAX_ENTRY_BYTES, isPublicIP, assertSafeUrl, readCapped, rateLimit, RATE_MAP_CAP, trackRank, toUtf8Buffer };
+export { ALLOWED_HOSTS, MAX_BYTES, MAX_ENTRY_BYTES, isPublicIP, assertSafeUrl, readCapped, rateLimit, RATE_MAP_CAP };
