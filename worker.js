@@ -1,6 +1,15 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.43
+// HispaSubs — Cloudflare Worker v1.4.44
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.44 (09/11/2026):
+//  - [ANTI-SPAM / CRÉDITOS] SubAdictos (subadictos.net, wiki-adictos.subadictos.net) y TheSubFactory
+//    (thesubfactory.net) pasan a la lista de comunidades conocidas: sus créditos ya no cuentan como
+//    líneas débiles (visto en producción 8-9/11: ~22 descartes de 327). Un dominio compuesto o con
+//    TLD ajeno (p. ej. www.thesubfactory.net.bet-win.top) sigue siendo señal débil.
+//  - [LOGS] Las líneas `descartado por idioma` y `descartado por spam` añaden al final
+//    ` id=<id de la pista>` (y, en idioma, ` ratio=<fracción de palabras funcionales> n=<palabras>`)
+//    para poder verificar falsos positivos sin adivinar. El texto previo del log no cambia.
 //
 // v1.4.43 (08/11/2026) — Hotfix 1.4.43:
 //  - [REVERSIÓN POR DEFECTO] `SUBDL_EPFILTER` y `RELEASE_ORDER` pasan a estar APAGADOS
@@ -1329,7 +1338,7 @@ function initPage() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.43",
+  version: "1.4.44",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1381,12 +1390,18 @@ const SUBDL_ES_LANG_RE = /^(?:es|esp|spa|spanish|español|espanol)(?:[-_][a-z0-9
 // Comprobación barata de que un texto es español (palabras funcionales sobre
 // las primeras ~12 KB). Un español real da ~0,35-0,45; inglés o francés ~0.
 const ES_STOPWORDS = new Set(["que", "el", "la", "de", "no", "y", "en", "es", "un", "una", "los", "las", "se", "lo", "me", "te", "por", "con", "para", "del", "al", "mi", "tu", "su", "yo", "qué", "está"]);
-const looksSpanish = (text) => {
+// v1.4.44: `spanishRatio` expone el mismo cálculo (n = palabras analizadas, ratio = fracción de
+// palabras funcionales) para que el log de descarte por idioma muestre el valor real.
+const spanishRatio = (text) => {
   const words = text.slice(0, 12288).toLowerCase().match(/\p{L}+/gu) || [];
-  if (words.length < 20) return true; // texto demasiado corto para juzgar: no se descarta
   let hits = 0;
   for (const w of words) if (ES_STOPWORDS.has(w)) hits += 1;
-  return hits / words.length >= 0.15;
+  return { n: words.length, ratio: words.length ? hits / words.length : 0 };
+};
+const looksSpanish = (text) => {
+  const { n, ratio } = spanishRatio(text);
+  if (n < 20) return true; // texto demasiado corto para juzgar: no se descarta
+  return ratio >= 0.15;
 };
 // Códigos que PARECEN español pero el filtro descarta ("spl", "spn", "ea",
 // "lat…", "mx…", "cast…"; "est" = estonio, se excluye). Si OS-V3 enviara un
@@ -1966,7 +1981,7 @@ const SPAM_WEAK_LINE = /(?<![\p{L}\p{N}_])(?:(?:https?:\/\/|www\.)[^\s<>"']+|(?:
 // menos una que NO sea crédito (dominio/email desconocido, opensubtitles, yts…).
 // OpenSubtitles y YTS siguen fuera de esta lista a propósito: su marca de agua
 // SÍ es publicidad.
-const SPAM_CREDIT_LINE = /(?<![\p{L}\p{N}_])(?:argenteam|subdivx|tusubtitulo|subtitulamos|elrincondelsub|allsubs|asia-team|subs-team|addic7ed|yyets|forominiseries|subtitulos\.es)(?![\p{L}\p{N}_])|(?<![\p{L}\p{N}_])(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])/iu;
+const SPAM_CREDIT_LINE = /(?<![\p{L}\p{N}_])(?:argenteam|subdivx|tusubtitulo|subtitulamos|elrincondelsub|allsubs|asia-team|subs-team|addic7ed|yyets|forominiseries|subtitulos\.es|subadictos|thesubfactory)(?![\p{L}\p{N}_])|(?<![\p{L}\p{N}_])(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])/iu;
 
 // Lista ampliada con créditos reales vistos en producción (27/10): Asia-Team (.tv),
 // Subs-Team, Addic7ed, YYeTs y ForoMiniSeries; cada uno solo con su dominio exacto.
@@ -1976,7 +1991,7 @@ const SPAM_CREDIT_LINE = /(?<![\p{L}\p{N}_])(?:argenteam|subdivx|tusubtitulo|sub
 // `https://bet.top/?ref=argenteam`), ya no queda NINGUNA señal débil.
 // Un punto FINAL de frase tras el nombre/dominio ("Traducido por Argenteam.", "www.subtitulos.es.")
 // no impide la exención; un punto seguido de letra/número ("www.argenteam.net.bet-win.top") sí.
-const SPAM_CREDIT_NAME_TOKEN = /(?<![\p{L}\p{N}_.-])(?:https?:\/\/)?(?:www\.)?(?:argenteam(?:\.net)?|(?:asia-team|subs-team)(?:\.(?:net|tv))?|(?:subdivx|tusubtitulo|elrincondelsub|addic7ed|yyets)(?:\.com)?|forominiseries(?:\.net)?|subtitulamos(?:\.tv)?|allsubs(?:\.org)?|subtitulos\.es)(?:\/[a-z0-9/_-]*)?(?![\p{L}\p{N}_?=&-]|\.[\p{L}\p{N}])/giu;
+const SPAM_CREDIT_NAME_TOKEN = /(?<![\p{L}\p{N}_.-])(?:https?:\/\/)?(?:www\.)?(?:argenteam(?:\.net)?|(?:asia-team|subs-team)(?:\.(?:net|tv))?|(?:subdivx|tusubtitulo|elrincondelsub|addic7ed|yyets)(?:\.com)?|forominiseries(?:\.net)?|subtitulamos(?:\.tv)?|allsubs(?:\.org)?|(?:wiki-adictos\.)?subadictos(?:\.net)?|thesubfactory(?:\.net)?|subtitulos\.es)(?:\/[a-z0-9/_-]*)?(?![\p{L}\p{N}_?=&-]|\.[\p{L}\p{N}])/giu;
 const SPAM_CREDIT_PHRASE = /(?<![\p{L}\p{N}_])(?:subt[ií]tulos?|subtitulad[oa]s?|traducci[oó]n|traducid[oa]s?|corregid[oa]s?|sincronizad[oa]s?)\s+(?:por|by)(?![\p{L}\p{N}_])/giu;
 // Versiones NO globales para .test() (las /g guardan lastIndex entre llamadas).
 const SPAM_CREDIT_PHRASE_TEST = new RegExp(SPAM_CREDIT_PHRASE.source, "iu");
@@ -2215,7 +2230,8 @@ const classifySubtitle = async (
     // Pistas de códigos regionales no confirmados (OS-V3 `spl`/`spn`): si el texto
     // no parece español, se descartan en vez de servirlas como "📄 Español".
     if ((sub.verifyEs || verifyAll) && !looksSpanish(text)) {
-      console.log(`[classify] descartado por idioma (no parece español; código ${sub.rawLang}) [${sub.source}]`);
+      const sr = spanishRatio(text);
+      console.log(`[classify] descartado por idioma (no parece español; código ${sub.rawLang}) [${sub.source}] id=${sub.id} ratio=${sr.ratio.toFixed(3)} n=${sr.n}`);
       return null;
     }
 
@@ -2230,7 +2246,7 @@ const classifySubtitle = async (
       if (spamMode === "log") {
         console.log(`[classify] SPAM_FILTER=log: se habría descartado (${spam.reason}${detail}) [${sub.source}]`);
       } else {
-        console.log(`[classify] descartado por spam (${spam.reason}${detail}) [${sub.source}]`);
+        console.log(`[classify] descartado por spam (${spam.reason}${detail}) [${sub.source}] id=${sub.id}`);
         return null;
       }
     }
@@ -2345,7 +2361,7 @@ const getCanonicalConfigStr = (config) =>
 // Exportado solo para tests (corpus etiquetado en test_worker.js; el timeout
 // de OS-V3 para fijar su valor en una aserción; y el veredicto anti-spam con
 // sus dos presupuestos para las aserciones de v1.4.2/1.4.3).
-export { errKind, looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, REF_NAME, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect, ES_VOSOTROS_RE, DICT_ES_EXTRA, DICT_LAT_EXTRA, DICT_ES_WEAK_EXTRA, DICT_LAT_WEAK_EXTRA, releaseMatchesEp, getSubDL };
+export { errKind, looksSpanish, spanishRatio, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, REF_NAME, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect, ES_VOSOTROS_RE, DICT_ES_EXTRA, DICT_LAT_EXTRA, DICT_ES_WEAK_EXTRA, DICT_LAT_WEAK_EXTRA, releaseMatchesEp, getSubDL };
 
 // ---------------------------------------------------------------------------
 // Router

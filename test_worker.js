@@ -1,5 +1,5 @@
 // Pruebas del Worker HispaSubs (offline + una llamada de red opcional)
-import worker, { errKind, looksSpanish, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, REF_NAME, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect, ES_VOSOTROS_RE, DICT_ES_EXTRA, DICT_LAT_EXTRA, DICT_ES_WEAK_EXTRA, DICT_LAT_WEAK_EXTRA, releaseMatchesEp, getSubDL } from "./worker.js";
+import worker, { errKind, looksSpanish, spanishRatio, NEAR_ES_LANG_RE, scoreText, subtitleCacheUrl, OS_V3_TIMEOUT_MS, spamVerdict, ANALYSIS_BUDGET_PER_SOURCE, ANALYSIS_FETCH_PER_SOURCE, CLASSIFY_BUDGET_MS, WAVE2_MAX_W1_MS, rateLimitFallback, RATE_MAP_CAP, readCapped, MAX_ANALYZE_BYTES, isSdh, hashContent, SDH_MIN_MATCHES, SDH_ACOUSTIC_RE, dedupWave, getCanonicalConfigStr, isPlatformRelease, PLATFORM_RELEASE_RE, IS_PLATFORM, RELEASE_SOURCE, REF_NAME, releaseSourceOf, normalizeDialectOrder, detectFilenameDialect, extractFilename, resolveDialectTarget, orderSubtitlesByDialect, ES_VOSOTROS_RE, DICT_ES_EXTRA, DICT_LAT_EXTRA, DICT_ES_WEAK_EXTRA, DICT_LAT_WEAK_EXTRA, releaseMatchesEp, getSubDL } from "./worker.js";
 
 const base = "https://hispasubs.example.workers.dev";
 const get = (path) => worker.fetch(new Request(base + path), {}, {});
@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.43", m10.version === "1.4.43", m10.version);
+  check("manifest version 1.4.44", m10.version === "1.4.44", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -3737,6 +3737,99 @@ try {
     }
     for (const a of deferred) check(...a);
   }
+}
+
+// 34) v1.4.44: SubAdictos/TheSubFactory como créditos conocidos; id/ratio en los logs de descarte
+{
+  const srtWith = (head) =>
+    `1\n00:00:01,000 --> 00:00:02,000\n${head}\n\n2\n00:00:03,000 --> 00:00:04,000\nHola chaval, ¿cómo estás?\n\n` +
+    "3\n00:00:05,000 --> 00:00:06,000\nVamos a por el coche.\n\n".repeat(40);
+  const cases = [
+    // bloques REALES descartados en producción el 8-9/11 y que ahora se conservan
+    ["SubAdictos x3 (wiki-adictos)", "Wiki-Adictos.Subadictos.Net\nWww.Subadictos.Net\nSubAdictos.net", false],
+    ["SubAdictos con punto final", "Www.SubAdictos.Net.\nSubAdictos.net", false],
+    ["TheSubFactory correo + web", "marchelo64@thesubfactory.net\nwww.thesubfactory.net", false],
+    ["TheSubFactory con frases de crédito", "Traducido Por\nCorregido Por\nakallabeth@TheSubFactory.net\nwww.thesubfactory.net", false],
+    ["frase de crédito + SubAdictos", "Subtítulos por\nwww.subadictos.net", false],
+    // lo que SIGUE descartando
+    ["TheSubFactory + agregador tvsubtitles", "www.TheSubFactory.net\nwww.tvsubtitles.net", true],
+    ["SubAdictos + marca OpenSubtitles", "SubAdictos.net\nwww.OpenSubtitles.org", true],
+    ["comunidad + anuncio sin frase de crédito", "www.subadictos.net\nwww.casino-gratis.top", true],
+    ["dominio compuesto (www.casino-subadictos.top)", "www.casino-subadictos.top\nwww.casino-subadictos.top", true],
+    ["dominio compuesto con sufijo (thesubfactory.net.bet-win.top)", "www.thesubfactory.net.bet-win.top\nwww.thesubfactory.net.bet-win.top", true],
+    ["subadictos.net.bet-win.top", "www.subadictos.net.bet-win.top\nwww.subadictos.net.bet-win.top", true],
+    ["TLD falso (thesubfactory.bet)", "www.thesubfactory.bet\nwww.thesubfactory.bet", true],
+    ["query de afiliado con la comunidad", "https://bet-win.top/?ref=subadictos\nhttps://bet-win.top/?ref=subadictos", true],
+    ["comunidad en la misma línea que un dominio ajeno", "www.subadictos.net www.bet-win.com\nwww.subadictos.net www.bet-win.com", true],
+  ];
+  for (const [name, head, expected] of cases) {
+    const v = spamVerdict(srtWith(head));
+    check(`1.4.44 créditos: ${name} -> ${expected ? "descarta" : "conserva"}`, v.discard === expected, JSON.stringify(v));
+  }
+
+  // spanishRatio: mismo cálculo que looksSpanish
+  {
+    const ES = "No sé qué hacer con el coche de mi padre en la ciudad, pero vosotros tenéis la nevera. ".repeat(10);
+    const EN = "I don't know what to do with the car and the computer in the city, but we have to go to the house now. ".repeat(10);
+    const a = spanishRatio(ES), b = spanishRatio(EN), c = spanishRatio("");
+    check("spanishRatio: español >= 0.15 y n > 20", a.ratio >= 0.15 && a.n > 20, JSON.stringify(a));
+    check("spanishRatio: inglés < 0.15", b.ratio < 0.15 && b.n > 20, JSON.stringify(b));
+    check("spanishRatio: vacío -> n=0, ratio=0", c.n === 0 && c.ratio === 0, JSON.stringify(c));
+    for (const [nm, t] of [["es", ES], ["en", EN], ["vacío", ""], ["corto", "hello there friend"], ["19 palabras", "uno dos tres cuatro cinco seis siete ocho nueve diez once doce trece catorce quince dieciséis diecisiete dieciocho diecinueve"]]) {
+      const r = spanishRatio(t);
+      check(`looksSpanish coherente con spanishRatio (${nm})`, looksSpanish(t) === (r.n < 20 || r.ratio >= 0.15), JSON.stringify(r));
+    }
+  }
+
+  // Fronteras de looksSpanish (umbral 0.15 y mínimo de 20 palabras), sin cambios respecto a la 1.4.43
+  {
+    const mk = (hits, total) => Array.from({ length: total }, (_, i) => (i < hits ? "que" : "zzz")).join(" ");
+    check("looksSpanish: 15/100 palabras funcionales (= 0.15) -> true", looksSpanish(mk(15, 100)) === true && spanishRatio(mk(15, 100)).ratio === 0.15);
+    check("looksSpanish: 14/100 (0.14) -> false", looksSpanish(mk(14, 100)) === false);
+    check("looksSpanish: 20 palabras sin funcionales -> false (mínimo alcanzado)", looksSpanish(mk(0, 20)) === false);
+    check("looksSpanish: 19 palabras sin funcionales -> true (muy corto)", looksSpanish(mk(0, 19)) === true);
+  }
+
+  const jsonR = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
+  const run = async (id, { os = [], subdl = null, body, env = {}, key = "" } = {}) => {
+    const prevC = mockGlobal("caches", { default: { match: async () => undefined, put: async () => {} } });
+    const prevF = globalThis.fetch;
+    globalThis.fetch = (input) => {
+      const u = String(input && input.url !== undefined ? input.url : input);
+      if (u.includes("opensubtitles-v3.strem.io")) return Promise.resolve(jsonR({ subtitles: os }));
+      if (u.includes("api.subdl.com")) return Promise.resolve(jsonR(subdl || { status: true, subtitles: [] }));
+      return Promise.resolve(textResp(body(u)));
+    };
+    const l = console.log, e = console.error, lines = [];
+    console.log = (...a) => lines.push(a.join(" ")); console.error = (...a) => lines.push(a.join(" "));
+    let j;
+    try {
+      const pre = key ? `/${b64url({ subdlKey: key })}` : "";
+      const r = await worker.fetch(new Request(`${base}${pre}/subtitles/movie/${id}.json`), env, { waitUntil: () => {} });
+      j = await r.json();
+    } finally { console.log = l; console.error = e; globalThis.fetch = prevF; restoreGlobal("caches", prevC); }
+    return { n: j.subtitles.length, lines };
+  };
+  const ENG = "I don't know what to do with the car and the computer in the city, but we have to go to the house now. ".repeat(10);
+  const ES_LINE = "1\n00:00:01,000 --> 00:00:03,000\nNo sé qué hacer con el coche de mi padre en la ciudad, pero vosotros tenéis la nevera.\n\n";
+
+  let r = await run("tt7790101", { os: [{ id: "abc123", url: "https://subs5.strem.io/a.srt", lang: "spl" }], body: () => ENG });
+  const li = r.lines.find((l) => l.includes("descartado por idioma")) || "";
+  const mm = /^\[classify\] descartado por idioma \(no parece español; código spl\) \[OS-V3\] id=abc123 ratio=(\d\.\d{3}) n=(\d+)$/.exec(li);
+  check("log idioma OS-V3: conserva el texto previo y añade id/ratio/n al final", !!mm, li);
+  check("log idioma: ratio y n coinciden con spanishRatio", !!mm && mm[1] === spanishRatio(ENG).ratio.toFixed(3) && Number(mm[2]) === spanishRatio(ENG).n, li);
+  check("log idioma: la pista sigue descartándose", r.n === 0, String(r.n));
+
+  r = await run("tt7790102", { key: "clave_valida_123", env: { LANG_VERIFY: "1" }, subdl: { status: true, subtitles: [{ url: "/subtitle/9-9.zip", release_name: "X", language: "ES", file_id: 9 }] }, body: () => ENG });
+  const ls = r.lines.find((l) => l.includes("descartado por idioma")) || "";
+  check("log idioma SubDL: id sdl_<file_id> tras [SubDL]", /\[SubDL\] id=sdl_9 ratio=0\.\d{3} n=\d+$/.test(ls), ls);
+
+  r = await run("tt7790103", { os: [{ id: "spm1", url: "https://subs5.strem.io/a.srt", lang: "spa" }], body: () => ES_LINE.repeat(8) + "Visita www.casino-ya.top y casa de apuestas\n" });
+  const lp = r.lines.find((l) => l.includes("descartado por spam")) || "";
+  check("log spam: id de la pista al final, texto previo intacto", /^\[classify\] descartado por spam \(fuerte: "[^"]+"\) \[OS-V3\] id=spm1$/.test(lp) && r.n === 0, lp);
+
+  r = await run("tt7790104", { os: [{ id: "ok1", url: "https://subs5.strem.io/a.srt", lang: "spa" }], body: () => ES_LINE.repeat(8) });
+  check("sin descartes no hay líneas nuevas y se sirve la pista", r.n === 1 && !r.lines.some((l) => l.includes("descartado por")), JSON.stringify(r.lines.filter((l) => l.includes("[classify]"))));
 }
 
 console.log(`\n${pass} ok, ${fail} fallos`);
