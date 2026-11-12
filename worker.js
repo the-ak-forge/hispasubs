@@ -1,6 +1,12 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.44
+// HispaSubs — Cloudflare Worker v1.4.45
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.45 (12/11/2026):
+//  - [LANG_VERIFY / looksSpanish] El umbral de palabras funcionales baja de 0.15 a 0.05. Datos de la
+//    1.4.44 (ratio en el log): 42 de 84 pistas descartadas por idioma tenían ratio 0.10-0.15 y las tres
+//    revisadas a mano (OS 12804607, 7368490, 7736381) eran español real. Quedan descartadas las que
+//    están por debajo de 0.05 (inglés y otros: la gran mayoría <0.03). Sin otros cambios.
 //
 // v1.4.44 (09/11/2026):
 //  - [ANTI-SPAM / CRÉDITOS] SubAdictos (subadictos.net, wiki-adictos.subadictos.net) y TheSubFactory
@@ -1338,7 +1344,7 @@ function initPage() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.44",
+  version: "1.4.45",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1388,10 +1394,15 @@ const OS_V3_VERIFY_LANG_RE = /^(?:spl|spn)(?:[-_][a-z0-9]{2,8})?$/;
 // Vacío/ausente se conserva; cualquier otro (p. ej. "br_pt") se descarta.
 const SUBDL_ES_LANG_RE = /^(?:es|esp|spa|spanish|español|espanol)(?:[-_][a-z0-9]{2,8})?$/;
 // Comprobación barata de que un texto es español (palabras funcionales sobre
-// las primeras ~12 KB). Un español real da ~0,35-0,45; inglés o francés ~0.
+// las primeras ~12 KB). Un español real da ~0,14-0,45 (medido en producción); inglés ~0-0,03.
 const ES_STOPWORDS = new Set(["que", "el", "la", "de", "no", "y", "en", "es", "un", "una", "los", "las", "se", "lo", "me", "te", "por", "con", "para", "del", "al", "mi", "tu", "su", "yo", "qué", "está"]);
 // v1.4.44: `spanishRatio` expone el mismo cálculo (n = palabras analizadas, ratio = fracción de
 // palabras funcionales) para que el log de descarte por idioma muestre el valor real.
+// v1.4.45: umbral 0.15 -> 0.05. Los logs de la 1.4.44 (`ratio=`) mostraron 42 pistas descartadas con
+// ratio 0.10-0.15 (~1.400 palabras analizadas) y tres de ellas, revisadas a mano, eran español real
+// (ratios 0.136-0.145): el español de subtítulos reales llega a ~0.14. El inglés y otros idiomas ajenos
+// quedaron por debajo de 0.03 (27 de 84 pistas distintas descartadas).
+const LOOKS_SPANISH_MIN_RATIO = 0.05;
 const spanishRatio = (text) => {
   const words = text.slice(0, 12288).toLowerCase().match(/\p{L}+/gu) || [];
   let hits = 0;
@@ -1401,7 +1412,7 @@ const spanishRatio = (text) => {
 const looksSpanish = (text) => {
   const { n, ratio } = spanishRatio(text);
   if (n < 20) return true; // texto demasiado corto para juzgar: no se descarta
-  return ratio >= 0.15;
+  return ratio >= LOOKS_SPANISH_MIN_RATIO;
 };
 // Códigos que PARECEN español pero el filtro descarta ("spl", "spn", "ea",
 // "lat…", "mx…", "cast…"; "est" = estonio, se excluye). Si OS-V3 enviara un

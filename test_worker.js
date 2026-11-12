@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.44", m10.version === "1.4.44", m10.version);
+  check("manifest version 1.4.45", m10.version === "1.4.45", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -3772,20 +3772,22 @@ try {
     const ES = "No sé qué hacer con el coche de mi padre en la ciudad, pero vosotros tenéis la nevera. ".repeat(10);
     const EN = "I don't know what to do with the car and the computer in the city, but we have to go to the house now. ".repeat(10);
     const a = spanishRatio(ES), b = spanishRatio(EN), c = spanishRatio("");
-    check("spanishRatio: español >= 0.15 y n > 20", a.ratio >= 0.15 && a.n > 20, JSON.stringify(a));
-    check("spanishRatio: inglés < 0.15", b.ratio < 0.15 && b.n > 20, JSON.stringify(b));
+    check("spanishRatio: español >= 0.05 y n > 20", a.ratio >= 0.05 && a.n > 20, JSON.stringify(a));
+    check("spanishRatio: inglés < 0.05", b.ratio < 0.05 && b.n > 20, JSON.stringify(b));
     check("spanishRatio: vacío -> n=0, ratio=0", c.n === 0 && c.ratio === 0, JSON.stringify(c));
     for (const [nm, t] of [["es", ES], ["en", EN], ["vacío", ""], ["corto", "hello there friend"], ["19 palabras", "uno dos tres cuatro cinco seis siete ocho nueve diez once doce trece catorce quince dieciséis diecisiete dieciocho diecinueve"]]) {
       const r = spanishRatio(t);
-      check(`looksSpanish coherente con spanishRatio (${nm})`, looksSpanish(t) === (r.n < 20 || r.ratio >= 0.15), JSON.stringify(r));
+      check(`looksSpanish coherente con spanishRatio (${nm})`, looksSpanish(t) === (r.n < 20 || r.ratio >= 0.05), JSON.stringify(r));
     }
   }
 
-  // Fronteras de looksSpanish (umbral 0.15 y mínimo de 20 palabras), sin cambios respecto a la 1.4.43
+  // Fronteras de looksSpanish (umbral 0.05 desde la 1.4.45 y mínimo de 20 palabras)
   {
     const mk = (hits, total) => Array.from({ length: total }, (_, i) => (i < hits ? "que" : "zzz")).join(" ");
-    check("looksSpanish: 15/100 palabras funcionales (= 0.15) -> true", looksSpanish(mk(15, 100)) === true && spanishRatio(mk(15, 100)).ratio === 0.15);
-    check("looksSpanish: 14/100 (0.14) -> false", looksSpanish(mk(14, 100)) === false);
+    check("looksSpanish: 5/100 palabras funcionales (= 0.05) -> true", looksSpanish(mk(5, 100)) === true && spanishRatio(mk(5, 100)).ratio === 0.05);
+    check("looksSpanish: 4/100 (0.04) -> false", looksSpanish(mk(4, 100)) === false);
+    check("looksSpanish: 14/100 (0.14, español real visto en producción) -> true", looksSpanish(mk(14, 100)) === true);
+    check("looksSpanish: 3/100 (0.03, inglés típico) -> false", looksSpanish(mk(3, 100)) === false);
     check("looksSpanish: 20 palabras sin funcionales -> false (mínimo alcanzado)", looksSpanish(mk(0, 20)) === false);
     check("looksSpanish: 19 palabras sin funcionales -> true (muy corto)", looksSpanish(mk(0, 19)) === true);
   }
@@ -3828,6 +3830,15 @@ try {
   const lp = r.lines.find((l) => l.includes("descartado por spam")) || "";
   check("log spam: id de la pista al final, texto previo intacto", /^\[classify\] descartado por spam \(fuerte: "[^"]+"\) \[OS-V3\] id=spm1$/.test(lp) && r.n === 0, lp);
 
+  {
+    const mk2 = (hits, total) => Array.from({ length: total }, (_, i) => (i % 100 < hits ? "que" : "zzz")).join(" ");
+    r = await run("tt7790105", { os: [{ id: "lowes", url: "https://subs5.strem.io/a.srt", lang: "spa" }], env: { LANG_VERIFY: "1" }, body: () => ES_LINE + mk2(14, 1400) });
+    check("LANG_VERIFY=1: español real con ratio ~0.14 se sirve (antes se descartaba)", r.n === 1 && !r.lines.some((l) => l.includes("descartado por idioma")), JSON.stringify([r.n, r.lines.filter((l) => l.includes("[classify]"))]));
+    r = await run("tt7790107", { os: [{ id: "low3", url: "https://subs5.strem.io/a.srt", lang: "spa" }], env: { LANG_VERIFY: "1" }, body: () => mk2(3, 1400) });
+    check("LANG_VERIFY=1: ratio ~0.03 (inglés típico) se descarta", r.n === 0 && r.lines.some((l) => /descartado por idioma.*ratio=0\.03\d/.test(l)), JSON.stringify([r.n, r.lines.filter((l) => l.includes("[classify]"))]));
+    r = await run("tt7790106", { os: [{ id: "eng1", url: "https://subs5.strem.io/a.srt", lang: "spa" }], env: { LANG_VERIFY: "1" }, body: () => mk2(0, 1400) });
+    check("LANG_VERIFY=1: texto sin palabras funcionales (ratio 0) se descarta", r.n === 0 && r.lines.some((l) => l.includes("descartado por idioma") && l.includes("ratio=0.000")), JSON.stringify([r.n, r.lines.filter((l) => l.includes("[classify]"))]));
+  }
   r = await run("tt7790104", { os: [{ id: "ok1", url: "https://subs5.strem.io/a.srt", lang: "spa" }], body: () => ES_LINE.repeat(8) });
   check("sin descartes no hay líneas nuevas y se sirve la pista", r.n === 1 && !r.lines.some((l) => l.includes("descartado por")), JSON.stringify(r.lines.filter((l) => l.includes("[classify]"))));
 }
