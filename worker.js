@@ -1,6 +1,14 @@
 // ============================================================================
-// HispaSubs — Cloudflare Worker v1.4.45
+// HispaSubs — Cloudflare Worker v1.4.46
 // Addon de Stremio: subtítulos en español clasificados por dialecto.
+//
+// v1.4.46 (13/11/2026):
+//  - [LANG_VERIFY / looksSpanish] Segunda señal: densidad de palabras funcionales de otros idiomas
+//    (neerlandés, inglés, alemán, francés, eslavo). Se descarta si ratio < 0.05 (como antes) o si
+//    ajeno >= 0.06 y ajeno > ratio. Pistas reales revisadas: Troy (neerlandés, ratio 0.085, ajeno 0.255),
+//    Friday (esloveno, 0.054 / 0.143) y Grey (serbocroata, 0.041 / 0.161) se descartan; Frieren,
+//    SEAL y Dexter (español, ajeno <= 0.001) se conservan. El log de idioma añade `ajeno=`.
+//    No detecta mezclas ES/EN más allá de los primeros ~12 KB.
 //
 // v1.4.45 (12/11/2026):
 //  - [LANG_VERIFY / looksSpanish] El umbral de palabras funcionales baja de 0.15 a 0.05. Datos de la
@@ -1344,7 +1352,7 @@ function initPage() {
 
 const getManifest = (host) => ({
   id: "org.hispasubs.addon",
-  version: "1.4.45",
+  version: "1.4.46",
   name: "HispaSubs",
   // Descripción ESTÁTICA (no depende de la config del usuario).
   description:
@@ -1403,16 +1411,27 @@ const ES_STOPWORDS = new Set(["que", "el", "la", "de", "no", "y", "en", "es", "u
 // (ratios 0.136-0.145): el español de subtítulos reales llega a ~0.14. El inglés y otros idiomas ajenos
 // quedaron por debajo de 0.03 (27 de 84 pistas distintas descartadas).
 const LOOKS_SPANISH_MIN_RATIO = 0.05;
+// v1.4.46: segunda señal. Con el ratio solo, español real (Frieren 0.085) y neerlandés (Troy 0.085) se
+// solapan y el esloveno (0.054) pasaba. `FOREIGN_WORDS` = palabras funcionales de neerlandés, inglés,
+// alemán, francés y eslavo (esloveno/croata/serbio) que NO son palabras españolas ni risas ("ja", "je" solo
+// como eslavo no se usa: "je" sí se incluye, "ja"/"ti" no). Medido en seis pistas reales: español
+// <= 0.001; neerlandés 0.255, esloveno 0.143, serbocroata 0.161.
+const FOREIGN_MIN_DENSITY = 0.06;
+const FOREIGN_WORDS = new Set("het een van ik jij niet dat zijn ze maar dit wat voor met ben hij wij hebben naar the and you that with this have are was your what for not but they his her there der die das und nicht ich ist sie ein auch von den les des est pas vous une dans qui nous suis je ne da sem kaj jaz bi ste smo ali tudi kako ker ovo ili nije sam".split(" "));
 const spanishRatio = (text) => {
   const words = text.slice(0, 12288).toLowerCase().match(/\p{L}+/gu) || [];
-  let hits = 0;
-  for (const w of words) if (ES_STOPWORDS.has(w)) hits += 1;
-  return { n: words.length, ratio: words.length ? hits / words.length : 0 };
+  let hits = 0, foreign = 0;
+  for (const w of words) {
+    if (ES_STOPWORDS.has(w)) hits += 1;
+    else if (FOREIGN_WORDS.has(w)) foreign += 1;
+  }
+  return { n: words.length, ratio: words.length ? hits / words.length : 0, foreign: words.length ? foreign / words.length : 0 };
 };
 const looksSpanish = (text) => {
-  const { n, ratio } = spanishRatio(text);
-  if (n < 20) return true; // texto demasiado corto para juzgar: no se descarta
-  return ratio >= LOOKS_SPANISH_MIN_RATIO;
+  const { n, ratio, foreign } = spanishRatio(text);
+  if (n < 20) return true;
+  if (ratio < LOOKS_SPANISH_MIN_RATIO) return false;
+  return !(foreign >= FOREIGN_MIN_DENSITY && foreign > ratio);
 };
 // Códigos que PARECEN español pero el filtro descarta ("spl", "spn", "ea",
 // "lat…", "mx…", "cast…"; "est" = estonio, se excluye). Si OS-V3 enviara un
@@ -2242,7 +2261,7 @@ const classifySubtitle = async (
     // no parece español, se descartan en vez de servirlas como "📄 Español".
     if ((sub.verifyEs || verifyAll) && !looksSpanish(text)) {
       const sr = spanishRatio(text);
-      console.log(`[classify] descartado por idioma (no parece español; código ${sub.rawLang}) [${sub.source}] id=${sub.id} ratio=${sr.ratio.toFixed(3)} n=${sr.n}`);
+      console.log(`[classify] descartado por idioma (no parece español; código ${sub.rawLang}) [${sub.source}] id=${sub.id} ratio=${sr.ratio.toFixed(3)} n=${sr.n} ajeno=${sr.foreign.toFixed(3)}`);
       return null;
     }
 

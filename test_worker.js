@@ -383,7 +383,7 @@ try {
   const m10 = await res.json();
   check("v1.3.1: manifest sin stremioAddonsConfig (firma de v1.2.0, inválida)",
     !("stremioAddonsConfig" in m10));
-  check("manifest version 1.4.45", m10.version === "1.4.45", m10.version);
+  check("manifest version 1.4.46", m10.version === "1.4.46", m10.version);
 
   // 10d) Rate limit por IP (solo peticiones sin caché). Usa Rate Limiting API
   // (binding simulado en tests vía propiedad env.SUBS_RATE_LIMIT_LIMIT cuando
@@ -1786,6 +1786,33 @@ try {
 
 // 24) v1.4.17: catch con ámbito correcto y anti-envenenamiento de k_subdl
 {
+  // v1.4.46: segunda señal (densidad de palabras de otros idiomas). Fronteras con 'que' (español) y 'het' (ajeno).
+  {
+    const mk3 = (es, fo, total) => Array.from({ length: total }, (_, i) => (i < es ? "que" : i < es + fo ? "het" : "zzz")).join(" ");
+    check("1.4.46 ajeno: spanishRatio expone foreign", spanishRatio(mk3(8, 10, 100)).foreign === 0.1 && spanishRatio(mk3(8, 10, 100)).ratio === 0.08);
+    check("1.4.46 ajeno: ratio 0.08, ajeno 0.10 (> ratio y >= 0.06) -> false", looksSpanish(mk3(8, 10, 100)) === false);
+    check("1.4.46 ajeno: ratio 0.05, ajeno 0.06 (frontera del umbral) -> false", looksSpanish(mk3(5, 6, 100)) === false);
+    check("1.4.46 ajeno: ratio 0.05, ajeno 0.05 (bajo el umbral 0.06) -> true", looksSpanish(mk3(5, 5, 100)) === true);
+    check("1.4.46 ajeno: ratio 0.14, ajeno 0.10 (ajeno < ratio) -> true", looksSpanish(mk3(14, 10, 100)) === true);
+    check("1.4.46 ajeno: ratio 0.07, ajeno 0.07 (igual, no >) -> true", looksSpanish(mk3(7, 7, 100)) === true);
+    check("1.4.46 ajeno: ratio 0.07, ajeno 0.08 -> false", looksSpanish(mk3(7, 8, 100)) === false);
+    check("1.4.46 ajeno: ratio < 0.05 sigue descartando sin ajeno", looksSpanish(mk3(4, 0, 100)) === false);
+    check("1.4.46 ajeno: 19 palabras ajenas -> true (muy corto)", looksSpanish(mk3(0, 19, 19)) === true);
+    check("1.4.46 ajeno: umbral exacto (ratio 0.05: ajeno 0.06 -> false; 0.055 -> true)", looksSpanish(mk3(10, 12, 200)) === false && looksSpanish(mk3(10, 11, 200)) === true);
+    const WORDS = "het een van ik jij niet dat zijn ze maar dit wat voor met ben hij wij hebben naar the and you that with this have are was your what for not but they his her there der die das und nicht ich ist sie ein auch von den les des est pas vous une dans qui nous suis je ne da sem kaj jaz bi ste smo ali tudi kako ker ovo ili nije sam".split(" ");
+    const missing = WORDS.filter((w) => spanishRatio(`${w} `.repeat(30)).foreign !== 1);
+    check("1.4.46 ajeno: las 76 palabras de la lista cuentan como ajenas (una a una)", WORDS.length === 76 && missing.length === 0, missing.join(","));
+    const notForeign = ["ja", "ti", "si", "y", "e", "se", "que", "el", "no", "sin", "con", "para"].filter((w) => spanishRatio(`${w} `.repeat(30)).foreign !== 0);
+    check("1.4.46 ajeno: 'ja', 'ti', 'si' y palabras españolas NO cuentan como ajenas", notForeign.length === 0, notForeign.join(","));
+    const NLT = "Ik weet het niet, maar dat is een van de dingen die ze zijn vergeten voor het huis met jij. ".repeat(12) + "que que que que que que que que que que que que que que que que que que que que que que que que ";
+    check("1.4.46 neerlandés con ratio >= 0.05 -> false", spanishRatio(NLT).ratio >= 0.05 && looksSpanish(NLT) === false, JSON.stringify(spanishRatio(NLT)));
+    const SLT = "Kaj je to, ne vem, da sem jaz tudi ali ker ste smo kako ovo ili nije sam. ".repeat(12) + "que que que que que que que que que que que que que que que que que que que que que que que que ";
+    check("1.4.46 eslavo con ratio >= 0.05 -> false", spanishRatio(SLT).ratio >= 0.05 && looksSpanish(SLT) === false, JSON.stringify(spanishRatio(SLT)));
+    const ESR = "No sé qué hacer con el coche de mi padre en la ciudad, pero vosotros tenéis la nevera. ".repeat(10);
+    check("1.4.46 español real: ajeno ~0 y se conserva", spanishRatio(ESR).foreign < 0.01 && looksSpanish(ESR) === true);
+    check("1.4.46 risas 'ja ja'/'je je' y 'da' en español no suman al ajeno bajo", spanishRatio(("ja ja ja je je ti ".repeat(2) + ESR)).foreign < 0.06);
+  }
+
   const jsonR = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
 
   // A. Un error inesperado dentro del try NO debe romper el catch (ReferenceError -> 500)
@@ -3817,14 +3844,14 @@ try {
 
   let r = await run("tt7790101", { os: [{ id: "abc123", url: "https://subs5.strem.io/a.srt", lang: "spl" }], body: () => ENG });
   const li = r.lines.find((l) => l.includes("descartado por idioma")) || "";
-  const mm = /^\[classify\] descartado por idioma \(no parece español; código spl\) \[OS-V3\] id=abc123 ratio=(\d\.\d{3}) n=(\d+)$/.exec(li);
+  const mm = /^\[classify\] descartado por idioma \(no parece español; código spl\) \[OS-V3\] id=abc123 ratio=(\d\.\d{3}) n=(\d+) ajeno=(\d\.\d{3})$/.exec(li);
   check("log idioma OS-V3: conserva el texto previo y añade id/ratio/n al final", !!mm, li);
-  check("log idioma: ratio y n coinciden con spanishRatio", !!mm && mm[1] === spanishRatio(ENG).ratio.toFixed(3) && Number(mm[2]) === spanishRatio(ENG).n, li);
+  check("log idioma: ratio, n y ajeno coinciden con spanishRatio", !!mm && mm[1] === spanishRatio(ENG).ratio.toFixed(3) && Number(mm[2]) === spanishRatio(ENG).n && mm[3] === spanishRatio(ENG).foreign.toFixed(3), li);
   check("log idioma: la pista sigue descartándose", r.n === 0, String(r.n));
 
   r = await run("tt7790102", { key: "clave_valida_123", env: { LANG_VERIFY: "1" }, subdl: { status: true, subtitles: [{ url: "/subtitle/9-9.zip", release_name: "X", language: "ES", file_id: 9 }] }, body: () => ENG });
   const ls = r.lines.find((l) => l.includes("descartado por idioma")) || "";
-  check("log idioma SubDL: id sdl_<file_id> tras [SubDL]", /\[SubDL\] id=sdl_9 ratio=0\.\d{3} n=\d+$/.test(ls), ls);
+  check("log idioma SubDL: id sdl_<file_id> tras [SubDL]", /\[SubDL\] id=sdl_9 ratio=0\.\d{3} n=\d+ ajeno=\d\.\d{3}$/.test(ls), ls);
 
   r = await run("tt7790103", { os: [{ id: "spm1", url: "https://subs5.strem.io/a.srt", lang: "spa" }], body: () => ES_LINE.repeat(8) + "Visita www.casino-ya.top y casa de apuestas\n" });
   const lp = r.lines.find((l) => l.includes("descartado por spam")) || "";
